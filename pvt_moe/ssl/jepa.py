@@ -1,0 +1,284 @@
+"""JEPA-style self-supervised pretraining for the PVT v2 backbone.
+
+Architecture (I-JEPA adapted to a hierarchical encoder — see
+docs/JEPA_GUIDE.md for the full design rationale and citations):
+
+- **context encoder**: the PVT v2 backbone (MoE forced OFF — pretrain dense,
+  upcycle experts at fine-tune time), fed the masked image: stage-1 tokens
+  inside masked 32px units are replaced by a learnable mask token.
+- **target encoder**: EMA copy of the context encoder, sees the FULL image,
+  never receives gradients. Targets are its stage-4 tokens, LayerNorm'd
+  (no affine), taken at masked positions.
+- **predictor**: narrow ViT over the 7x7 stage-4 grid predicting target
+  features at masked positions.
+- **loss**: smooth-L1 between prediction and target at masked positions.
+
+Collapse monitoring: the per-feature std of the RAW target features (before
+LN) is logged as ``target_std``; if it trends to ~0 the representation has
+collapsed (raise EMA momentum / check LR).
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from pvt_moe.config import merge_config, validate_config
+from pvt_moe.models.pvt import build_model
+from pvt_moe.ssl.masking import sample_batch_masks, upsample_mask
+from pvt_moe.ssl.predictor import JEPAPredictor
+
+#: SSL-specific defaults; merge as cfg["ssl"] (see notebooks/03_jepa_pretrain).
+DEFAULT_SSL = {
+    "epochs": 100,
+    "lr": 1.5e-3,                 # for global batch ~2048; scale linearly
+    "warmup_epochs": 15,
+    "final_lr": 1e-6,
+    "weight_decay": 0.04,         # cosine-ramped to weight_decay_end
+    "weight_decay_end": 0.4,
+    "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
+    "ema_momentum_end": 1.0,
+    "mask_n_blocks": 4,
+    "mask_block_area": [0.10, 0.20],
+    "mask_aspect_ratio": [0.75, 1.5],
+    "predictor_dim": 384,
+    "predictor_depth": 6,
+    "predictor_heads": 6,
+    "grad_clip": 3.0,
+}
+
+
+def build_ssl_backbone(cfg: dict) -> nn.Module:
+    """The context/target encoder: cfg's backbone with MoE OFF and no head."""
+    ssl_cfg = copy.deepcopy(cfg)
+    ssl_cfg["model"]["ablation"]["use_moe"] = False
+    ssl_cfg["model"]["ablation"]["moe_placement"] = [[] for _ in cfg["model"]["depths"]]
+    ssl_cfg["dataset"]["num_classes"] = 0  # head -> Identity
+    return build_model(ssl_cfg)
+
+
+class LitJEPA(pl.LightningModule):
+    """I-JEPA-style pretraining module."""
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        # Partial cfg["ssl"] overrides must fall back to DEFAULT_SSL for every
+        # key they omit (user keys win, defaults backfill).
+        cfg = merge_config({"ssl": DEFAULT_SSL}, cfg)
+        self.cfg = cfg
+        self.ssl = cfg["ssl"]
+        self.save_hyperparameters({"cfg": cfg})
+
+        img_size = cfg["dataset"]["img_size"]
+        if img_size % 32 != 0:
+            raise ValueError(f"img_size must be divisible by 32, got {img_size}")
+        self.mask_grid = img_size // 32       # stage-4 grid (7 for 224)
+        self.stage1_grid = img_size // 4      # stage-1 grid (56 for 224)
+
+        self.context = build_ssl_backbone(cfg)
+        self.target = copy.deepcopy(self.context)
+        for p in self.target.parameters():
+            p.requires_grad = False
+        # The target must ALWAYS run in eval mode: it inherits training=True
+        # from the deepcopy and Lightning never toggles it, so DropPath
+        # (drop_path_rate=0.2) would otherwise make the regression targets
+        # stochastic. train() below keeps it eval through every mode switch.
+        self.target.eval()
+
+        backbone_dim = cfg["model"]["embed_dims"][-1]
+        self.predictor = JEPAPredictor(
+            backbone_dim=backbone_dim,
+            dim=self.ssl["predictor_dim"],
+            depth=self.ssl["predictor_depth"],
+            num_heads=self.ssl["predictor_heads"],
+            grid=self.mask_grid,
+        )
+        # Learnable stage-1 mask token (SimMIM-style input masking).
+        self.input_mask_token = nn.Parameter(
+            torch.zeros(cfg["model"]["embed_dims"][0])
+        )
+        nn.init.trunc_normal_(self.input_mask_token, std=0.02)
+        self._ema_last_step = 0
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.target.eval()  # EMA target never leaves eval (DropPath off)
+        return self
+
+    # -- schedules ---------------------------------------------------------
+
+    def _progress(self) -> float:
+        total = max(1, self.trainer.estimated_stepping_batches)
+        return min(1.0, self.global_step / total)
+
+    def _ema_momentum(self, progress: float | None = None) -> float:
+        p = self._progress() if progress is None else progress
+        m0, m1 = self.ssl["ema_momentum"], self.ssl["ema_momentum_end"]
+        return m1 - (m1 - m0) * (math.cos(math.pi * p) + 1) / 2
+
+    def _weight_decay(self, progress: float | None = None) -> float:
+        p = self._progress() if progress is None else progress
+        w0, w1 = self.ssl["weight_decay"], self.ssl["weight_decay_end"]
+        return w1 - (w1 - w0) * (math.cos(math.pi * p) + 1) / 2
+
+    # -- training ------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch  # labels unused
+        B = x.shape[0]
+
+        mask = sample_batch_masks(
+            B,
+            grid=self.mask_grid,
+            n_blocks=self.ssl["mask_n_blocks"],
+            block_area=tuple(self.ssl["mask_block_area"]),
+            aspect_ratio=tuple(self.ssl["mask_aspect_ratio"]),
+        ).to(x.device)                                    # (B, 49)
+        stage1_mask = upsample_mask(mask, self.mask_grid, self.stage1_grid)
+
+        ctx_tokens, _ = self.context.forward_features(
+            x,
+            return_tokens=True,
+            stage1_token_mask=stage1_mask,
+            mask_token=self.input_mask_token,
+        )                                                  # (B, 49, C)
+
+        with torch.no_grad():
+            tgt_raw, _ = self.target.forward_features(x, return_tokens=True)
+            tgt = F.layer_norm(tgt_raw, (tgt_raw.shape[-1],))
+
+        pred = self.predictor(ctx_tokens, mask)            # (B, 49, C)
+        loss = F.smooth_l1_loss(pred[mask], tgt[mask])
+
+        self.log("ssl_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("target_std", tgt_raw.std(dim=(0, 1)).mean(), on_step=False, on_epoch=True)
+        self.log("pred_std", pred[mask].std(dim=0).mean(), on_step=False, on_epoch=True)
+        self.log("mask_ratio", mask.float().mean(), on_step=False, on_epoch=True)
+        self.log("ema_momentum", self._ema_momentum(), on_step=False, on_epoch=True)
+        return loss
+
+    def on_train_start(self):
+        self._ema_last_step = self.global_step  # correct after ckpt resume
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # EMA update of the target encoder — once per OPTIMIZER step, not per
+        # micro-batch (global_step only advances on real optimizer steps, so
+        # this stays correct under gradient accumulation).
+        if self.global_step == self._ema_last_step:
+            return
+        self._ema_last_step = self.global_step
+        m = self._ema_momentum()
+        with torch.no_grad():
+            for pt, pc in zip(self.target.parameters(), self.context.parameters()):
+                pt.mul_(m).add_(pc.detach(), alpha=1.0 - m)
+            for bt, bc in zip(self.target.buffers(), self.context.buffers()):
+                bt.copy_(bc)
+        # Cosine weight-decay ramp (I-JEPA recipe).
+        wd = self._weight_decay()
+        for group in self.trainer.optimizers[0].param_groups:
+            if group.get("use_wd_schedule"):
+                group["weight_decay"] = wd
+
+    def configure_optimizers(self):
+        decay, no_decay = [], []
+        modules = [self.context, self.predictor]
+        for module in modules:
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if p.ndim <= 1 else decay).append(p)
+        no_decay.append(self.input_mask_token)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": self.ssl["weight_decay"],
+                 "use_wd_schedule": True},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=self.ssl["lr"],
+            betas=(0.9, 0.95),
+        )
+
+        total_steps = max(1, self.trainer.estimated_stepping_batches)
+        warmup_steps = int(
+            total_steps * self.ssl["warmup_epochs"] / max(1, self.cfg["ssl"]["epochs"])
+        )
+        final_ratio = self.ssl["final_lr"] / self.ssl["lr"]
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return final_ratio + (1 - final_ratio) * (math.cos(math.pi * t) + 1) / 2
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "name": "lr"},
+        }
+
+    # -- export ------------------------------------------------------------
+
+    def save_backbone(self, path: str):
+        """Save the context encoder for `mode: ssl_init` in supervised runs."""
+        torch.save({"state_dict": self.context.state_dict(), "cfg": self.cfg}, path)
+        print(f"[jepa] context encoder saved to {path}")
+
+
+class LitProbe(pl.LightningModule):
+    """Linear probe: frozen backbone + one linear layer on pooled features."""
+
+    def __init__(self, backbone: nn.Module, num_classes: int, lr: float = 1e-3,
+                 epochs: int = 30):
+        super().__init__()
+        self.backbone = backbone
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        feat_dim = backbone.embed_dims[-1]
+        self.head = nn.Linear(feat_dim, num_classes)
+        self.lr = lr
+        self.epochs = epochs
+        self.loss_fn = nn.CrossEntropyLoss()
+
+        from torchmetrics.classification import MulticlassAccuracy
+
+        self.val_acc = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro")
+        self.val_acc5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro")
+
+    def forward(self, x):
+        with torch.no_grad():
+            feats, _ = self.backbone.forward_features(x)
+        return self.head(feats)
+
+    def on_train_epoch_start(self):
+        self.backbone.eval()  # keep frozen stats regardless of .train() calls
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        loss = self.loss_fn(self(x), y)
+        self.log("probe_train_loss", loss, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        self.log("probe_val_loss", self.loss_fn(logits, y), on_epoch=True)
+        self.val_acc(logits, y)
+        self.val_acc5(logits, y)
+        self.log("probe_val_acc", self.val_acc, on_epoch=True, prog_bar=True)
+        self.log("probe_val_acc_top5", self.val_acc5, on_epoch=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.head.parameters(), lr=self.lr, weight_decay=0.0)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pvt-moe"
+version = "10.0.0"
+description = "PVT v2 + Mixture-of-Experts ablation framework (thesis codebase)"
+requires-python = ">=3.10"
+dependencies = [
+    # Core. torch>=2.5 recommended on the GPU box (SDPA enable_gqa fast path;
+    # the code falls back gracefully on older torch for CPU tests).
+    "torch>=2.3",
+    "torchvision",
+    "pytorch-lightning>=2.0",
+    "torchmetrics>=1.0",
+    "timm>=0.9",          # Mixup / SoftTargetCrossEntropy only
+    "datasets>=2.14",     # HF Arrow pipeline
+    "transformers>=4.40", # HF pretrained weight loading
+    "huggingface_hub",
+    "matplotlib",
+    "pandas",
+]
+
+[project.optional-dependencies]
+# MoE backends are installed separately — see notebooks 01/02 install cells:
+#   tutel:      pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
+#   megablocks: pip install --no-build-isolation grouped_gemm==0.3.0 && pip install megablocks==0.10.0
+#               (megablocks 0.10.0 pins torch 2.7.x)
+extras = ["fvcore", "wandb", "tensorboard"]
+
+[tool.setuptools]
+packages = [
+    "pvt_moe",
+    "pvt_moe.models",
+    "pvt_moe.data",
+    "pvt_moe.engine",
+    "pvt_moe.ssl",
+    "pvt_moe.utils",
+]
