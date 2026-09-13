@@ -7,10 +7,33 @@ Two implementations sit behind one interface:
 - ``MoEMlp`` — sparse: a Tutel or MegaBlocks expert layer replacing the whole
   FFN. Returns ``(tensor, aux_loss)``.
 
-ARCHITECTURAL INVARIANT: the MoE branch has **no DWConv**, so an MoE block
-loses PVT v2's conv positional encoding. Enable RoPE in the same blocks to
-reinject positional information (this is why the default config places RoPE
-exactly where it places MoE).
+ARCHITECTURAL INVARIANT: the routed MoE branch has **no DWConv**, so an MoE
+block loses PVT v2's conv positional encoding. Enable RoPE in the same blocks
+to reinject positional information (this is why the default config places RoPE
+exactly where it places MoE) — or enable a shared expert, which can carry the
+DWConv itself.
+
+Shared expert (``moe.shared_expert``, DeepSeekMoE / Qwen-MoE style)
+-------------------------------------------------------------------
+An always-on dense FFN evaluated for EVERY token in parallel with the routed
+experts; its output is added to theirs::
+
+    y = routed_moe(x) + shared_expert(x)
+
+It lives outside the backend layer (plain ``nn.Module``, ordinary data-parallel
+parameter, no ``skip_allreduce``), so it works identically for both backends
+and its weights survive whatever the backend does to its own experts. Two
+reasons it matters here:
+
+1. It is the only place a pretrained dense FFN can be kept *exactly* rather
+   than copied into E experts — and with ``shared_expert_dwconv`` it keeps the
+   DWConv too, restoring the positional encoding the routed branch drops.
+2. With ``routed_zero_init`` the routed experts' fc2 starts at zero, so at
+   step 0 the block computes exactly the pretrained dense FFN and the routed
+   experts learn a residual on top of it.
+
+Cost: one extra dense FFN per token (no routing, no capacity), i.e. the block
+goes from top-k to top-k+1 active FFNs per token.
 
 Backend notes
 -------------
@@ -56,7 +79,13 @@ class DWConv(nn.Module):
 
 
 class Mlp(nn.Module):
-    """Dense PVT v2 FFN: fc1 -> DWConv -> act -> fc2."""
+    """Dense PVT v2 FFN: fc1 -> DWConv -> act -> fc2.
+
+    ``use_dwconv=False`` drops the depthwise conv (and with it PVT v2's conv
+    positional encoding), leaving a plain fc1 -> act -> fc2 FFN. Only the
+    shared-expert branch of ``MoEMlp`` uses that form; the backbone's dense
+    blocks always keep the DWConv.
+    """
 
     def __init__(
         self,
@@ -65,10 +94,11 @@ class Mlp(nn.Module):
         act_layer=nn.GELU,
         drop: float = 0.0,
         linear_attention: bool = False,
+        use_dwconv: bool = True,
     ):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.dwconv = DWConv(hidden_features)
+        self.dwconv = DWConv(hidden_features) if use_dwconv else None
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(drop)
@@ -79,7 +109,8 @@ class Mlp(nn.Module):
         x = self.fc1(x)
         if self.relu is not None:
             x = self.relu(x)
-        x = self.dwconv(x, H, W)
+        if self.dwconv is not None:
+            x = self.dwconv(x, H, W)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
@@ -109,6 +140,19 @@ class MoEMlp(nn.Module):
         self.in_features = in_features
         self.hidden_features = hidden_features
         self.drop = nn.Dropout(drop)
+
+        # Always-on shared expert (None when disabled). Built with drop=0.0:
+        # this module's single ``self.drop`` is applied once to the summed
+        # output, so the shared branch must not drop twice.
+        self.shared_expert = None
+        if moe_cfg.get("shared_expert", False):
+            self.shared_expert = Mlp(
+                in_features,
+                hidden_features,
+                act_layer=act_layer,
+                drop=0.0,
+                use_dwconv=moe_cfg.get("shared_expert_dwconv", True),
+            )
 
         if self.backend == "tutel":
             self.moe_layer = self._build_tutel(in_features, hidden_features, moe_cfg, act_layer)
@@ -206,4 +250,8 @@ class MoEMlp(nn.Module):
             clear_load_balancing_loss()
 
         out = out.reshape(B, N, C)
+        if self.shared_expert is not None:
+            # The shared expert sees the ORIGINAL (B, N, C) input — it needs
+            # H/W for its DWConv, which the flattened routed path cannot use.
+            out = out + self.shared_expert(x, H, W)
         return self.drop(out), aux

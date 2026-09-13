@@ -36,12 +36,40 @@ stage 4 is 8:2 GQA.
 
 `MoEMlp` replaces the entire dense FFN in placed blocks.
 
-**INVARIANT — the MoE branch has no DWConv.** PVT v2 carries its positional
-encoding as a depthwise 3×3 conv *inside* the FFN; the expert FFN drops it.
-That is why RoPE exists in this codebase: the default config enables RoPE in
-exactly the MoE blocks to reinject position. If you place MoE without RoPE,
-know that those blocks are position-blind (that is itself an ablation, but an
-intentional one).
+**INVARIANT — the routed MoE branch has no DWConv.** PVT v2 carries its
+positional encoding as a depthwise 3×3 conv *inside* the FFN; the expert FFN
+drops it. That is why RoPE exists in this codebase: the default config enables
+RoPE in exactly the MoE blocks to reinject position. If you place MoE without
+RoPE, know that those blocks are position-blind (that is itself an ablation,
+but an intentional one).
+
+**Shared expert (`moe.shared_expert`, optional, default off).** An always-on
+dense FFN added to the routed output for every token:
+
+```
+y = routed_moe(x) + shared_expert(x)          # DeepSeekMoE / Qwen-MoE style
+```
+
+It is a plain `Mlp` held by `MoEMlp` *outside* `moe_layer`, which has three
+consequences worth stating as invariants:
+
+1. **Backend-agnostic and init-safe.** Tutel and MegaBlocks each initialize
+   their own expert tensors at construction; the shared expert is outside that
+   blast radius, so it is the only branch whose weights are guaranteed to be
+   whatever we put there.
+2. **It can keep the DWConv** (`shared_expert_dwconv`, default True), which
+   relaxes the invariant above: a shared-expert MoE block is *not*
+   position-blind, so RoPE becomes an independent axis rather than a
+   compensation for MoE.
+3. **`routed_zero_init` gives exact function preservation.** Zeroing every
+   routed expert's fc2 at upcycle makes the block compute exactly the
+   pretrained dense FFN at step 0 (verified by
+   `tests/test_shared_expert.py::test_upcycled_block_reproduces_dense_ffn_exactly`),
+   with the routed experts learning a residual. fc2 still receives gradient
+   from the first step, so the experts are not frozen.
+
+Do NOT mark shared-expert parameters with `skip_allreduce` — they are ordinary
+data-parallel parameters, unlike the routed expert tensors.
 
 **INVARIANT — aux-loss contract** (the "fixed aux" semantics that took the v3
 lineage several failed runs to get right):

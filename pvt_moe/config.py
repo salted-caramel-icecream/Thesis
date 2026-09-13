@@ -138,6 +138,22 @@ _DEFAULT: dict = {
             "top_k": 1,
             "capacity_factor": 2.0,       # tutel only (megablocks is dropless)
             "gate_noise": 0.5,            # tutel only
+
+            # --- Shared expert (DeepSeekMoE / Qwen-MoE style) --------------
+            # An always-on dense FFN added to the routed experts' output for
+            # every token. Costs one extra FFN per token (top_k -> top_k+1
+            # active), and is the only way to carry a pretrained dense FFN
+            # through EXACTLY rather than copying it into every expert.
+            "shared_expert": False,
+            # Keep PVT v2's depthwise conv in the shared branch. True makes
+            # the shared expert a verbatim PVT v2 Mlp, which restores the
+            # conv positional encoding the routed branch drops (so RoPE
+            # becomes optional rather than load-bearing in MoE blocks).
+            "shared_expert_dwconv": True,
+            # Zero the routed experts' fc2 when upcycling, so the block starts
+            # out computing EXACTLY the pretrained dense FFN and the routed
+            # experts learn a residual. Requires shared_expert.
+            "routed_zero_init": False,
         },
 
         "pretrained_hf_id": "OpenGVLab/pvt_v2_b1",
@@ -252,7 +268,11 @@ def build_run_tag(cfg: dict) -> str:
         moe_pl = resolve_placement(abl["moe_placement"], abl["moe_last_n_stages"], depths)
         moe_cfg = cfg["model"]["moe"]
         backend = "" if moe_cfg["backend"] == "tutel" else "-mb"
-        moe = f"moe-{_placement_tag(moe_pl, depths)}-e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{backend}"
+        shared = "+sh" if moe_cfg.get("shared_expert") else ""
+        moe = (
+            f"moe-{_placement_tag(moe_pl, depths)}-"
+            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{backend}"
+        )
     else:
         moe = "dense"
 
@@ -312,6 +332,14 @@ def validate_config(cfg: dict) -> dict:
     for heads, kv in zip(model["num_heads"], model["num_kv_heads"]):
         if heads % kv != 0:
             raise ValueError(f"num_heads {heads} must be divisible by num_kv_heads {kv}")
+
+    moe = model["moe"]
+    if moe.get("routed_zero_init") and not moe.get("shared_expert"):
+        raise ValueError(
+            "moe.routed_zero_init requires moe.shared_expert: zeroing every "
+            "routed expert's fc2 without a shared expert makes the MoE block "
+            "output identically zero at init."
+        )
 
     abl = model["ablation"]
     abl["moe_placement"] = resolve_placement(abl["moe_placement"], abl["moe_last_n_stages"], depths)

@@ -38,9 +38,30 @@ The notebooks add the repo root to `sys.path`; alternatively `pip install -e .`.
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
 | 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
+| 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 
 Run names are derived from the flags (e.g. `v10_in1k_moe-s4-e8k1_rope-s4_ln`) —
 every W&B run self-documents its ablation.
+
+## Shared expert (`model.moe.shared_expert`)
+
+An always-on dense FFN evaluated for every token alongside the routed
+experts, `y = routed_moe(x) + shared_expert(x)`. It lives outside the backend
+layer, so it is backend-agnostic and its weights are never touched by Tutel's
+or MegaBlocks' own expert initialization.
+
+| Knob | Effect |
+|------|--------|
+| `shared_expert: True` | build the shared branch (costs one extra FFN per token: top-k → top-k+1 active) |
+| `shared_expert_dwconv: True` | shared branch is a verbatim PVT v2 `Mlp`, **DWConv included** — restores the conv positional encoding the routed branch drops, so RoPE is no longer load-bearing in MoE blocks |
+| `routed_zero_init: True` | zero the routed experts' fc2 at upcycle, so the block starts out computing *exactly* the pretrained dense FFN and the routed experts learn a residual (requires `shared_expert`) |
+
+With `mode: hf_pretrained`, the shared branch is loaded verbatim from the
+pretrained dense FFN — the one place a pretrained FFN survives intact rather
+than being replicated into E experts. Read the
+`seeded_shared=... zeroed_routed_fc2=...` fields of the `[HF pretrained]` line
+to confirm it happened. Run names gain `+sh`
+(e.g. `v10_in1k_moe-s4-e8k1+sh_rope-s4_ln`).
 
 ## MoE backends
 
