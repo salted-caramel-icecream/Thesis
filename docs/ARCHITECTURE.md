@@ -61,6 +61,22 @@ consequences worth stating as invariants:
    relaxes the invariant above: a shared-expert MoE block is *not*
    position-blind, so RoPE becomes an independent axis rather than a
    compensation for MoE.
+
+   *Why the routed branch still cannot have one.* Token-choice routing
+   destroys the grid: the router gathers each expert's tokens out of order
+   and pads them to `capacity`, so the `N` axis reaching an expert is a
+   ragged bag of tokens from arbitrary `(h, w)` positions — there is no
+   `H x W` to reshape to, and tokens over capacity are dropped entirely. A
+   depthwise conv is therefore only definable on the **unrouted** tensor.
+   `MoEMlp.forward` passes the flattened `x_flat` to `moe_layer` but the
+   original `(B, N, C)` `x` plus `H`/`W` to the shared expert, so the shared
+   branch is the one place inside an MoE block where the grid survives.
+   `tests/test_shared_expert.py::test_shared_expert_sees_the_token_grid`
+   pins this down: permuting tokens and un-permuting the output changes the
+   shared branch's result (and does not, with the DWConv off).
+
+   A second consequence of being unrouted: capacity-dropped tokens still get
+   a full FFN from the shared branch instead of zero.
 3. **`routed_zero_init` gives exact function preservation.** Zeroing every
    routed expert's fc2 at upcycle makes the block compute exactly the
    pretrained dense FFN at step 0 (verified by

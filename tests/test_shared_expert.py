@@ -211,3 +211,110 @@ def test_shared_expert_params_land_in_stage4_decay_group():
     groups = {g["name"]: g for g in lit.configure_optimizers()["optimizer"].param_groups}
     in_s4 = {id(p) for p in groups["stage4_decay"]["params"]}
     assert shared_ids and shared_ids <= in_s4, "shared expert not in stage4_decay group"
+
+
+# --- spatial structure (why the DWConv can live here and not in a routed expert) ---
+
+def _shared_only(**over):
+    """A MoEMlp whose routed branch is zeroed, so output == shared_expert(x)."""
+    moe = _moe_mlp(**over)
+    zero_routed_expert_output(moe)
+    moe.eval()
+    return moe
+
+
+def test_shared_expert_sees_the_token_grid():
+    """The shared branch is NOT routed, so its DWConv sees an intact H x W grid.
+
+    Permuting tokens and un-permuting the output must CHANGE the result: that
+    position-sensitivity is precisely what token-choice routing destroys (the
+    router gathers tokens per expert and pads to capacity, so N no longer maps
+    to a grid) and is why the DWConv belongs in the shared branch only.
+    """
+    torch.manual_seed(0)
+    moe = _shared_only(shared_expert_dwconv=True)
+    H = W = 7
+    x = torch.randn(2, H * W, DIM)
+    perm = torch.randperm(H * W)
+    inverse = torch.argsort(perm)
+
+    with torch.no_grad():
+        straight, _ = moe(x, H, W)
+        shuffled, _ = moe(x[:, perm], H, W)
+    assert not torch.allclose(straight, shuffled[:, inverse], atol=1e-5), (
+        "shared expert is position-blind — the DWConv is not seeing the grid"
+    )
+
+
+def test_shared_expert_without_dwconv_is_token_wise():
+    """Control: with the DWConv off the shared branch is purely token-wise."""
+    torch.manual_seed(0)
+    moe = _shared_only(shared_expert_dwconv=False)
+    H = W = 7
+    x = torch.randn(2, H * W, DIM)
+    perm = torch.randperm(H * W)
+    inverse = torch.argsort(perm)
+
+    with torch.no_grad():
+        straight, _ = moe(x, H, W)
+        shuffled, _ = moe(x[:, perm], H, W)
+    assert torch.allclose(straight, shuffled[:, inverse], atol=1e-5)
+
+
+def test_shared_expert_runs_on_every_token():
+    """No capacity limit applies to the shared branch: no token gets zero."""
+    moe = _shared_only()
+    with torch.no_grad():
+        out, _ = moe(torch.randn(2, 49, DIM), 7, 7)
+    per_token = out.abs().sum(dim=-1)
+    assert (per_token > 0).all(), "some token received no shared-expert output"
+
+
+# --- compute accounting ----------------------------------------------------
+
+def _moe_model(**moe_over):
+    cfg = tiny_config(model={
+        "ablation": {"use_moe": True, "moe_placement": [[], [], [], [0]]},
+        "moe": moe_over,
+    })
+    undo = install_fake_tutel_backend()
+    try:
+        return build_model(cfg)
+    finally:
+        undo()
+
+
+def test_analytic_flops_include_the_shared_expert():
+    from pvt_moe.utils.flops import _analytic_moe_flops
+
+    base = _analytic_moe_flops(_moe_model(shared_expert=False), 224)
+    withshared = _analytic_moe_flops(_moe_model(shared_expert=True), 224)
+
+    dim, hidden, seq = 64, 128, (224 // 32) ** 2   # tiny_config stage 4
+    expected = seq * (dim * hidden + hidden * dim + 9 * hidden)
+    assert withshared - base == expected, (
+        f"shared-expert FLOPs mis-counted: {withshared - base} != {expected}"
+    )
+
+
+def test_analytic_flops_drop_dwconv_term_when_disabled():
+    from pvt_moe.utils.flops import _analytic_moe_flops
+
+    with_dw = _analytic_moe_flops(_moe_model(shared_expert=True), 224)
+    no_dw = _analytic_moe_flops(
+        _moe_model(shared_expert=True, shared_expert_dwconv=False), 224
+    )
+    hidden, seq = 128, (224 // 32) ** 2
+    assert with_dw - no_dw == seq * 9 * hidden
+
+
+def test_count_params_splits_shared_from_routed():
+    from pvt_moe.utils.flops import count_params
+
+    stats = count_params(_moe_model(shared_expert=True))
+    assert stats["shared_expert_m"] > 0
+    assert stats["routed_expert_m"] > 0
+    assert abs(stats["shared_expert_m"] + stats["routed_expert_m"] - stats["moe_m"]) < 1e-9
+
+    plain = count_params(_moe_model(shared_expert=False))
+    assert plain["shared_expert_m"] == 0
