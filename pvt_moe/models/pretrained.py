@@ -87,6 +87,7 @@ def load_hf_pretrained(
     hf_model_id: str = "OpenGVLab/pvt_v2_b1",
     seed_moe_experts: bool = True,
     routed_zero_init: bool = False,
+    shared_zero_init: bool = False,
     verbose: bool = True,
 ) -> dict:
     """Load HF PVT v2 weights into the backbone. Returns a stats dict.
@@ -94,8 +95,11 @@ def load_hf_pretrained(
     MoE blocks (from ``model.moe_placement``) skip their dense ``mlp.*``
     weights; when ``seed_moe_experts`` those weights seed the experts instead.
     A block with a shared expert additionally gets the dense FFN loaded into
-    that shared branch verbatim; ``routed_zero_init`` then zeros the routed
-    experts' fc2 so the block starts out exactly at the pretrained function.
+    that shared branch verbatim. Exactly one of the two zero-inits may then be
+    applied so the block does not emit ~2x the dense layer at step 0:
+    ``routed_zero_init`` zeros the routed experts' fc2 (exact function
+    preservation at any top_k), ``shared_zero_init`` zeros the shared expert's
+    fc2 instead (the spec's Sparse-Upcycling-style init).
     """
     from transformers import AutoModelForImageClassification  # lazy
 
@@ -117,7 +121,8 @@ def load_hf_pretrained(
     stats = {
         "loaded": 0, "kv_fused": 0, "kv_skipped": 0, "skipped_moe_mlp": 0,
         "skipped_shape": 0, "dropped_no_target": 0, "unmapped": [],
-        "seeded_moe_blocks": 0, "seeded_shared_experts": 0, "zeroed_routed_fc2": 0,
+        "seeded_moe_blocks": 0, "seeded_shared_experts": 0,
+        "zeroed_routed_fc2": 0, "zeroed_shared_fc2": 0,
     }
 
     for hf_key, value in hf_state.items():
@@ -181,6 +186,8 @@ def load_hf_pretrained(
                 stats["seeded_shared_experts"] += 1
                 if routed_zero_init:
                     stats["zeroed_routed_fc2"] += zero_routed_expert_output(moe_mlp)
+                if shared_zero_init:
+                    stats["zeroed_shared_fc2"] += zero_shared_expert_output(moe_mlp)
 
     if verbose:
         print(
@@ -189,7 +196,8 @@ def load_hf_pretrained(
             f"shape_skipped={stats['skipped_shape']} no_target={stats['dropped_no_target']} "
             f"seeded_moe_blocks={stats['seeded_moe_blocks']} "
             f"seeded_shared={stats['seeded_shared_experts']} "
-            f"zeroed_routed_fc2={stats['zeroed_routed_fc2']}"
+            f"zeroed_routed_fc2={stats['zeroed_routed_fc2']} "
+            f"zeroed_shared_fc2={stats['zeroed_shared_fc2']}"
         )
         if stats["loaded"] < 50:
             print("  !! Very few weights loaded — remap patterns are probably stale. "
@@ -334,6 +342,36 @@ def seed_shared_expert_from_dense(moe_mlp, dense_state: dict, prefix: str) -> in
         print(f"[shared expert] warning — {prefix}: loaded {len(sub)}/{expected} "
               f"tensors, left at init: {missing}")
     return len(sub)
+
+
+@torch.no_grad()
+def zero_shared_expert_output(moe_mlp) -> int:
+    """Zero the SHARED expert's output projection (fc2 weight and bias).
+
+    The counterpart to ``zero_routed_expert_output``: here the ROUTED experts
+    carry the replicated pretrained FFN and the shared expert grows from zero.
+    This is the Sparse-Upcycling-style init in docs/HPARAMS.md, whose stated
+    purpose is to stop shared + routed both copying the FFN and emitting ~2x
+    the dense layer at step 0.
+
+    Caveat (see docs/HPARAMS.md): that scheme is only function-preserving if
+    the router's combine weights are normalized per token to sum to 1. Tutel
+    normalizes gates ONLY when ``top_k > 1`` (``impls/fast_dispatch.py``,
+    ``extract_critical``), so at the default ``top_k: 1`` the routed branch is
+    scaled by the raw softmax score (<1) and the block does NOT reproduce the
+    dense FFN exactly. ``routed_zero_init`` does, at any top_k.
+
+    Returns the number of tensors zeroed (0 when there is no shared expert).
+    """
+    shared = getattr(moe_mlp, "shared_expert", None)
+    if shared is None:
+        return 0
+    shared.fc2.weight.zero_()
+    zeroed = 1
+    if shared.fc2.bias is not None:
+        shared.fc2.bias.zero_()
+        zeroed += 1
+    return zeroed
 
 
 @torch.no_grad()

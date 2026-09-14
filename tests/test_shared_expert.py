@@ -37,8 +37,9 @@ def _moe_mlp(**over):
 
 # --- construction ----------------------------------------------------------
 
-def test_shared_expert_absent_by_default():
-    assert default_config()["model"]["moe"]["shared_expert"] is False
+def test_shared_expert_on_by_default_and_omittable():
+    # The spec's MoE block is "1 shared expert, always-on".
+    assert default_config()["model"]["moe"]["shared_expert"] is True
     moe = _moe_mlp(shared_expert=False, routed_zero_init=False)
     assert moe.shared_expert is None
 
@@ -168,8 +169,8 @@ def test_config_rejects_zero_init_without_shared_expert():
 def test_run_tag_marks_shared_expert():
     cfg = merge_config(default_config(), {"model": {"moe": {"shared_expert": True}}})
     assert "+sh" in build_run_tag(validate_config(cfg))
-    plain = validate_config(default_config())
-    assert "+sh" not in build_run_tag(plain)
+    off = merge_config(default_config(), {"model": {"moe": {"shared_expert": False}}})
+    assert "+sh" not in build_run_tag(validate_config(off))
 
 
 def test_model_builds_with_shared_expert_end_to_end():

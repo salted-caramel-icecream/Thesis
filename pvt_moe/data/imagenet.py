@@ -10,6 +10,19 @@ Hard-won rules from this project's history (do not regress):
 - Workers died (batch 1024 x 12 workers) when prefetch was oversized; the
   loader settings below are the stable configuration.
 
+Augmentation follows the DeiT-1 stack that PVT v2 inherits. Two pieces need
+timm rather than torchvision:
+
+- **RandAugment** is specified as timm's config string
+  (``rand-m9-mstd0.5-inc1``): magnitude 9, magnitude-std 0.5, *increasing*
+  severity. torchvision's ``RandAugment`` supports neither the magnitude
+  jitter nor the increasing-severity op set, so it is only a fallback
+  (``dataset.randaugment: None``).
+- **Repeated augmentation** (3 repeats) is a *sampler*, not a transform: each
+  image is drawn 3x per epoch with different augmentations, and the epoch is
+  shortened to compensate so the step count is unchanged. Set
+  ``dataset.repeated_aug: 1`` to disable.
+
 ImageNet-22k: same Arrow layout expected at ``dataset.arrow_dirs['imagenet-22k']``
 with 21841 classes (fall11 full-tag convention). Build it once with
 ``datasets``' parquet loader + ``save_to_disk`` (see README). The label
@@ -31,16 +44,35 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 _LABEL_KEYS = ("label", "labels", "cls", "fine_label")
 
 
+def _build_randaugment(ds: dict):
+    """RandAugment op: timm's config string when given, else torchvision."""
+    spec = ds.get("randaugment")
+    if isinstance(spec, str):
+        from timm.data import rand_augment_transform  # lazy
+
+        # timm needs the target size + fill colour to place its geometric ops.
+        hparams = {
+            "translate_const": int(ds["img_size"] * 0.45),
+            "img_mean": tuple(round(255 * c) for c in IMAGENET_MEAN),
+        }
+        return rand_augment_transform(spec, hparams)
+    if isinstance(spec, (list, tuple)):  # legacy [ops, magnitude] form
+        return transforms.RandAugment(*spec)
+    return transforms.RandAugment(
+        ds.get("randaugment_ops", 2), ds.get("randaugment_magnitude", 9)
+    )
+
+
 def build_transforms(cfg: dict):
-    """(train, val) torchvision transforms — the v9 recipe."""
+    """(train, val) transforms — the DeiT-1 stack PVT v2 uses."""
     ds = cfg["dataset"]
     img_size = ds["img_size"]
-    ra_ops, ra_mag = ds["randaugment"]
     train_tf = transforms.Compose(
         [
             transforms.RandomResizedCrop(img_size),
             transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(ra_ops, ra_mag),
+            # RandAugment runs on the PIL image, before ToTensor.
+            _build_randaugment(ds),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             transforms.RandomErasing(p=ds["random_erasing"]),
@@ -137,6 +169,29 @@ def build_dataloaders(cfg: dict, ssl: bool = False):
     train_ds, val_ds = build_datasets(cfg)
     if ssl:
         train_ds.transform = build_ssl_transform(cfg)
+
+    # Repeated augmentation: a sampler, not a transform. Disabled for SSL —
+    # JEPA's objective already supplies the invariance pressure and seeing the
+    # same image 3x per batch would weaken the target signal.
+    repeats = 1 if ssl else int(cfg["dataset"].get("repeated_aug", 1) or 1)
+    train_sampler = None
+    if repeats > 1:
+        from timm.data.distributed_sampler import RepeatAugSampler  # lazy
+
+        # RepeatAugSampler calls dist.get_world_size() unconditionally when
+        # num_replicas is None, which raises on a single-process run (no
+        # process group). Supply the degenerate values ourselves unless
+        # torch.distributed is actually up.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            replicas, rank = None, None
+        else:
+            replicas, rank = 1, 0
+        train_sampler = RepeatAugSampler(
+            train_ds, num_replicas=replicas, rank=rank, num_repeats=repeats
+        )
+        print(f"[data] repeated augmentation: {repeats} repeats "
+              f"({len(train_sampler):,} samples/epoch)")
+
     num_workers = cfg["num_workers"]
     # fork is measurably faster for HF Arrow datasets, but is Linux-only.
     mp_ctx = "fork" if sys.platform == "linux" and num_workers > 0 else None
@@ -148,7 +203,13 @@ def build_dataloaders(cfg: dict, ssl: bool = False):
         multiprocessing_context=mp_ctx,
     )
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=True, **common
+        train_ds,
+        batch_size=cfg["batch_size"],
+        # A sampler and shuffle=True are mutually exclusive in DataLoader.
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        drop_last=True,
+        **common,
     )
     val_loader = DataLoader(
         val_ds,

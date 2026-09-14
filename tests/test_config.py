@@ -17,8 +17,8 @@ from pvt_moe.config import (
 def test_default_config_validates():
     cfg = validate_config(default_config())
     assert cfg["dataset"]["num_classes"] == 1000
-    assert cfg["run_name"] == "v10_in1k_moe-s4-e8k1_rope-s4_ln"
-    assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [0, 1]]
+    assert cfg["run_name"] == "v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
+    assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
 
 
 def test_num_classes_derived_for_22k():
@@ -61,7 +61,7 @@ def test_run_tag_variants():
         "model": {"norm_type": "rmsnorm",
                   "ablation": {"use_moe": False, "use_rope": False}},
     })
-    assert build_run_tag(validate_config(cfg)) == "v10_in1k_dense_norope_rms"
+    assert build_run_tag(validate_config(cfg)) == "v10_in1k_dense_norope_rms_scratch90"
 
     cfg2 = merge_config(default_config(), {
         "model": {"ablation": {"moe_placement": [[], [], [1], [0, 1]]},

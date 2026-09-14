@@ -106,6 +106,7 @@ class Block(nn.Module):
         moe_cfg: dict | None = None,
         use_rope: bool = False,
         rope_theta: float = 100.0,
+        dense_dwconv: bool = True,
     ):
         super().__init__()
         self.use_moe = use_moe
@@ -129,7 +130,10 @@ class Block(nn.Module):
         if use_moe:
             self.mlp = MoEMlp(dim, hidden, moe_cfg=moe_cfg, act_layer=act_layer, drop=drop)
         else:
-            self.mlp = Mlp(dim, hidden, act_layer=act_layer, drop=drop, linear_attention=linear_attention)
+            self.mlp = Mlp(
+                dim, hidden, act_layer=act_layer, drop=drop,
+                linear_attention=linear_attention, use_dwconv=dense_dwconv,
+            )
 
     def forward(self, x: torch.Tensor, H: int, W: int):
         x = x + self.drop_path(self.attn(self.norm1(x), H, W))
@@ -169,6 +173,7 @@ class PyramidVisionTransformerV2(nn.Module):
         moe_cfg: dict | None = None,
         rope_theta: float = 100.0,
         act_layer=nn.GELU,
+        dense_dwconv: bool = True,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -213,6 +218,7 @@ class PyramidVisionTransformerV2(nn.Module):
                         moe_cfg=moe_cfg,
                         use_rope=(j in self.rope_placement[i]),
                         rope_theta=rope_theta,
+                        dense_dwconv=dense_dwconv,
                     )
                     for j in range(depths[i])
                 ]
@@ -378,4 +384,5 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         rope_placement=abl["rope_placement"] if abl["use_rope"] else None,
         moe_cfg=m["moe"],
         rope_theta=abl["rope_theta"],
+        dense_dwconv=m.get("dense_dwconv", True),
     )

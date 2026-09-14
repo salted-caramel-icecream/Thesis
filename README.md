@@ -9,7 +9,8 @@ repo root / `Archive/` / `Others/` for provenance).
 pvt_moe/        the package — ALL logic lives here
 notebooks/      thin launchers (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA)
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
-docs/           ARCHITECTURE.md (model & invariants), JEPA_GUIDE.md (SSL recipe)
+docs/           ARCHITECTURE.md (model & invariants), HPARAMS.md (the recipe
+                tables), JEPA_GUIDE.md (SSL recipe)
 .claude/skills/ skill library for AI-assisted maintenance
 ```
 
@@ -29,6 +30,43 @@ python tests/run_all.py      # must print "N passed, 0 failed"
 
 The notebooks add the repo root to `sys.path`; alternatively `pip install -e .`.
 
+## Recipes: from scratch or pretrained
+
+One key picks the whole hyperparameter set (`docs/HPARAMS.md` is the source of
+truth; `tests/test_recipes.py::test_spec_*` assert every value):
+
+```python
+cfg = merge_config(default_config(), {"recipe": "scratch"})   # or "pretrained"
+```
+
+| | `scratch` (default) | `pretrained` |
+|---|---|---|
+| `mode` | `scratch` | `hf_pretrained` |
+| Epochs | **90** (ablations) / 150 / 300 (final) | 100 |
+| Peak LR | 1e-3 @ batch 1024 | 1e-4 |
+| Warmup epochs | 5 | 3 |
+| Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") |
+| Stage-4 LR multiplier | 1.0 | 1.0 |
+| Weight decay / clip / batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical |
+
+A recipe fills only fields left as `None`, so **anything you set explicitly
+wins**:
+
+```python
+merge_config(default_config(), {
+    "recipe": "scratch",
+    "epochs": 300,                                     # 90 | 150 | 300
+    "optim": {"lr": 5e-4, "warmup_epochs": 10},        # override either, or leave None
+})
+```
+
+Warmup always starts from an absolute **1e-6** — `optim.warmup_start_factor`
+is derived from your peak LR rather than hand-set, so it stays right when you
+change `lr`. Run names carry the budget: `..._ln_scratch90`, `..._ln_ft100`.
+
+In `notebooks/01_train_supervised.ipynb` the top of the CONFIG cell exposes
+`RECIPE`, `EPOCHS`, `LR` and `WARMUP_EPOCHS` directly.
+
 ## The five ablation axes
 
 | # | Axis | Config | Notes |
@@ -39,6 +77,7 @@ The notebooks add the repo root to `sys.path`; alternatively `pip install -e .`.
 | 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
 | 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
+| 7 | Conv positional encoding | `model.dense_dwconv` | `False` removes PVT v2's FFN DWConv from dense blocks too — the "no DWConv + RoPE" arm (ladder runs 2 and 6) |
 
 Run names are derived from the flags (e.g. `v10_in1k_moe-s4-e8k1_rope-s4_ln`) —
 every W&B run self-documents its ablation.
@@ -88,6 +127,7 @@ instructions instead of silently re-downloading ~160 GB.
 | mode | What happens |
 |------|--------------|
 | `hf_pretrained` | remap `OpenGVLab/pvt_v2_b1` (kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling) |
+| | Set by `recipe: "pretrained"`; see `docs/HPARAMS.md` §3 for the two upcycling inits and why the spec's default is not function-preserving at `top_k: 1` |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |
 | `resume` | full Lightning resume from `ckpt_path` |
