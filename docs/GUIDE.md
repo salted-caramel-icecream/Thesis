@@ -128,6 +128,7 @@ key nothing reads.
 | MoE placement | `--moe-placement "[[],[],[],[1]]"` | `ablation.moe_placement` |
 | RoPE | `--rope` / `--no-rope` | `ablation.use_rope` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
+| DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
 | norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |

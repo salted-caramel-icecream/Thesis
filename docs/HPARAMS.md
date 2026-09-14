@@ -112,6 +112,45 @@ Not applied automatically — pass --lr.
 0.5. The "linear + softmax" row is about the gate *function* (vs cosine / L2),
 not about noise. Tutel's own default is 0.0. Set it deliberately.
 
+### Positional encoding in the MoE'd block
+
+`model.moe.moe_block_dwconv` controls whether the converted block keeps PVT
+v2's depthwise conv. It is **scoped to the blocks in `moe_placement`** — dense
+blocks elsewhere keep their official CFFN (`model.dense_dwconv` strips those).
+
+The conv rides the **shared expert**, because that is the only branch of a MoE
+block with an intact token grid: token-choice routing gathers each expert's
+tokens out of order and pads to capacity, so the routed branch has no H×W to
+convolve over. A block with `shared_expert: false` therefore has no conv at
+all, and the flag resolves to false.
+
+Independent of `use_rope`, giving four arms, all distinctly named:
+
+| Arm | Flags | Run name fragment |
+|---|---|---|
+| conv carries position | `--moe-dwconv --no-rope` | `+sh_norope` |
+| RoPE replaces the conv | `--no-moe-dwconv --rope` | `+sh-plain_rope-s4b1` |
+| both | `--moe-dwconv --rope` | `+sh_rope-s4b1` |
+| neither | `--no-moe-dwconv --no-rope` | `+sh-plain_norope` |
+
+Ready-made: `configs/scratch_10..12_*.yaml`.
+
+"Neither" is not degenerate. PVT v2 has no learned or sinusoidal position
+embedding, but its zero-padded patch-embed convs leak absolute position
+(Islam et al., ICLR 2020), so that arm measures how much the CFFN contributes
+on top of what the stem already provides.
+
+When the conv is dropped, upcycling still transfers fc1/fc2 and their biases
+in full and reports the skip rather than dropping it silently:
+
+```
+[shared expert] block4.1.: this block has no DWConv (moe_block_dwconv=False)
+— skipped 2 conv tensor(s); fc1/fc2 transferred in full.
+```
+
+Any *other* source tensor without a destination is a `WARNING`, not a quiet
+drop — `tests/test_shared_expert.py` asserts both messages.
+
 ---
 
 ## 3. Pretrained (`recipe: "pretrained"`)
@@ -358,7 +397,7 @@ do not fully compose. Either the pretrained path keeps the conv-FFN, or you
 accept a partial load with a randomly-initialized positional component.
 
 This codebase now offers a third option the doc predates: a **shared expert
-carrying the DWConv** (`model.moe.shared_expert_dwconv: True`, the default).
+carrying the DWConv** (`model.moe.moe_block_dwconv: True`, the default).
 The shared branch is unrouted, so it can hold PVT v2's depthwise conv *and*
 load it verbatim from the checkpoint — the routed branch stays conv-free
 because token-choice routing destroys the token grid. That keeps the

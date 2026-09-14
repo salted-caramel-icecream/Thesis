@@ -299,14 +299,23 @@ _DEFAULT: dict = {
             # active), and is the only way to carry a pretrained dense FFN
             # through EXACTLY rather than copying it into every expert.
             "shared_expert": True,
-            # Keep PVT v2's depthwise conv in the shared branch. True makes
-            # the shared expert a verbatim PVT v2 Mlp, which restores the
-            # conv positional encoding the routed branch drops (so RoPE
-            # becomes optional rather than load-bearing in MoE blocks).
-            "shared_expert_dwconv": True,
-            # Zero the routed experts' fc2 when upcycling, so the block starts
-            # out computing EXACTLY the pretrained dense FFN and the routed
-            # experts learn a residual. Requires shared_expert.
+            # Does the MoE'd BLOCK keep PVT v2's depthwise conv anywhere?
+            #
+            # True  -> the shared expert is a verbatim PVT v2 Mlp
+            #          (fc1 -> DWConv -> GELU -> fc2), so the block keeps the
+            #          conv positional encoding and RoPE becomes an
+            #          independent axis rather than a compensation for MoE.
+            # False -> plain fc1 -> GELU -> fc2 throughout the block.
+            #
+            # The conv lands on the SHARED branch because that is the only
+            # place it can: token-choice routing gathers each expert's tokens
+            # out of order and pads to capacity, so the routed branch has no
+            # H x W grid to convolve over (docs/ARCHITECTURE.md section 2).
+            #
+            # SCOPE: this touches ONLY the blocks in ablation.moe_placement.
+            # Dense blocks elsewhere keep their official CFFN untouched — use
+            # model.dense_dwconv for those.
+            "moe_block_dwconv": True,
             # Which branch starts at zero when upcycling a pretrained FFN:
             # "routed_zero" | "shared_zero" | "none" (VALID_UPCYCLE_INITS).
             # None => recipe default. Resolves to "none" whenever there is no
@@ -446,6 +455,10 @@ def build_run_tag(cfg: dict) -> str:
         )
         init = {"shared_zero": "-szi", "none": "-nozi"}.get(
             moe_cfg.get("upcycle_init"), "") if init_applies else ""
+        # A MoE'd block with and without its DWConv are different models;
+        # without this they would share a checkpoint directory.
+        plain = ("-plain" if moe_cfg.get("shared_expert")
+                 and not moe_cfg.get("moe_block_dwconv", True) else "")
         randexp = (
             "-randexp"
             if cfg.get("mode") == "hf_pretrained"
@@ -454,7 +467,7 @@ def build_run_tag(cfg: dict) -> str:
         )
         moe = (
             f"moe-{_placement_tag(moe_pl, depths)}-"
-            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{init}{randexp}{backend}"
+            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{plain}{init}{randexp}{backend}"
         )
     else:
         moe = "dense"

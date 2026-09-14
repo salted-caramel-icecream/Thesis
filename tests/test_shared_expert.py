@@ -23,7 +23,7 @@ DIM, HIDDEN, E = 16, 32, 4
 _MOE_CFG = {
     "backend": "tutel", "num_experts": E, "top_k": 1,
     "capacity_factor": 2.0, "gate_noise": 0.5,
-    "shared_expert": True, "shared_expert_dwconv": True, "upcycle_init": "routed_zero",
+    "shared_expert": True, "moe_block_dwconv": True, "upcycle_init": "routed_zero",
 }
 
 
@@ -52,8 +52,8 @@ def test_shared_expert_is_a_pvt_mlp_with_dwconv():
     assert moe.shared_expert.fc2.weight.shape == (DIM, HIDDEN)
 
 
-def test_shared_expert_dwconv_can_be_disabled():
-    moe = _moe_mlp(shared_expert_dwconv=False)
+def test_moe_block_dwconv_can_be_disabled():
+    moe = _moe_mlp(moe_block_dwconv=False)
     assert moe.shared_expert.dwconv is None
     x = torch.randn(2, 9, DIM)
     out, _ = moe(x, 3, 3)
@@ -233,7 +233,7 @@ def test_shared_expert_sees_the_token_grid():
     to a grid) and is why the DWConv belongs in the shared branch only.
     """
     torch.manual_seed(0)
-    moe = _shared_only(shared_expert_dwconv=True)
+    moe = _shared_only(moe_block_dwconv=True)
     H = W = 7
     x = torch.randn(2, H * W, DIM)
     perm = torch.randperm(H * W)
@@ -250,7 +250,7 @@ def test_shared_expert_sees_the_token_grid():
 def test_shared_expert_without_dwconv_is_token_wise():
     """Control: with the DWConv off the shared branch is purely token-wise."""
     torch.manual_seed(0)
-    moe = _shared_only(shared_expert_dwconv=False)
+    moe = _shared_only(moe_block_dwconv=False)
     H = W = 7
     x = torch.randn(2, H * W, DIM)
     perm = torch.randperm(H * W)
@@ -303,7 +303,7 @@ def test_analytic_flops_drop_dwconv_term_when_disabled():
 
     with_dw = _analytic_moe_flops(_moe_model(shared_expert=True), 224)
     no_dw = _analytic_moe_flops(
-        _moe_model(shared_expert=True, shared_expert_dwconv=False), 224
+        _moe_model(shared_expert=True, moe_block_dwconv=False), 224
     )
     hidden, seq = 128, (224 // 32) ** 2
     assert with_dw - no_dw == seq * 9 * hidden
@@ -419,7 +419,7 @@ def test_shared_zero_does_NOT_preserve_the_function_at_top_k_1():
 def test_function_preservation_holds_without_the_shared_dwconv():
     """A plain FC1->GELU->FC2 shared expert cannot reproduce the dense FFN,
     because the dense FFN has a DWConv the shared branch dropped."""
-    dense, moe = _dense_and_upcycled("routed_zero", shared_expert_dwconv=False)
+    dense, moe = _dense_and_upcycled("routed_zero", moe_block_dwconv=False)
     dense.eval()
     moe.eval()
     x = torch.randn(2, 3, 64, 64)
@@ -430,3 +430,133 @@ def test_function_preservation_holds_without_the_shared_dwconv():
         "dropping the shared DWConv should break exact preservation — the "
         "dense FFN's conv has nowhere to go"
     )
+
+
+# --- STEP 2: moe_block_dwconv is SCOPED to the MoE'd blocks ----------------
+
+def _model_with(moe_placement, **moe_over):
+    cfg = tiny_config(model={
+        "ablation": {"use_moe": True, "moe_placement": moe_placement},
+        "moe": {"shared_expert": True, **moe_over},
+    })
+    undo = install_fake_tutel_backend()
+    try:
+        return build_model(cfg), cfg
+    finally:
+        undo()
+
+
+def test_moe_block_dwconv_false_touches_only_the_moed_blocks():
+    """Every block OUTSIDE moe_placement must keep its official CFFN."""
+    placement = [[], [], [], [1]]           # stage 4, last block only
+    model, _ = _model_with(placement, moe_block_dwconv=False)
+
+    moed, dense_blocks = [], []
+    for stage in range(1, 5):
+        for j, blk in enumerate(getattr(model, f"block{stage}")):
+            (moed if j in placement[stage - 1] else dense_blocks).append(
+                (f"block{stage}.{j}", blk))
+
+    assert len(moed) == 1, [n for n, _ in moed]
+    assert dense_blocks, "test needs at least one untouched dense block"
+
+    for name, blk in dense_blocks:
+        assert isinstance(blk.mlp, Mlp), name
+        assert blk.mlp.dwconv is not None, f"{name} lost its DWConv — not in scope!"
+    for name, blk in moed:
+        assert blk.mlp.shared_expert.dwconv is None, name
+
+
+def test_moe_block_dwconv_true_keeps_the_conv_in_the_moed_block():
+    model, _ = _model_with([[], [], [], [1]], moe_block_dwconv=True)
+    assert model.block4[1].mlp.shared_expert.dwconv is not None
+    assert model.block1[0].mlp.dwconv is not None
+
+
+def test_multi_stage_placement_stays_scoped():
+    # tiny_config depths are [1, 1, 1, 2], so stage 3's only block is index 0.
+    placement = [[], [], [0], [1]]          # stages 3 and 4
+    model, _ = _model_with(placement, moe_block_dwconv=False)
+    assert model.block3[0].mlp.shared_expert.dwconv is None
+    assert model.block4[1].mlp.shared_expert.dwconv is None
+    # the dense sibling in stage 4, and stages 1-2 entirely, are untouched
+    assert model.block4[0].mlp.dwconv is not None
+    assert model.block1[0].mlp.dwconv is not None
+    assert model.block2[0].mlp.dwconv is not None
+
+
+def test_dwconv_and_rope_are_independently_toggleable():
+    """The four arms must all be buildable and distinctly named."""
+    arms = {
+        "dwconv+norope": dict(dw=True, rope=False),
+        "nodwconv+rope": dict(dw=False, rope=True),
+        "dwconv+rope": dict(dw=True, rope=True),
+        "nodwconv+norope": dict(dw=False, rope=False),
+    }
+    names = {}
+    for label, a in arms.items():
+        cfg = tiny_config(model={
+            "ablation": {"use_moe": True, "moe_placement": [[], [], [], [1]],
+                         "use_rope": a["rope"],
+                         "rope_placement": [[], [], [], [1]] if a["rope"] else [[], [], [], []]},
+            "moe": {"shared_expert": True, "moe_block_dwconv": a["dw"]},
+        })
+        undo = install_fake_tutel_backend()
+        try:
+            model = build_model(cfg)
+        finally:
+            undo()
+        assert (model.block4[1].mlp.shared_expert.dwconv is not None) is a["dw"], label
+        names[label] = cfg["run_name"]
+    assert len(set(names.values())) == 4, (
+        f"arms collide on run_name (they would share a checkpoint dir): {names}"
+    )
+
+
+def test_seeding_skips_only_the_conv_when_the_block_has_none(capsys=None):
+    """'don't silently drop other weights': fc1/fc2/bias still transfer, the
+    conv is reported as skipped, and nothing else goes missing."""
+    import io
+    from contextlib import redirect_stdout
+
+    from pvt_moe.models.pretrained import seed_shared_expert_from_dense
+
+    moe = _moe_mlp(moe_block_dwconv=False)
+    dense = Mlp(DIM, HIDDEN)                      # WITH a DWConv
+    prefix = "block4.0."
+    state = {f"{prefix}mlp.{k}": v for k, v in dense.state_dict().items()}
+    assert any("dwconv" in k for k in state), "source must have a conv to skip"
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        n = seed_shared_expert_from_dense(moe, state, prefix)
+    out = buf.getvalue()
+
+    # every non-conv tensor transferred, verbatim
+    for key, value in dense.state_dict().items():
+        if key.startswith("dwconv."):
+            continue
+        assert torch.equal(moe.shared_expert.state_dict()[key], value), key
+    assert n == len(moe.shared_expert.state_dict())
+    # and the skip was announced, not silent
+    assert "moe_block_dwconv=False" in out and "skipped" in out, out
+    assert "WARNING" not in out, f"a routine skip must not warn: {out}"
+
+
+def test_seeding_warns_when_something_other_than_the_conv_is_dropped():
+    import io
+    from contextlib import redirect_stdout
+
+    from pvt_moe.models.pretrained import seed_shared_expert_from_dense
+
+    moe = _moe_mlp(moe_block_dwconv=True)
+    dense = Mlp(DIM, HIDDEN)
+    prefix = "block4.0."
+    state = {f"{prefix}mlp.{k}": v for k, v in dense.state_dict().items()}
+    state[f"{prefix}mlp.mystery.weight"] = torch.randn(3)   # no destination
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        seed_shared_expert_from_dense(moe, state, prefix)
+    out = buf.getvalue()
+    assert "WARNING" in out and "mystery.weight" in out, out

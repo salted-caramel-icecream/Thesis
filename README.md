@@ -138,7 +138,7 @@ or MegaBlocks' own expert initialization.
 | Knob | Effect |
 |------|--------|
 | `shared_expert: True` | build the shared branch (costs one extra FFN per token: top-k → top-k+1 active) |
-| `shared_expert_dwconv: True` | shared branch is a verbatim PVT v2 `Mlp`, **DWConv included** — restores the conv positional encoding the routed branch drops, so RoPE is no longer load-bearing in MoE blocks |
+| `moe_block_dwconv: True` | the MoE'd block keeps PVT v2's DWConv (on the shared branch, the only one with an intact token grid) — so RoPE becomes an independent axis instead of a compensation. **Scoped to `moe_placement`**; dense blocks elsewhere are untouched |
 | `upcycle_init` | which branch starts at zero when upcycling: `"routed_zero"` (default — the block starts out computing *exactly* the pretrained dense FFN), `"shared_zero"` (the spec's scheme), or `"none"`. Resolves to `"none"` with no shared expert |
 
 With `mode: hf_pretrained`, the shared branch is loaded verbatim from the

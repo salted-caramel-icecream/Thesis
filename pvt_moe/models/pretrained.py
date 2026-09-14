@@ -338,11 +338,27 @@ def seed_shared_expert_from_dense(moe_mlp, dense_state: dict, prefix: str) -> in
             sub[local] = value
 
     shared.load_state_dict(sub, strict=False)
-    expected = len(target)
-    if len(sub) < expected:
-        missing = sorted(set(target) - set(sub))
-        print(f"[shared expert] warning — {prefix}: loaded {len(sub)}/{expected} "
-              f"tensors, left at init: {missing}")
+
+    # Report BOTH directions. A source tensor with no destination is expected
+    # when the block dropped its DWConv (moe_block_dwconv: False) and alarming
+    # otherwise, so say which it is rather than dropping weights silently.
+    source_keys = {k[len(prefix) + len("mlp."):] for k in dense_state
+                   if k.startswith(prefix + "mlp.")}
+    no_destination = sorted(source_keys - set(target))
+    if no_destination:
+        conv_only = all(k.startswith("dwconv.") for k in no_destination)
+        if conv_only and shared.dwconv is None:
+            print(f"[shared expert] {prefix}: this block has no DWConv "
+                  f"(moe_block_dwconv=False) — skipped {len(no_destination)} conv "
+                  f"tensor(s); fc1/fc2 transferred in full.")
+        else:
+            print(f"[shared expert] WARNING — {prefix}: {len(no_destination)} source "
+                  f"tensor(s) had no destination and were DROPPED: {no_destination}")
+
+    left_at_init = sorted(set(target) - set(sub))
+    if left_at_init:
+        print(f"[shared expert] WARNING — {prefix}: loaded {len(sub)}/{len(target)} "
+              f"tensors, left at random init: {left_at_init}")
     return len(sub)
 
 

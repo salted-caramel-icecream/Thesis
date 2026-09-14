@@ -106,7 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     _bool_pair(g, "rope", "use_rope", "enable RoPE (--no-rope to disable)")
     _bool_pair(g, "dwconv", "dense_dwconv",
                "keep PVT v2's FFN depthwise conv in DENSE blocks "
-               "(--no-dwconv for the 'no DWConv' arm)")
+               "(--no-dwconv for the fully-dense 'no DWConv' arm)")
+    _bool_pair(g, "moe-dwconv", "moe_block_dwconv",
+               "keep the depthwise conv inside the MoE'd BLOCK — it rides the "
+               "shared expert, the only branch with an intact token grid. "
+               "--no-moe-dwconv gives plain fc1->GELU->fc2. Scoped to "
+               "moe_placement; dense blocks elsewhere are untouched")
     _bool_pair(g, "shared-expert", "shared_expert",
                "always-on shared expert added to the routed output")
     g.add_argument("--experts", type=int, dest="num_experts", help="routed experts (recipe: 4)")
@@ -249,6 +254,7 @@ _FLAG_PATHS = {
     "drop_path_rate": "model.drop_path_rate",
     "norm_type": "model.norm_type",
     "dense_dwconv": "model.dense_dwconv",
+    "moe_block_dwconv": "model.moe.moe_block_dwconv",
     "use_moe": "model.ablation.use_moe",
     "use_rope": "model.ablation.use_rope",
     "moe_last_n_stages": "model.ablation.moe_last_n_stages",

@@ -57,7 +57,7 @@ consequences worth stating as invariants:
    their own expert tensors at construction; the shared expert is outside that
    blast radius, so it is the only branch whose weights are guaranteed to be
    whatever we put there.
-2. **It can keep the DWConv** (`shared_expert_dwconv`, default True), which
+2. **It can keep the DWConv** (`moe_block_dwconv`, default True), which
    relaxes the invariant above: a shared-expert MoE block is *not*
    position-blind, so RoPE becomes an independent axis rather than a
    compensation for MoE.

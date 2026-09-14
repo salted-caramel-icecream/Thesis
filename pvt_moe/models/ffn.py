@@ -26,7 +26,7 @@ and its weights survive whatever the backend does to its own experts. Two
 reasons it matters here:
 
 1. It is the only place a pretrained dense FFN can be kept *exactly* rather
-   than copied into E experts — and with ``shared_expert_dwconv`` it keeps the
+   than copied into E experts — and with ``moe_block_dwconv`` it keeps the
    DWConv too, restoring the positional encoding the routed branch drops.
 2. With ``upcycle_init="routed_zero"`` the routed experts' fc2 starts at zero,
    so at step 0 the block computes exactly the pretrained dense FFN and the
@@ -151,7 +151,7 @@ class MoEMlp(nn.Module):
                 hidden_features,
                 act_layer=act_layer,
                 drop=0.0,
-                use_dwconv=moe_cfg.get("shared_expert_dwconv", True),
+                use_dwconv=moe_cfg.get("moe_block_dwconv", True),
             )
 
         if self.backend == "tutel":

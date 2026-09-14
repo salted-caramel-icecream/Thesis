@@ -1,0 +1,22 @@
+# MoE block drops its DWConv, RoPE on
+# Position-encoding arm — docs/HPARAMS.md section 2.
+#
+#   python train.py --config configs/scratch_11_moe_nodwconv_rope.yaml
+#
+# NOTE: RoPE reinjects the position the conv used to carry.
+#
+# moe_block_dwconv is SCOPED to the blocks in moe_placement; dense blocks
+# elsewhere keep their official CFFN. Use model.dense_dwconv to strip those.
+
+recipe: "scratch"
+epochs: 90
+model:
+  moe:
+    num_experts: 4
+    shared_expert: true
+    moe_block_dwconv: false
+  ablation:
+    use_moe: true
+    moe_placement: [[], [], [], [1]]
+    use_rope: true
+    rope_placement: [[], [], [], [1]]
