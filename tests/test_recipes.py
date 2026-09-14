@@ -370,3 +370,88 @@ def test_default_config_passes_its_own_schema_check():
     from pvt_moe.config import assert_known_keys
 
     assert_known_keys(default_config())
+
+
+# --- v9 lineage parity ------------------------------------------------------
+
+def test_val_metrics_include_macro_precision_and_recall():
+    """The v9 lineage logged these; they surface per-class collapse that micro
+    accuracy hides. Not on the train split (mixup'd soft targets)."""
+    from pvt_moe.engine.classifier import LitClassifier
+
+    lit = LitClassifier(tiny_config())
+    val = set(lit.val_metrics)
+    assert {"val_acc", "val_acc_top5", "val_precision_macro",
+            "val_recall_macro"} <= val, val
+    assert not any("precision" in k for k in lit.train_metrics)
+
+
+def test_val_metrics_actually_compute():
+    from pvt_moe.engine.classifier import LitClassifier
+
+    cfg = tiny_config()
+    lit = LitClassifier(cfg)
+    n = cfg["dataset"]["num_classes"]
+    logits = torch.randn(16, n)
+    target = torch.randint(0, n, (16,))
+    out = lit.val_metrics(logits, target)
+    for key in ("val_acc", "val_precision_macro", "val_recall_macro"):
+        assert torch.isfinite(out[key]), key
+
+
+# --- gradient checkpointing -------------------------------------------------
+
+def test_grad_checkpointing_defaults_off():
+    assert _cfg()["model"]["grad_checkpointing"] == []
+    assert build_model(tiny_config()).grad_checkpointing == set()
+
+
+def test_grad_checkpointing_stage_numbers_validated():
+    for bad in ([0], [5], [1, 9]):
+        try:
+            _cfg(model={"grad_checkpointing": bad})
+        except ValueError as e:
+            assert "grad_checkpointing" in str(e)
+        else:
+            raise AssertionError(f"{bad} should be rejected")
+
+
+def test_grad_checkpointing_preserves_outputs_and_gradients():
+    """Recomputation must change memory, never results."""
+    plain = tiny_config(model={"grad_checkpointing": []})
+    ckpt = tiny_config(model={"grad_checkpointing": [1, 2]})
+
+    torch.manual_seed(7)
+    a = build_model(plain)
+    torch.manual_seed(7)
+    b = build_model(ckpt)
+    b.load_state_dict(a.state_dict())
+    assert b.grad_checkpointing == {1, 2}
+
+    a.train()
+    b.train()
+    x = torch.randn(2, 3, 64, 64)
+    # drop_path is stochastic — disable it so the two paths are comparable
+    for m in list(a.modules()) + list(b.modules()):
+        if type(m).__name__ == "DropPath":
+            m.drop_prob = 0.0
+
+    out_a, _ = a(x)
+    out_b, _ = b(x)
+    assert torch.allclose(out_a, out_b, atol=1e-5), \
+        (out_a - out_b).abs().max().item()
+
+    out_a.sum().backward()
+    out_b.sum().backward()
+    ga = a.block1[0].mlp.fc1.weight.grad
+    gb = b.block1[0].mlp.fc1.weight.grad
+    assert gb is not None, "checkpointed stage produced no gradient"
+    assert torch.allclose(ga, gb, atol=1e-5), (ga - gb).abs().max().item()
+
+
+def test_grad_checkpointing_is_inactive_in_eval():
+    model = build_model(tiny_config(model={"grad_checkpointing": [1]}))
+    model.eval()
+    with torch.no_grad():
+        out, _ = model(torch.randn(2, 3, 64, 64))
+    assert out.shape[0] == 2

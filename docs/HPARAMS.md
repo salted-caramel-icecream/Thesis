@@ -62,9 +62,11 @@ Both of the first two need timm rather than torchvision:
 - The RandAugment **config string** carries magnitude-std 0.5 and the
   *increasing-severity* op set. torchvision's `RandAugment` supports neither,
   so it is only a fallback (`dataset.randaugment: None`).
-- Repeated augmentation is a **sampler**, not a transform: each image is drawn
-  3× per epoch with different augmentations and the epoch is shortened to
-  compensate. `dataset.repeated_aug: 1` disables it.
+- Repeated augmentation is a **sampler**, not a transform. The epoch keeps its
+  length (same step count); it just draws ~⅓ as many distinct images, each 3×
+  with different augmentation. The effect is on gradient variance, not
+  throughput — it neither costs nor saves wall-clock time.
+  `dataset.repeated_aug: 1` disables it.
 
 ### Batch size: micro vs effective
 
@@ -318,9 +320,9 @@ the DataLoader already falls back from `fork` to spawn off Linux.
 ### Wall-clock reality
 
 At an estimated 250–500 img/s for PVT v2 B1 at 224² on this card, one
-ImageNet-1k epoch is roughly **45–85 minutes** (repeated augmentation shortens
-the epoch to ~77% of the dataset, which is included). That puts the spec's
-budgets at:
+ImageNet-1k epoch is roughly **45–85 minutes**. (Repeated augmentation does
+not change this: the epoch keeps its step count.) That puts the spec's budgets
+at:
 
 | Budget | Estimated wall clock |
 |---|---|

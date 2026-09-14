@@ -111,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rope-placement", metavar="JSON")
     g.add_argument("--rope-last-n", type=int, dest="rope_last_n_stages")
     g.add_argument("--rope-theta", type=float)
+    g.add_argument("--grad-checkpointing", metavar="JSON",
+                   help='stages (1-based) to recompute in backward, e.g. "[1,2]". '
+                        'Saves memory proportional to token count, so stage 1 '
+                        'buys the most. ~30%% slower per checkpointed stage')
 
     g = p.add_argument_group("warm start")
     g.add_argument("--mode", choices=VALID_MODES,
@@ -259,7 +263,8 @@ def build_config(args, verbose: bool = True) -> dict:
             cfg = merge_config(cfg, _nest(path, value))
 
     for dest, path in (("moe_placement", "model.ablation.moe_placement"),
-                       ("rope_placement", "model.ablation.rope_placement")):
+                       ("rope_placement", "model.ablation.rope_placement"),
+                       ("grad_checkpointing", "model.grad_checkpointing")):
         raw = getattr(args, dest, None)
         if raw is not None:
             try:

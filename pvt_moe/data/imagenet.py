@@ -18,10 +18,16 @@ timm rather than torchvision:
   severity. torchvision's ``RandAugment`` supports neither the magnitude
   jitter nor the increasing-severity op set, so it is only a fallback
   (``dataset.randaugment: None``).
-- **Repeated augmentation** (3 repeats) is a *sampler*, not a transform: each
-  image is drawn 3x per epoch with different augmentations, and the epoch is
-  shortened to compensate so the step count is unchanged. Set
-  ``dataset.repeated_aug: 1`` to disable.
+- **Repeated augmentation** (3 repeats) is a *sampler*, not a transform. The
+  epoch keeps its LENGTH (same number of steps); what changes is that it draws
+  only ~1/3 as many distinct images, each 3 times with different augmentation.
+  It therefore costs no extra time and buys none either — the effect is on
+  gradient variance, not throughput. ``dataset.repeated_aug: 1`` disables it.
+
+  The sampler shuffles deterministically from ``self.epoch``; Lightning's fit
+  loop advances it via ``_set_sampler_epoch``. If that ever stopped happening,
+  every epoch would redraw the SAME third of the dataset —
+  ``tests/test_data_sampler.py`` runs a real fit to catch that.
 
 ImageNet-22k: same Arrow layout expected at ``dataset.arrow_dirs['imagenet-22k']``
 with 21841 classes (fall11 full-tag convention). Build it once with
@@ -190,8 +196,9 @@ def build_dataloaders(cfg: dict, ssl: bool = False):
         train_sampler = RepeatAugSampler(
             train_ds, num_replicas=replicas, rank=rank, num_repeats=repeats
         )
-        print(f"[data] repeated augmentation: {repeats} repeats "
-              f"({len(train_sampler):,} samples/epoch)")
+        print(f"[data] repeated augmentation: {repeats} repeats | "
+              f"{len(train_sampler):,} samples/epoch "
+              f"(~{len(train_sampler) // repeats:,} distinct images)")
 
     num_workers = cfg["num_workers"]
     # fork is measurably faster for HF Arrow datasets, but is Linux-only.

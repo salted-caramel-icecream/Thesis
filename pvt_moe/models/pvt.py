@@ -174,8 +174,11 @@ class PyramidVisionTransformerV2(nn.Module):
         rope_theta: float = 100.0,
         act_layer=nn.GELU,
         dense_dwconv: bool = True,
+        grad_checkpointing=(),
     ):
         super().__init__()
+        # 1-based stage numbers to recompute in the backward pass.
+        self.grad_checkpointing = set(grad_checkpointing or ())
         self.num_classes = num_classes
         self.depths = list(depths)
         self.num_stages = len(depths)
@@ -329,8 +332,19 @@ class PyramidVisionTransformerV2(nn.Module):
                     stage1_token_mask[..., None], mask_token.to(x.dtype).expand_as(x), x
                 )
 
+            checkpointed = (
+                self.training
+                and torch.is_grad_enabled()
+                and (i + 1) in self.grad_checkpointing
+            )
             for blk in blocks:
-                out = blk(x, H, W)
+                if checkpointed:
+                    # use_reentrant=False keeps this compatible with blocks that
+                    # return tuples (MoE blocks return (x, aux)).
+                    out = torch.utils.checkpoint.checkpoint(
+                        blk, x, H, W, use_reentrant=False)
+                else:
+                    out = blk(x, H, W)
                 if isinstance(out, tuple):
                     x, blk_aux = out
                     aux_total = aux_total + blk_aux
@@ -385,4 +399,5 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         moe_cfg=m["moe"],
         rope_theta=abl["rope_theta"],
         dense_dwconv=m.get("dense_dwconv", True),
+        grad_checkpointing=m.get("grad_checkpointing", ()),
     )

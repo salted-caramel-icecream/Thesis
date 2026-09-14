@@ -227,6 +227,14 @@ _DEFAULT: dict = {
         # (DeiT-3), so 90/150 ep -> 0.1 and 300 ep -> 0.15. pretrained: 0.1
         # ("as pretraining").
         "drop_path_rate": None,
+        # Stages (1-based) to run under gradient checkpointing while training:
+        # recompute activations in the backward pass instead of storing them.
+        # [] disables it. Roughly 30% slower per checkpointed stage, and the
+        # saving is proportional to TOKEN COUNT, so stage 1 (56x56 = 3136
+        # tokens) is worth far more than stage 4 (7x7 = 49). On a 12 GB card
+        # [1] or [1, 2] typically buys a 2-4x larger micro-batch.
+        "grad_checkpointing": [],
+
         # PVT v2 carries positional information as a depthwise 3x3 conv inside
         # the dense FFN. False removes it from DENSE blocks too — the
         # "no DWConv + RoPE" architecture edit as an ablation in its own right
@@ -791,6 +799,12 @@ def validate_config(cfg: dict) -> dict:
 
     depths = model["depths"]
     n = len(depths)
+    bad = [i for i in model.get("grad_checkpointing", []) if not 1 <= i <= n]
+    if bad:
+        raise ValueError(
+            f"model.grad_checkpointing must contain 1-based stage numbers in "
+            f"[1, {n}], got {bad}"
+        )
     for key in ("embed_dims", "num_heads", "num_kv_heads", "mlp_ratios", "sr_ratios"):
         if len(model[key]) != n:
             raise ValueError(f"model.{key} must have {n} entries, got {len(model[key])}")
