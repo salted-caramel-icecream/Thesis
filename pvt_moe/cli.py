@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pathlib
 import sys
 
 from pvt_moe.config import (
@@ -86,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stochastic depth (default: derived from --epochs)")
     g.add_argument("--stage4-lr-mult", type=float, dest="stage4_lr_multiplier",
                    help="stage-4/head LR multiplier (recipe: 1.0)")
+    g.add_argument("--milestones", metavar="JSON",
+                   help='epochs at which to save a permanent full-state '
+                        'checkpoint, e.g. "[90,100,150,200]". Never pruned by '
+                        'save_top_k; resume from any of them later')
+    g.add_argument("--stop-at", type=int, dest="stop_at_epoch", metavar="N",
+                   help="stop after N epochs WITHOUT changing the schedule "
+                        "(the cosine stays built for --epochs). Resume later "
+                        "with --resume-from")
     g.add_argument("--ladder", type=int, metavar="N",
                    help="apply ablation-ladder row N for this recipe "
                         "(1-9, docs/HPARAMS.md section 4)")
@@ -120,6 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--mode", choices=VALID_MODES,
                    help="override the recipe's mode (resume / ssl_init need --ckpt)")
     g.add_argument("--ckpt", dest="ckpt_path", metavar="PATH")
+    g.add_argument("--resume-from", metavar="PATH",
+                   help="resume model + optimizer + scheduler + epoch from a "
+                        "checkpoint and continue the SAME schedule. Implies "
+                        "--mode resume; works across machines and runs")
     g.add_argument("--hf-id", dest="pretrained_hf_id")
     _bool_pair(g, "seed-experts", "seed_moe_from_dense",
                "replicate the pretrained FFN into each expert "
@@ -149,8 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--precision")
     g.add_argument("--seed", type=int)
     g.add_argument("--run-name", help="default: derived from the ablation flags")
-    g.add_argument("--checkpoint-root")
-    g.add_argument("--log-root")
+    g.add_argument("--checkpoint-root", dest="checkpoint_root", metavar="DIR",
+                   help="where run directories (checkpoints) are written")
+    g.add_argument("--checkpoint-dir", dest="checkpoint_root",
+                   metavar="DIR", help=argparse.SUPPRESS)  # alias
+    g.add_argument("--log-root", metavar="DIR")
+    g.add_argument("--data-dir", metavar="DIR",
+                   help="directory holding the Arrow snapshot for the selected "
+                        "dataset (overrides dataset.arrow_dirs[<name>])")
     _bool_pair(g, "wandb", "use_wandb", "log to Weights & Biases")
     _bool_pair(g, "tensorboard", "use_tensorboard", "log to TensorBoard")
     _bool_pair(g, "deterministic", "deterministic",
@@ -158,7 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("escape hatches & inspection")
     g.add_argument("--config", metavar="FILE",
-                   help="JSON config merged before any flag")
+                   help="YAML or JSON config merged before any flag "
+                        "(.yaml/.yml need PyYAML)")
     g.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
@@ -175,6 +196,29 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Args -> config
 # ---------------------------------------------------------------------------
+
+def load_config_file(path: str) -> dict:
+    """Load a YAML or JSON config fragment.
+
+    YAML is the documented format for ``configs/*.yaml`` because ablation arms
+    want comments; JSON is accepted so ``--save-config`` output round-trips.
+    """
+    text = pathlib.Path(path).read_text()
+    if path.endswith((".yaml", ".yml")):
+        try:
+            import yaml  # lazy: only YAML configs need it
+        except ModuleNotFoundError:
+            raise SystemExit(
+                f"{path} is YAML but PyYAML is not installed. "
+                "Run `pip install pyyaml`, or use a .json config."
+            )
+        loaded = yaml.safe_load(text) or {}
+    else:
+        loaded = json.loads(text)
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"{path} must contain a mapping, got {type(loaded).__name__}")
+    return loaded
+
 
 def _parse_value(raw: str):
     """JSON where possible (numbers, bools, null, lists), else a plain string."""
@@ -196,6 +240,7 @@ def _nest(dotted: str, value):
 #: applied, so an unset flag never shadows the recipe.
 _FLAG_PATHS = {
     "epochs": "epochs",
+    "stop_at_epoch": "stop_at_epoch",
     "lr": "optim.lr",
     "warmup_epochs": "optim.warmup_epochs",
     "weight_decay": "optim.weight_decay",
@@ -246,8 +291,7 @@ def build_config(args, verbose: bool = True) -> dict:
     cfg = merge_config(cfg, {"recipe": args.recipe})
 
     if args.config:
-        with open(args.config) as fh:
-            cfg = merge_config(cfg, json.load(fh))
+        cfg = merge_config(cfg, load_config_file(args.config))
 
     if args.ladder is not None:
         overrides, desc, note = ladder_overrides(args.recipe, args.ladder)
@@ -257,6 +301,17 @@ def build_config(args, verbose: bool = True) -> dict:
             if note:
                 print(f"[ladder]   note: {note}")
 
+    # --data-dir points at the snapshot for whichever dataset is selected, so
+    # it must be applied after any --dataset flag has been resolved.
+    if getattr(args, "data_dir", None):
+        name = getattr(args, "dataset_name", None) or cfg["dataset"]["name"]
+        cfg = merge_config(cfg, {"dataset": {"arrow_dirs": {name: args.data_dir}}})
+
+    if getattr(args, "resume_from", None):
+        # Resuming restores the full state, so re-running a warm start would
+        # download HF weights, upcycle, and then have all of it overwritten.
+        cfg = merge_config(cfg, {"mode": "resume", "ckpt_path": args.resume_from})
+
     for dest, path in _FLAG_PATHS.items():
         value = getattr(args, dest, None)
         if value is not None:
@@ -264,7 +319,8 @@ def build_config(args, verbose: bool = True) -> dict:
 
     for dest, path in (("moe_placement", "model.ablation.moe_placement"),
                        ("rope_placement", "model.ablation.rope_placement"),
-                       ("grad_checkpointing", "model.grad_checkpointing")):
+                       ("grad_checkpointing", "model.grad_checkpointing"),
+                       ("milestones", "milestones")):
         raw = getattr(args, dest, None)
         if raw is not None:
             try:
@@ -320,6 +376,15 @@ def describe(cfg: dict) -> str:
     lines.append(f"  RoPE: {abl['rope_placement'] if abl['use_rope'] else 'off'} "
                  f"| aug {cfg['dataset']['randaugment']} "
                  f"x{cfg['dataset']['repeated_aug']} repeats")
+    if cfg.get("milestones") or cfg.get("stop_at_epoch"):
+        stop = cfg.get("stop_at_epoch") or cfg["epochs"]
+        lines.append(
+            f"  schedule: cosine over {cfg['epochs']} ep, running to epoch "
+            f"{stop}{' then stopping' if stop < cfg['epochs'] else ''} "
+            f"| milestones {cfg.get('milestones') or 'none'}"
+        )
+    if cfg["mode"] == "resume":
+        lines.append(f"  RESUMING full state from {cfg['ckpt_path']}")
     return "\n".join(lines)
 
 
@@ -342,6 +407,13 @@ def main(argv=None) -> int:
     print(describe(cfg))
     if eval_only:
         print("  (epochs=0 -> validation only, no training)")
+
+    # Check the resume path BEFORE importing torch or touching the dataset:
+    # a typo'd checkpoint should fail in a second, not after ImageNet loads.
+    if cfg["mode"] == "resume" and not os.path.exists(cfg["ckpt_path"] or ""):
+        print(f"error: checkpoint to resume from not found: {cfg['ckpt_path']}",
+              file=sys.stderr)
+        return 2
 
     if args.print_config:
         printable = {k: v for k, v in cfg.items() if not k.startswith("_")}

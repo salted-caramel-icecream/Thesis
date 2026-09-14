@@ -156,6 +156,17 @@ _DEFAULT: dict = {
     "mode": None,
     "ckpt_path": None,
 
+    # Epoch counts (number of COMPLETED epochs) at which to write a permanent,
+    # never-pruned checkpoint holding model + optimizer + scheduler + epoch.
+    # Lets one long run be picked up later from any of these points, on this
+    # machine or another. Independent of ModelCheckpoint's rolling top-k.
+    "milestones": [],
+    # Stop after this many epochs WITHOUT changing the schedule. The cosine is
+    # always built for `epochs`, so `epochs: 300, stop_at_epoch: 90` trains the
+    # first 90 epochs of a 300-epoch schedule -- not a compressed 90-epoch one.
+    # Resume later with mode "resume" and a larger (or absent) stop_at_epoch.
+    "stop_at_epoch": None,
+
     # None => recipe default (scratch: 90, pretrained: 100). For from-scratch
     # ablations pick one of config.SCRATCH_EPOCH_CHOICES == (90, 150, 300);
     # stochastic depth follows automatically (scratch_drop_path).
@@ -796,6 +807,20 @@ def validate_config(cfg: dict) -> dict:
     if ds["name"] not in NUM_CLASSES:
         raise ValueError(f"dataset.name must be one of {tuple(NUM_CLASSES)}, got {ds['name']!r}")
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
+
+    budget = cfg["epochs"]
+    stop_at = cfg.get("stop_at_epoch")
+    if stop_at is not None and not 1 <= stop_at <= budget:
+        raise ValueError(
+            f"stop_at_epoch must be in [1, epochs={budget}], got {stop_at}. "
+            "It truncates the run; it never extends it."
+        )
+    late = [m for m in cfg.get("milestones") or [] if not 1 <= m <= budget]
+    if late:
+        raise ValueError(
+            f"milestones must be within [1, epochs={budget}], got {late}"
+        )
+    cfg["milestones"] = sorted(set(cfg.get("milestones") or []))
 
     depths = model["depths"]
     n = len(depths)

@@ -1,0 +1,20 @@
+# Dense, no DWConv + RoPE
+# Ablation ladder row 2 (scratch) — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/scratch_02_dense_nodwconv_rope.yaml
+#
+# Anything omitted comes from the "scratch" recipe. Flags still override this
+# file: `--config configs/scratch_02_dense_nodwconv_rope.yaml --epochs 300`.
+#
+# NOTE: the DWConv is removed from EVERY block, so RoPE is placed in every block
+# NOTE: too — the architecture edit as a whole. Pass --rope-placement for a
+# NOTE: narrower arm.
+
+recipe: "scratch"
+epochs: 90
+model:
+  dense_dwconv: false
+  ablation:
+    use_moe: false
+    use_rope: true
+    rope_last_n_stages: 4

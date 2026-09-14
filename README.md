@@ -7,10 +7,14 @@ repo root / `Archive/` / `Others/` for provenance).
 
 ```
 pvt_moe/        the package — ALL logic lives here
-notebooks/      thin launchers (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA)
+notebooks/      thin launchers — v11_train.ipynb is the current one
+                (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA are older)
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
-docs/           ARCHITECTURE.md (model & invariants), HPARAMS.md (the recipe
-                tables), JEPA_GUIDE.md (SSL recipe)
+configs/        one YAML per ablation arm (--config configs/xxx.yaml)
+docs/           GUIDE.md (how to run: tokens, data, config, resuming)
+                HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
+                NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
+                JEPA_GUIDE.md (SSL recipe)
 .claude/skills/ skill library for AI-assisted maintenance
 ```
 
@@ -28,9 +32,13 @@ python tests/run_all.py      # must print "N passed, 0 failed"
 python train.py --recipe scratch --epochs 90
 python train.py --recipe pretrained --lr 5e-5
 
-# 3b) ...or Jupyter: run notebooks/01_train_supervised.ipynb and edit
-#     ONLY the config cell (same package underneath, same results).
+# 3b) ...or Jupyter: run notebooks/v11_train.ipynb and edit ONLY the CONFIG
+#     cell (same package underneath, same results — and it prints the
+#     equivalent command line so a notebook run is reproducible headless).
 ```
+
+**New here? Read `docs/GUIDE.md`** — tokens, dataset setup, every config knob
+in both front ends, and how to split a 300-epoch run across machines.
 
 Both front ends are thin: all logic lives in `pvt_moe/`. The notebooks and
 `train.py` add the repo root to `sys.path`; alternatively `pip install -e .`,
@@ -152,6 +160,22 @@ to confirm it happened. Run names gain `+sh`
   The archived first attempt failed on three counts (no grouped_gemm, aux
   collected in eval, bias=True silently ignored) — all fixed in
   `pvt_moe/models/ffn.py`; the notebook's sanity cell checks each one.
+
+## Long runs in pieces
+
+Train a 300-epoch schedule across sessions or machines without compressing the
+cosine:
+
+```bash
+python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]" --stop-at 90
+python train.py --recipe scratch --epochs 300 --resume-from .../milestone-epoch090.ckpt
+```
+
+`--epochs` is the schedule; `--stop-at` is only where you get off. Milestone
+checkpoints hold model + optimizer + scheduler + epoch and are never pruned by
+`save_top_k`. A stopped-and-resumed run follows an LR trajectory identical to
+one uninterrupted run — `tests/test_resume.py` asserts exactly that. Details
+in `docs/GUIDE.md` §4.
 
 ## Hardware sizing (single 12 GB card)
 

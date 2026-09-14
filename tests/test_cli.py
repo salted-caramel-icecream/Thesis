@@ -311,3 +311,91 @@ def test_config_errors_exit_2_instead_of_raising():
             assert e.code == 2, argv
             continue
         assert rc == 2, f"{argv} should exit 2, got {rc}"
+
+
+# --- config files, data dirs, resume ---------------------------------------
+
+def test_every_shipped_config_file_resolves():
+    """configs/*.yaml are the ablation arms — all must build a valid config
+    and none may collide on run_name (that would share a checkpoint dir)."""
+    import pathlib
+
+    from pvt_moe.cli import load_config_file
+
+    files = sorted(pathlib.Path("configs").glob("*.yaml"))
+    assert len(files) >= 18, f"expected the full ladder, found {len(files)}"
+    names = {}
+    for f in files:
+        assert load_config_file(str(f)), f
+        cfg = _cfg("--config", str(f))
+        names.setdefault(cfg["run_name"], []).append(f.name)
+    dupes = {k: v for k, v in names.items() if len(v) > 1}
+    assert not dupes, f"config files collide on run_name: {dupes}"
+
+
+def test_yaml_and_json_configs_are_equivalent():
+    import json as _json
+    import tempfile
+
+    import yaml
+
+    payload = {"epochs": 42, "model": {"moe": {"num_experts": 8}}}
+    paths = {}
+    for ext, dump in ((".yaml", yaml.safe_dump), (".json", _json.dumps)):
+        with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False) as fh:
+            fh.write(dump(payload))
+            paths[ext] = fh.name
+    a = _cfg("--config", paths[".yaml"])
+    b = _cfg("--config", paths[".json"])
+    assert a["epochs"] == b["epochs"] == 42
+    assert a["model"]["moe"]["num_experts"] == b["model"]["moe"]["num_experts"] == 8
+
+
+def test_config_file_rejects_a_non_mapping():
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write("- just\n- a list\n")
+        path = fh.name
+    try:
+        _cfg("--config", path)
+    except SystemExit as e:
+        assert "mapping" in str(e)
+        return
+    raise AssertionError("a non-mapping config must be rejected")
+
+
+def test_data_dir_overrides_the_selected_datasets_snapshot():
+    c = _cfg("--data-dir", "/mnt/imagenet_arrow")
+    assert c["dataset"]["arrow_dirs"]["imagenet-1k"] == "/mnt/imagenet_arrow"
+    # and it follows --dataset rather than always writing the 1k entry
+    c22 = _cfg("--dataset", "imagenet-22k", "--data-dir", "/mnt/in22k")
+    assert c22["dataset"]["arrow_dirs"]["imagenet-22k"] == "/mnt/in22k"
+    assert c22["dataset"]["arrow_dirs"]["imagenet-1k"] != "/mnt/in22k"
+
+
+def test_checkpoint_dir_is_an_alias_for_checkpoint_root():
+    assert _cfg("--checkpoint-dir", "/ck")["checkpoint_root"] == "/ck"
+    assert _cfg("--checkpoint-root", "/ck")["checkpoint_root"] == "/ck"
+
+
+def test_resume_from_implies_resume_mode():
+    """Otherwise a --recipe pretrained resume would download HF weights and
+    upcycle them, only for Lightning to overwrite all of it."""
+    c = _cfg("--recipe", "pretrained", "--resume-from", "/tmp/x.ckpt")
+    assert c["mode"] == "resume"
+    assert c["ckpt_path"] == "/tmp/x.ckpt"
+
+
+def test_milestones_and_stop_at_flags():
+    c = _cfg("--epochs", "300", "--milestones", "[90,150]", "--stop-at", "90")
+    assert c["milestones"] == [90, 150]
+    assert c["stop_at_epoch"] == 90
+    assert c["epochs"] == 300, "stop_at must not change the schedule's budget"
+    assert "300 ep" in describe(c) and "milestones" in describe(c)
+
+
+def test_missing_resume_checkpoint_exits_2():
+    from pvt_moe.cli import main
+
+    assert main(["--resume-from", "/nonexistent/x.ckpt"]) == 2

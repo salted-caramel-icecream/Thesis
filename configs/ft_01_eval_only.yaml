@@ -1,0 +1,17 @@
+# Pretrained PVT v2 B1, eval only
+# Ablation ladder row 1 (pretrained) — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/ft_01_eval_only.yaml
+#
+# Anything omitted comes from the "pretrained" recipe. Flags still override this
+# file: `--config configs/ft_01_eval_only.yaml --epochs 300`.
+#
+# NOTE: epochs=0 runs validation only (no fit).
+
+recipe: "pretrained"
+epochs: 0
+model:
+  dense_dwconv: true
+  ablation:
+    use_moe: false
+    use_rope: false
