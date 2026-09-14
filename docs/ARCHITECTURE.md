@@ -87,6 +87,42 @@ consequences worth stating as invariants:
 Do NOT mark shared-expert parameters with `skip_allreduce` — they are ordinary
 data-parallel parameters, unlike the routed expert tensors.
 
+## 2b. MoE backends
+
+| Backend | Status | Needs |
+|---|---|---|
+| `tutel` | **default** | a CUDA extension built from source (compiler required) |
+| `native` | fallback | nothing beyond torch |
+| `megablocks` | experimental | `megablocks==0.10.0` + `grouped_gemm` |
+
+Tutel stays the default because it produced the recorded results; switching
+would make new runs incomparable to the 72.27%. `native`
+(`pvt_moe/models/moe_native.py`) exists so a box where Tutel will not build —
+Windows/WSL2, a fresh rental, a broken nvcc — cannot stop an ablation.
+
+**INVARIANT — the native backend mirrors Tutel's parameter layout.** Same key
+names, same shapes, including the detail that `batched_fc2_w` stores
+`fc2.weight.T`. Consequences worth relying on:
+
+- a run started on one backend **resumes on the other**;
+- `seed_moe_experts_from_dense` and `zero_routed_expert_output` need no
+  backend special-case;
+- `expert_utilization` reads `gates[0].wg` on either.
+
+Measured parity (`tests/test_native_moe.py`, and the derivation in the module
+docstring):
+
+| | Result |
+|---|---|
+| Expert FFN arithmetic, identical weights | **bit-exact** (max Δ = 0.0) |
+| Load-balancing aux loss vs Tutel `gshard_loss` | **identical** — gshard expands to `E · Σ(P_i·f_i)`, the Switch formula |
+| Top-1 gate scaling | identical: raw softmax score, unnormalized (Tutel normalizes only when `top_k > 1`) |
+| End-to-end `moe_layer` output | **not compared** — Tutel's dispatch needs a process group and reorders tokens through capacity buffers; the arithmetic it performs is what is verified above |
+
+Deliberate limits of the fallback: top-1 only (raises on `top_k > 1` rather
+than running an untested path), no expert parallelism, and a python loop over
+experts (E=4 makes it cheaper than the scatter/gather it replaces).
+
 **INVARIANT — aux-loss contract** (the "fixed aux" semantics that took the v3
 lineage several failed runs to get right):
 

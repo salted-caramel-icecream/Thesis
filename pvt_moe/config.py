@@ -38,7 +38,13 @@ NUM_CLASSES = {
 
 VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
 VALID_NORMS = ("layernorm", "rmsnorm")
-VALID_BACKENDS = ("tutel", "megablocks")
+#: MoE backends. "tutel" is the DEFAULT because it is the implementation the
+#: v9 lineage's results were produced with — switching the default would make
+#: new runs incomparable to the recorded 72.27%. "native" is a pure-PyTorch
+#: fallback (no CUDA extension, no NCCL, no compiler) for boxes where Tutel
+#: will not build; it is architecturally equivalent at top_k=1 and shares
+#: Tutel's parameter layout, so checkpoints move between the two.
+VALID_BACKENDS = ("tutel", "native", "megablocks")
 VALID_RECIPES = ("scratch", "pretrained")
 
 #: How an upcycled MoE block is initialized. Both branches copy the pretrained
@@ -283,7 +289,9 @@ _DEFAULT: dict = {
 
         # --- MoE hyperparameters (previously hardcoded in the notebook) ----
         "moe": {
-            "backend": "tutel",           # "tutel" | "megablocks"
+            # "tutel" (default, validated) | "native" (pure-torch fallback)
+            # | "megablocks". See VALID_BACKENDS for why tutel stays default.
+            "backend": "tutel",
             # Sweet Spot runs E=4 and E=8 on IN-1k and notes larger counts
             # need more data to avoid overfitting.
             "num_experts": 4,
@@ -439,7 +447,11 @@ def build_run_tag(cfg: dict) -> str:
     if abl["use_moe"]:
         moe_pl = resolve_placement(abl["moe_placement"], abl["moe_last_n_stages"], depths)
         moe_cfg = cfg["model"]["moe"]
-        backend = "" if moe_cfg["backend"] == "tutel" else "-mb"
+        # Per-backend tag. A binary "tutel or -mb" test silently labelled the
+        # native backend as megablocks; every backend needs its own marker or
+        # two different implementations share a checkpoint directory.
+        backend = {"tutel": "", "native": "-nat", "megablocks": "-mb"}[
+            moe_cfg["backend"]]
         shared = "+sh" if moe_cfg.get("shared_expert") else ""
         # The random-expert-init control (pretrained ladder row 6) is
         # architecturally identical to the upcycled run it is compared against,

@@ -150,7 +150,13 @@ to confirm it happened. Run names gain `+sh`
 
 ## MoE backends
 
-- **Tutel** (default, notebook 01): builds from source on any torch;
+- **Native** (`--backend native`): pure PyTorch — no CUDA extension, no NCCL,
+  no compiler. The fallback for boxes where Tutel will not build. Top-1 only,
+  architecturally equivalent, and it mirrors Tutel's parameter layout so
+  checkpoints move between the two. Expert arithmetic is bit-exact against
+  Tutel and the aux loss is numerically identical; see `docs/ARCHITECTURE.md`
+  §2b.
+- **Tutel** (default): builds from source on any torch;
   top-k gate with capacity factor + gate noise. The Tutel gate train-forcing
   in `engine/classifier.py` is **load-bearing** (gates revert to eval after
   Lightning validation, silently disabling gate noise).

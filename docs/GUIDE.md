@@ -132,6 +132,7 @@ key nothing reads.
 | norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
+| MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
 | dataset | `--dataset imagenet-1k` | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
@@ -216,6 +217,26 @@ first. `setup_environment` measures free VRAM and warns before training if the
 micro-batch looks too large.
 
 ---
+
+## 5b. If Tutel will not build
+
+Tutel compiles a CUDA extension and needs a compiler (build-essential on
+Linux, MSVC Build Tools on Windows). When that is not available:
+
+```bash
+python train.py --backend native      # pure PyTorch, no extension, no NCCL
+```
+
+Architecturally equivalent at `top_k: 1`, and it shares Tutel's parameter
+layout — so a run started on one backend **resumes on the other**:
+
+```bash
+python train.py --backend native --resume-from .../milestone-epoch090.ckpt
+```
+
+Run names carry `-nat`, so the two never share a checkpoint directory. Tutel
+stays the default because it is what the recorded results were produced with.
+`docs/ARCHITECTURE.md` §2b has the measured parity table.
 
 ## 6. Reading the output
 
