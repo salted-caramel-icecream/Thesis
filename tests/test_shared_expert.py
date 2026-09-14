@@ -319,3 +319,114 @@ def test_count_params_splits_shared_from_routed():
 
     plain = count_params(_moe_model(shared_expert=False))
     assert plain["shared_expert_m"] == 0
+
+
+# --- STEP 1: function preservation at the MODEL level ----------------------
+# The bar is not "the block matches" but "the upcycled model reproduces the
+# dense checkpoint's output". Anything less can hide a mis-seeded block behind
+# a residual stream that mostly washes it out.
+
+def _dense_and_upcycled(upcycle_init="routed_zero", **moe_over):
+    """A dense model and a MoE model upcycled from its exact weights."""
+    import copy as _copy
+
+    from pvt_moe.models.pretrained import (
+        seed_moe_experts_from_dense,
+        seed_shared_expert_from_dense,
+        zero_routed_expert_output,
+        zero_shared_expert_output,
+    )
+
+    # RoPE off in BOTH: it adds parameters the dense checkpoint never had, so
+    # leaving it on would measure RoPE, not the upcycling.
+    common = {"ablation": {"use_rope": False, "rope_placement": [[], [], [], []]}}
+    dense_cfg = tiny_config(model={**common,
+                                   "ablation": {**common["ablation"], "use_moe": False},
+                                   "moe": {"shared_expert": True,
+                                           "upcycle_init": upcycle_init, **moe_over}})
+    torch.manual_seed(1234)
+    dense = build_model(dense_cfg)
+
+    moe_cfg = tiny_config(model={**common,
+                                 "ablation": {**common["ablation"], "use_moe": True,
+                                              "moe_placement": [[], [], [], [1]]},
+                                 "moe": {"shared_expert": True,
+                                         "upcycle_init": upcycle_init, **moe_over}})
+    undo = install_fake_tutel_backend()
+    try:
+        torch.manual_seed(1234)
+        moe = build_model(moe_cfg)
+    finally:
+        undo()
+
+    # 1. every weight the two models share, verbatim
+    dense_state = dense.state_dict()
+    missing, _ = moe.load_state_dict(dense_state, strict=False)
+    assert all("block4.1.mlp" in m for m in missing), \
+        f"only the MoE'd block's FFN should be missing, got {missing}"
+
+    # 2. upcycle the one converted block from the dense FFN it replaced
+    blk = dense.block4[1].mlp
+    moe_mlp = moe.block4[1].mlp
+    seed_moe_experts_from_dense(moe_mlp, blk.fc1.weight.data, blk.fc1.bias.data,
+                                blk.fc2.weight.data, blk.fc2.bias.data)
+    prefix = "block4.1."
+    seed_shared_expert_from_dense(
+        moe_mlp, {f"{prefix}mlp.{k}": v for k, v in _copy.deepcopy(blk.state_dict()).items()},
+        prefix)
+    if upcycle_init == "routed_zero":
+        zero_routed_expert_output(moe_mlp)
+    elif upcycle_init == "shared_zero":
+        zero_shared_expert_output(moe_mlp)
+    return dense, moe
+
+
+def test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval():
+    """THE correctness bar: same input, same output, within 1e-4."""
+    dense, moe = _dense_and_upcycled("routed_zero")
+    dense.eval()
+    moe.eval()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        want, _ = dense(x)
+        got, aux = moe(x)
+    err = (got - want).abs().max().item()
+    assert err < 1e-4, f"upcycled model differs from the dense model by {err:.3e}"
+    assert aux is not None, "the MoE block must still report its aux loss"
+
+
+def test_shared_zero_does_NOT_preserve_the_function_at_top_k_1():
+    """The spec's scheme, measured. Documents why it is not the default.
+
+    With a real Tutel gate the routed branch is additionally scaled by the raw
+    softmax score at top_k=1; even without that scaling the shared branch has
+    been zeroed, so the block no longer carries the DWConv path.
+    """
+    dense, moe = _dense_and_upcycled("shared_zero")
+    dense.eval()
+    moe.eval()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        want, _ = dense(x)
+        got, _ = moe(x)
+    err = (got - want).abs().max().item()
+    assert err > 1e-4, (
+        "shared_zero unexpectedly matched the dense model — if this starts "
+        "passing, re-derive the top_k=1 argument in docs/HPARAMS.md section 3"
+    )
+
+
+def test_function_preservation_holds_without_the_shared_dwconv():
+    """A plain FC1->GELU->FC2 shared expert cannot reproduce the dense FFN,
+    because the dense FFN has a DWConv the shared branch dropped."""
+    dense, moe = _dense_and_upcycled("routed_zero", shared_expert_dwconv=False)
+    dense.eval()
+    moe.eval()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        want, _ = dense(x)
+        got, _ = moe(x)
+    assert (got - want).abs().max().item() > 1e-4, (
+        "dropping the shared DWConv should break exact preservation — the "
+        "dense FFN's conv has nowhere to go"
+    )
