@@ -1,0 +1,22 @@
+# MoE block KEEPS its DWConv, no RoPE
+# Position-encoding arm — docs/HPARAMS.md section 2.
+#
+#   python train.py --config configs/scratch_10_moe_dwconv_norope.yaml
+#
+# NOTE: The conv carries position; RoPE is off. Baseline for the position axis.
+#
+# moe_block_dwconv is SCOPED to the blocks in moe_placement; dense blocks
+# elsewhere keep their official CFFN. Use model.dense_dwconv to strip those.
+
+recipe: "scratch"
+epochs: 90
+model:
+  moe:
+    num_experts: 4
+    shared_expert: true
+    moe_block_dwconv: true
+  ablation:
+    use_moe: true
+    moe_placement: [[], [], [], [1]]
+    use_rope: false
+    rope_placement: [[], [], [], []]

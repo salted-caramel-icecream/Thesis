@@ -1,0 +1,13 @@
+# Final, best config
+# Ablation ladder row 5 (scratch) — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/scratch_05_final_300ep.yaml
+#
+# Anything omitted comes from the "scratch" recipe. Flags still override this
+# file: `--config configs/scratch_05_final_300ep.yaml --epochs 300`.
+#
+# NOTE: row 5 is 'best config' — it sets the 300-epoch budget only; carry the
+# NOTE: winning architecture flags yourself.
+
+recipe: "scratch"
+epochs: 300

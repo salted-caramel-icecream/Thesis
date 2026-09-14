@@ -1,0 +1,15 @@
+# Baseline, conv-FFN intact
+# Ablation ladder row 1 (scratch) — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/scratch_01_baseline_conv_ffn.yaml
+#
+# Anything omitted comes from the "scratch" recipe. Flags still override this
+# file: `--config configs/scratch_01_baseline_conv_ffn.yaml --epochs 300`.
+
+recipe: "scratch"
+epochs: 90
+model:
+  dense_dwconv: true
+  ablation:
+    use_moe: false
+    use_rope: false

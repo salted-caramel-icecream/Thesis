@@ -7,10 +7,33 @@ Two implementations sit behind one interface:
 - ``MoEMlp`` — sparse: a Tutel or MegaBlocks expert layer replacing the whole
   FFN. Returns ``(tensor, aux_loss)``.
 
-ARCHITECTURAL INVARIANT: the MoE branch has **no DWConv**, so an MoE block
-loses PVT v2's conv positional encoding. Enable RoPE in the same blocks to
-reinject positional information (this is why the default config places RoPE
-exactly where it places MoE).
+ARCHITECTURAL INVARIANT: the routed MoE branch has **no DWConv**, so an MoE
+block loses PVT v2's conv positional encoding. Enable RoPE in the same blocks
+to reinject positional information (this is why the default config places RoPE
+exactly where it places MoE) — or enable a shared expert, which can carry the
+DWConv itself.
+
+Shared expert (``moe.shared_expert``, DeepSeekMoE / Qwen-MoE style)
+-------------------------------------------------------------------
+An always-on dense FFN evaluated for EVERY token in parallel with the routed
+experts; its output is added to theirs::
+
+    y = routed_moe(x) + shared_expert(x)
+
+It lives outside the backend layer (plain ``nn.Module``, ordinary data-parallel
+parameter, no ``skip_allreduce``), so it works identically for both backends
+and its weights survive whatever the backend does to its own experts. Two
+reasons it matters here:
+
+1. It is the only place a pretrained dense FFN can be kept *exactly* rather
+   than copied into E experts — and with ``moe_block_dwconv`` it keeps the
+   DWConv too, restoring the positional encoding the routed branch drops.
+2. With ``upcycle_init="routed_zero"`` the routed experts' fc2 starts at zero,
+   so at step 0 the block computes exactly the pretrained dense FFN and the
+   routed experts learn a residual on top of it.
+
+Cost: one extra dense FFN per token (no routing, no capacity), i.e. the block
+goes from top-k to top-k+1 active FFNs per token.
 
 Backend notes
 -------------
@@ -56,7 +79,13 @@ class DWConv(nn.Module):
 
 
 class Mlp(nn.Module):
-    """Dense PVT v2 FFN: fc1 -> DWConv -> act -> fc2."""
+    """Dense PVT v2 FFN: fc1 -> DWConv -> act -> fc2.
+
+    ``use_dwconv=False`` drops the depthwise conv (and with it PVT v2's conv
+    positional encoding), leaving a plain fc1 -> act -> fc2 FFN. Only the
+    shared-expert branch of ``MoEMlp`` uses that form; the backbone's dense
+    blocks always keep the DWConv.
+    """
 
     def __init__(
         self,
@@ -65,10 +94,11 @@ class Mlp(nn.Module):
         act_layer=nn.GELU,
         drop: float = 0.0,
         linear_attention: bool = False,
+        use_dwconv: bool = True,
     ):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.dwconv = DWConv(hidden_features)
+        self.dwconv = DWConv(hidden_features) if use_dwconv else None
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(drop)
@@ -79,7 +109,8 @@ class Mlp(nn.Module):
         x = self.fc1(x)
         if self.relu is not None:
             x = self.relu(x)
-        x = self.dwconv(x, H, W)
+        if self.dwconv is not None:
+            x = self.dwconv(x, H, W)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
@@ -110,8 +141,23 @@ class MoEMlp(nn.Module):
         self.hidden_features = hidden_features
         self.drop = nn.Dropout(drop)
 
+        # Always-on shared expert (None when disabled). Built with drop=0.0:
+        # this module's single ``self.drop`` is applied once to the summed
+        # output, so the shared branch must not drop twice.
+        self.shared_expert = None
+        if moe_cfg.get("shared_expert", False):
+            self.shared_expert = Mlp(
+                in_features,
+                hidden_features,
+                act_layer=act_layer,
+                drop=0.0,
+                use_dwconv=moe_cfg.get("moe_block_dwconv", True),
+            )
+
         if self.backend == "tutel":
             self.moe_layer = self._build_tutel(in_features, hidden_features, moe_cfg, act_layer)
+        elif self.backend == "native":
+            self.moe_layer = self._build_native(in_features, hidden_features, moe_cfg, act_layer)
         elif self.backend == "megablocks":
             self.moe_layer, self.mb_args = self._build_megablocks(
                 in_features, hidden_features, moe_cfg, act_layer
@@ -149,6 +195,21 @@ class MoEMlp(nn.Module):
         )
 
     @staticmethod
+    def _build_native(dim: int, hidden: int, moe_cfg: dict, act_layer):
+        """Pure-PyTorch fallback — same contract, no Tutel, no NCCL."""
+        from pvt_moe.models.moe_native import NativeMoEFFN  # lazy, symmetry
+
+        return NativeMoEFFN(
+            model_dim=dim,
+            hidden_size_per_expert=hidden,
+            num_experts=moe_cfg["num_experts"],
+            top_k=moe_cfg["top_k"],
+            capacity_factor=moe_cfg["capacity_factor"],
+            activation_fn=act_layer(),
+            gate_noise=moe_cfg.get("gate_noise", 0.0),
+        )
+
+    @staticmethod
     def _build_megablocks(dim: int, hidden: int, moe_cfg: dict, act_layer):
         from megablocks.layers.arguments import Arguments  # lazy
         from megablocks.layers.dmoe import dMoE
@@ -181,13 +242,70 @@ class MoEMlp(nn.Module):
         )
         return dMoE(args), args
 
+    # -- upcycling ------------------------------------------------------------
+
+    @torch.no_grad()
+    def load_from_dense_ffn(self, dense_state_dict: dict) -> int:
+        """Load a pretrained dense FFN into the SHARED expert. Backend-agnostic.
+
+        The routed experts are deliberately left at their zero-fc2 init: they
+        must emit exactly zero so the block reproduces the dense checkpoint at
+        step 0 (``upcycle_init: "routed_zero"``). Cloning the dense weights
+        into them instead is the ``"shared_zero"`` scheme, which is NOT
+        function-preserving at top_k=1 — Tutel normalizes combine weights only
+        when top_k > 1, so the routed branch would be scaled by an untrained
+        softmax score. See docs/HPARAMS.md section 3.
+
+        ``dense_state_dict`` is a plain PVT v2 ``Mlp`` state dict
+        (``fc1.weight``, ``fc1.bias``, ``fc2.weight``, ``fc2.bias``, and
+        ``dwconv.dwconv.*`` when the block keeps its conv). Returns the number
+        of tensors loaded; raises on any shape mismatch rather than quietly
+        leaving a layer at random init.
+        """
+        if self.shared_expert is None:
+            raise RuntimeError(
+                "load_from_dense_ffn needs a shared expert to load into "
+                "(moe.shared_expert is False). Without one there is no branch "
+                "that can carry the pretrained FFN."
+            )
+        target = self.shared_expert.state_dict()
+        loaded, skipped = 0, []
+        for key, value in dense_state_dict.items():
+            name = key.split("mlp.")[-1] if "mlp." in key else key
+            if name not in target:
+                skipped.append(name)
+                continue
+            if tuple(target[name].shape) != tuple(value.shape):
+                raise ValueError(
+                    f"shape mismatch loading dense FFN into the shared expert: "
+                    f"{name} is {tuple(value.shape)} in the checkpoint but "
+                    f"{tuple(target[name].shape)} in the model."
+                )
+            target[name].copy_(value)
+            loaded += 1
+
+        missing = sorted(set(target) - {k.split("mlp.")[-1] for k in dense_state_dict})
+        if missing:
+            raise ValueError(
+                f"dense FFN state dict is missing {missing}; the shared expert "
+                "would be left partly at random init. Pass the full Mlp "
+                "state_dict, or rebuild with moe_block_dwconv matching the source."
+            )
+        if skipped:
+            conv_only = all(k.startswith("dwconv.") for k in skipped)
+            note = ("this block has no DWConv (moe_block_dwconv=False)"
+                    if conv_only and self.shared_expert.dwconv is None
+                    else "NO DESTINATION — check the source")
+            print(f"[load_from_dense_ffn] skipped {skipped}: {note}")
+        return loaded
+
     # -- forward ------------------------------------------------------------
 
     def forward(self, x: torch.Tensor, H: int, W: int):
         B, N, C = x.shape
         x_flat = x.reshape(B * N, C).contiguous()
 
-        if self.backend == "tutel":
+        if self.backend in ("tutel", "native"):
             out, aux = self.moe_layer(x_flat)
         else:  # megablocks
             from megablocks.layers.moe import (  # lazy
@@ -206,4 +324,8 @@ class MoEMlp(nn.Module):
             clear_load_balancing_loss()
 
         out = out.reshape(B, N, C)
+        if self.shared_expert is not None:
+            # The shared expert sees the ORIGINAL (B, N, C) input — it needs
+            # H/W for its DWConv, which the flattened routed path cannot use.
+            out = out + self.shared_expert(x, H, W)
         return self.drop(out), aux

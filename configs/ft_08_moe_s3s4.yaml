@@ -1,0 +1,22 @@
+# N=4, stages 3 & 4
+# Ablation ladder row 8 (pretrained) — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/ft_08_moe_s3s4.yaml
+#
+# Anything omitted comes from the "pretrained" recipe. Flags still override this
+# file: `--config configs/ft_08_moe_s3s4.yaml --epochs 300`.
+#
+# NOTE: RoPE moved to stages 3+4 to match the MoE placement (this repo places
+# NOTE: RoPE where MoE is). Pass --rope-placement to decouple the two axes.
+
+recipe: "pretrained"
+epochs: 100
+model:
+  moe:
+    num_experts: 4
+    shared_expert: true
+  seed_moe_from_dense: true
+  ablation:
+    use_moe: true
+    moe_placement: [[], [], [1], [1]]
+    rope_placement: [[], [], [1], [1]]

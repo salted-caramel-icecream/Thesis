@@ -6,8 +6,15 @@ dense compute; MoE expert FFNs are stubbed during tracing (fvcore cannot
 trace Tutel/MegaBlocks kernels) and added back analytically in the SAME MAC
 convention:
 
-    moe_macs = seq_len * [ k * (dim*hidden + hidden*dim)   (expert FFNs)
-                           + dim * num_experts ]            (router)
+    moe_macs = seq_len * [ k * (dim*hidden + hidden*dim)   (routed expert FFNs)
+                           + dim * num_experts              (router)
+                           + (dim*hidden + hidden*dim)      (shared expert, if any)
+                           + 9 * hidden ]                   (its DWConv, if any)
+
+The shared expert is counted here rather than by fvcore because the ENTIRE
+``MoEMlp.forward`` — shared branch included — is stubbed during tracing.
+Forgetting it under-reports total GFLOPs, which is exactly the number an
+ablation table compares.
 
 Stage geometry: stage i tokens sit on an ``img_size / (4 * 2^i)`` grid.
 """
@@ -38,8 +45,30 @@ def _analytic_moe_flops(model, img_size: int) -> int:
         # MAC convention (1 multiply-add = 1), matching fvcore's dense count.
         expert_ffn = dim * hidden + hidden * dim                # fc1 + fc2
         router = dim * module.num_experts
-        total += seq_len * (module.top_k * expert_ffn + router)
+        per_token = module.top_k * expert_ffn + router
+
+        # The shared expert (when enabled) runs for EVERY token — it is dense
+        # compute, not routed, so it carries no top_k factor.
+        shared = getattr(module, "shared_expert", None)
+        if shared is not None:
+            per_token += expert_ffn
+            if shared.dwconv is not None:
+                # depthwise 3x3 over `hidden` channels: 9 MACs per channel
+                # per token (groups == channels, so no cross-channel term).
+                per_token += 9 * hidden
+
+        total += seq_len * per_token
     return total
+
+
+def _has_shared(model) -> bool:
+    from pvt_moe.models.ffn import MoEMlp
+
+    return any(
+        getattr(m, "shared_expert", None) is not None
+        for m in model.modules()
+        if isinstance(m, MoEMlp)
+    )
 
 
 def count_flops(model, img_size: int = 224, verbose: bool = True) -> dict:
@@ -86,7 +115,8 @@ def count_flops(model, img_size: int = 224, verbose: bool = True) -> dict:
     if verbose:
         print("(MAC convention: 1 multiply-add = 1 FLOP, as in the PVT/Swin papers)")
         print(f"Dense: {result['dense_gflops']:.3f} G")
-        print(f"MoE:   {result['moe_gflops']:.3f} G (top-k active experts + router)")
+        print(f"MoE:   {result['moe_gflops']:.3f} G "
+              f"(top-k active experts + router{' + shared expert' if _has_shared(model) else ''})")
         print(f"Total: {result['total_gflops']:.3f} G")
         print(table)
     return result
@@ -104,14 +134,26 @@ def count_params(model) -> dict:
         if isinstance(m, MoEMlp)
         for p in m.parameters()
     )
+    # Shared-expert params are always-on dense compute, so they are reported
+    # separately from the routed bank (of which only top_k/num_experts is
+    # active per token) — the two numbers mean different things in a table.
+    shared = sum(
+        p.numel()
+        for m in model.modules()
+        if isinstance(m, MoEMlp) and getattr(m, "shared_expert", None) is not None
+        for p in m.shared_expert.parameters()
+    )
     result = {
         "total_m": total / 1e6,
         "trainable_m": trainable / 1e6,
         "moe_m": moe / 1e6,
+        "shared_expert_m": shared / 1e6,
+        "routed_expert_m": (moe - shared) / 1e6,
         "dense_m": (total - moe) / 1e6,
     }
     print(
         f"Params: {result['total_m']:.1f}M total | {result['trainable_m']:.1f}M trainable | "
-        f"{result['moe_m']:.1f}M in MoE experts | {result['dense_m']:.1f}M dense"
+        f"{result['routed_expert_m']:.1f}M routed experts | "
+        f"{result['shared_expert_m']:.1f}M shared expert | {result['dense_m']:.1f}M dense"
     )
     return result

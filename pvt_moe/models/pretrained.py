@@ -11,6 +11,11 @@ Three entry points:
   ``state_dict`` saved by this package (e.g. a JEPA-pretrained encoder).
 - ``seed_moe_experts_from_dense(...)`` — copy dense fc1/fc2 into every
   expert. Layout-aware for both Tutel and MegaBlocks; refuses to guess.
+- ``seed_shared_expert_from_dense(...)`` — copy the dense FFN (fc1/fc2 AND
+  the DWConv) into ``MoEMlp.shared_expert``, which is a plain PVT v2 ``Mlp``
+  and therefore takes the weights verbatim.
+- ``zero_routed_expert_output(...)`` — zero every routed expert's fc2 so a
+  shared-expert block starts out computing EXACTLY the pretrained dense FFN.
 
 Norm-type interop: when the target model uses RMSNorm, LayerNorm ``.bias``
 keys from the source simply have no destination parameter and are dropped
@@ -81,12 +86,22 @@ def load_hf_pretrained(
     model: nn.Module,
     hf_model_id: str = "OpenGVLab/pvt_v2_b1",
     seed_moe_experts: bool = True,
+    upcycle_init: str = "none",
     verbose: bool = True,
 ) -> dict:
     """Load HF PVT v2 weights into the backbone. Returns a stats dict.
 
     MoE blocks (from ``model.moe_placement``) skip their dense ``mlp.*``
     weights; when ``seed_moe_experts`` those weights seed the experts instead.
+    A block with a shared expert additionally gets the dense FFN loaded into
+    that shared branch verbatim. ``upcycle_init`` then says which branch starts
+    at zero so the block does not emit ~2x the dense layer at step 0:
+
+    - ``"routed_zero"`` zeros the routed experts' fc2 — the shared branch
+      carries the pretrained FFN, exact at any top_k;
+    - ``"shared_zero"`` zeros the shared expert's fc2 instead — the routed
+      experts carry it (the spec's Sparse-Upcycling-style init);
+    - ``"none"`` zeros nothing.
     """
     from transformers import AutoModelForImageClassification  # lazy
 
@@ -108,7 +123,8 @@ def load_hf_pretrained(
     stats = {
         "loaded": 0, "kv_fused": 0, "kv_skipped": 0, "skipped_moe_mlp": 0,
         "skipped_shape": 0, "dropped_no_target": 0, "unmapped": [],
-        "seeded_moe_blocks": 0,
+        "seeded_moe_blocks": 0, "seeded_shared_experts": 0,
+        "zeroed_routed_fc2": 0, "zeroed_shared_fc2": 0,
     }
 
     for hf_key, value in hf_state.items():
@@ -164,12 +180,26 @@ def load_hf_pretrained(
             seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b)
             stats["seeded_moe_blocks"] += 1
 
+            # Shared expert (when enabled): takes the dense FFN verbatim,
+            # DWConv included, so the pretrained function is kept exactly
+            # rather than replicated across experts.
+            if getattr(moe_mlp, "shared_expert", None) is not None:
+                seed_shared_expert_from_dense(moe_mlp, dense_mlp_for_seeding, prefix)
+                stats["seeded_shared_experts"] += 1
+                if upcycle_init == "routed_zero":
+                    stats["zeroed_routed_fc2"] += zero_routed_expert_output(moe_mlp)
+                elif upcycle_init == "shared_zero":
+                    stats["zeroed_shared_fc2"] += zero_shared_expert_output(moe_mlp)
+
     if verbose:
         print(
             f"[HF pretrained] loaded={stats['loaded']} kv_fused={stats['kv_fused']} "
             f"kv_skipped_gqa={stats['kv_skipped']} moe_mlp_skipped={stats['skipped_moe_mlp']} "
             f"shape_skipped={stats['skipped_shape']} no_target={stats['dropped_no_target']} "
-            f"seeded_moe_blocks={stats['seeded_moe_blocks']}"
+            f"seeded_moe_blocks={stats['seeded_moe_blocks']} "
+            f"seeded_shared={stats['seeded_shared_experts']} "
+            f"zeroed_routed_fc2={stats['zeroed_routed_fc2']} "
+            f"zeroed_shared_fc2={stats['zeroed_shared_fc2']}"
         )
         if stats["loaded"] < 50:
             print("  !! Very few weights loaded — remap patterns are probably stale. "
@@ -277,6 +307,120 @@ def seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b) -> int:
     if unrecognized:
         print(f"[seed experts] warning — unrecognized params left at init: {unrecognized}")
     return seeded
+
+
+def _is_gate_param(lname: str) -> bool:
+    """True for router/gate parameters, which seeding must never touch."""
+    return "gate" in lname or re.search(r"(^|\.)wg", lname) is not None or "router" in lname
+
+
+@torch.no_grad()
+def seed_shared_expert_from_dense(moe_mlp, dense_state: dict, prefix: str) -> int:
+    """Load a block's dense ``mlp.*`` weights into ``moe_mlp.shared_expert``.
+
+    ``dense_state`` maps full model keys (``block4.0.mlp.fc1.weight``, ...) to
+    tensors; ``prefix`` is the block prefix (``"block4.0."``). The shared
+    expert IS a PVT v2 ``Mlp``, so the weights transfer verbatim — including
+    ``dwconv`` when the shared expert was built with it. Returns the number of
+    tensors loaded (0 when there is no shared expert).
+    """
+    shared = getattr(moe_mlp, "shared_expert", None)
+    if shared is None:
+        return 0
+
+    target = shared.state_dict()
+    sub = {}
+    for key, value in dense_state.items():
+        if not key.startswith(prefix + "mlp."):
+            continue
+        local = key[len(prefix) + len("mlp."):]        # e.g. "fc1.weight"
+        if local in target and target[local].shape == value.shape:
+            sub[local] = value
+
+    shared.load_state_dict(sub, strict=False)
+
+    # Report BOTH directions. A source tensor with no destination is expected
+    # when the block dropped its DWConv (moe_block_dwconv: False) and alarming
+    # otherwise, so say which it is rather than dropping weights silently.
+    source_keys = {k[len(prefix) + len("mlp."):] for k in dense_state
+                   if k.startswith(prefix + "mlp.")}
+    no_destination = sorted(source_keys - set(target))
+    if no_destination:
+        conv_only = all(k.startswith("dwconv.") for k in no_destination)
+        if conv_only and shared.dwconv is None:
+            print(f"[shared expert] {prefix}: this block has no DWConv "
+                  f"(moe_block_dwconv=False) — skipped {len(no_destination)} conv "
+                  f"tensor(s); fc1/fc2 transferred in full.")
+        else:
+            print(f"[shared expert] WARNING — {prefix}: {len(no_destination)} source "
+                  f"tensor(s) had no destination and were DROPPED: {no_destination}")
+
+    left_at_init = sorted(set(target) - set(sub))
+    if left_at_init:
+        print(f"[shared expert] WARNING — {prefix}: loaded {len(sub)}/{len(target)} "
+              f"tensors, left at random init: {left_at_init}")
+    return len(sub)
+
+
+@torch.no_grad()
+def zero_shared_expert_output(moe_mlp) -> int:
+    """Zero the SHARED expert's output projection (fc2 weight and bias).
+
+    The counterpart to ``zero_routed_expert_output``: here the ROUTED experts
+    carry the replicated pretrained FFN and the shared expert grows from zero.
+    This is the Sparse-Upcycling-style init in docs/HPARAMS.md, whose stated
+    purpose is to stop shared + routed both copying the FFN and emitting ~2x
+    the dense layer at step 0.
+
+    Caveat (see docs/HPARAMS.md): that scheme is only function-preserving if
+    the router's combine weights are normalized per token to sum to 1. Tutel
+    normalizes gates ONLY when ``top_k > 1`` (``impls/fast_dispatch.py``,
+    ``extract_critical``), so at the default ``top_k: 1`` the routed branch is
+    scaled by the raw softmax score (<1) and the block does NOT reproduce the
+    dense FFN exactly. ``upcycle_init="routed_zero"`` does, at any top_k.
+
+    Returns the number of tensors zeroed (0 when there is no shared expert).
+    """
+    shared = getattr(moe_mlp, "shared_expert", None)
+    if shared is None:
+        return 0
+    shared.fc2.weight.zero_()
+    zeroed = 1
+    if shared.fc2.bias is not None:
+        shared.fc2.bias.zero_()
+        zeroed += 1
+    return zeroed
+
+
+@torch.no_grad()
+def zero_routed_expert_output(moe_mlp) -> int:
+    """Zero every routed expert's fc2 (weight and bias).
+
+    With a shared expert holding the pretrained FFN, this makes the block's
+    output at step 0 exactly ``shared_expert(x)`` — i.e. exactly the
+    pretrained dense FFN — while the routed experts stay fully trainable
+    (fc2 receives gradient from the first step, then fc1 through it). This is
+    the residual-upcycling init (``upcycle_init="routed_zero"``); without a
+    shared expert it would zero the block's entire output, which is why
+    ``validate_config`` resolves that case to ``"none"``.
+
+    Returns the number of tensors zeroed; raises if none were recognized.
+    """
+    zeroed = 0
+    for name, param in moe_mlp.moe_layer.named_parameters():
+        lname = name.lower()
+        if _is_gate_param(lname):
+            continue
+        if "fc2" in lname or re.search(r"(^|\.)w2($|_)", lname):
+            param.zero_()
+            zeroed += 1
+    if zeroed == 0:
+        listing = [(n, tuple(p.shape)) for n, p in moe_mlp.moe_layer.named_parameters()]
+        raise RuntimeError(
+            "zero_routed_expert_output: found no fc2/w2 expert parameters. "
+            f"Backend={moe_mlp.backend}. named_parameters()={listing}."
+        )
+    return zeroed
 
 
 # ---------------------------------------------------------------------------

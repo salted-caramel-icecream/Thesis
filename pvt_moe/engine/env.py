@@ -8,6 +8,7 @@ running in a terminal/notebook and the variable is unset.
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 
@@ -22,7 +23,11 @@ def setup_environment(cfg: dict, interactive_secrets: bool = False) -> torch.dev
     """
     import pytorch_lightning as pl
 
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # expandable_segments uses CUDA's virtual-memory APIs and is not supported
+    # on Windows — setting it there produces an allocator warning on every run
+    # and does nothing. Keep it to Linux.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     pl.seed_everything(cfg["seed"], workers=True)
     torch.set_float32_matmul_precision("high")
@@ -37,13 +42,49 @@ def setup_environment(cfg: dict, interactive_secrets: bool = False) -> torch.dev
     if device.type == "cuda":
         name = torch.cuda.get_device_name(0)
         cap = torch.cuda.get_device_capability(0)
-        print(f"[env] GPU: {name} (sm_{cap[0]}{cap[1]}) | torch {torch.__version__} "
-              f"| CUDA {torch.version.cuda}")
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[env] GPU: {name} (sm_{cap[0]}{cap[1]}, {total_gb:.1f} GiB) "
+              f"| torch {torch.__version__} | CUDA {torch.version.cuda}")
+        _check_memory_budget(cfg, total_gb)
     else:
         print(f"[env] No GPU visible — CPU only (torch {torch.__version__})")
 
     _setup_secrets(cfg, interactive=interactive_secrets)
     return device
+
+
+#: Peak VRAM per image measured for PVT v2 B1 at 224^2 under bf16 autocast,
+#: as a rough planning figure only — real usage depends on MoE placement,
+#: capacity factor and the allocator's fragmentation.
+_APPROX_GIB_PER_IMAGE = 0.035
+
+
+def _check_memory_budget(cfg: dict, total_gb: float) -> None:
+    """Warn before a micro-batch that is unlikely to fit is attempted.
+
+    Advisory only — it never changes the config. A run that OOMs after an hour
+    of data loading is worse than a warning that is occasionally pessimistic.
+    """
+    micro = cfg["batch_size"]
+    accum = cfg.get("accumulate_grad_batches", 1)
+    val_micro = micro * cfg.get("val_batch_multiplier", 1)
+    print(f"[env] batch: {micro} micro x {accum} accum = "
+          f"{cfg.get('effective_batch_size', micro * accum)} effective "
+          f"| val {val_micro}")
+
+    # Whatever the desktop/compositor already holds is not available to us.
+    free_gb = torch.cuda.mem_get_info(0)[0] / 1024**3
+    estimate = micro * _APPROX_GIB_PER_IMAGE
+    if estimate > free_gb * 0.9:
+        fits = max(16, int(free_gb * 0.9 / _APPROX_GIB_PER_IMAGE) // 16 * 16)
+        print(f"[env] WARNING: micro-batch {micro} needs roughly "
+              f"{estimate:.1f} GiB but only {free_gb:.1f} GiB is free. "
+              f"Try batch_size={fits} (raise accumulate_grad_batches to keep "
+              f"the same effective batch).")
+    if sys.platform == "win32" and cfg.get("num_workers", 0) > 8:
+        print(f"[env] NOTE: num_workers={cfg['num_workers']} on Windows — "
+              "workers spawn (no fork), so each re-imports the module and "
+              "holds its own copy. 4-8 is usually the sweet spot on 32 GB.")
 
 
 def _setup_secrets(cfg: dict, interactive: bool) -> None:

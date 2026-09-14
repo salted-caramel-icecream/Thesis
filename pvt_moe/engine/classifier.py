@@ -31,7 +31,11 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from torchmetrics import MetricCollection
-from torchmetrics.classification import MulticlassAccuracy
+from torchmetrics.classification import (
+    MulticlassAccuracy,
+    MulticlassPrecision,
+    MulticlassRecall,
+)
 
 from pvt_moe.models.pretrained import load_backbone_checkpoint, load_hf_pretrained
 from pvt_moe.models.pvt import build_model
@@ -80,9 +84,24 @@ class LitClassifier(pl.LightningModule):
         def _acc(top_k: int):
             return MulticlassAccuracy(num_classes=num_classes, top_k=top_k, average="micro")
 
+        # Macro precision/recall (v9 lineage) surface per-class collapse that
+        # micro accuracy hides — an MoE that serves the head classes well and
+        # starves the tail reads fine on top-1 and badly here.
+        #
+        # Deliberately NOT on the train split: training metrics are computed
+        # against argmax of MIXUP'd soft targets, where per-class precision is
+        # noise. Use the val numbers.
         self.train_metrics = MetricCollection({"acc_mixed": _acc(1)}, prefix="train_")
         self.val_metrics = MetricCollection(
-            {"acc": _acc(1), "acc_top5": _acc(5)}, prefix="val_"
+            {
+                "acc": _acc(1),
+                "acc_top5": _acc(5),
+                "precision_macro": MulticlassPrecision(
+                    num_classes=num_classes, average="macro"),
+                "recall_macro": MulticlassRecall(
+                    num_classes=num_classes, average="macro"),
+            },
+            prefix="val_",
         )
         self.test_metrics = self.val_metrics.clone(prefix="test_")
 
@@ -106,6 +125,7 @@ class LitClassifier(pl.LightningModule):
                 self.model,
                 cfg["model"]["pretrained_hf_id"],
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
+                upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"),
             )
         elif mode == "ssl_init":
             load_backbone_checkpoint(self.model, cfg["ckpt_path"], skip_head=True)

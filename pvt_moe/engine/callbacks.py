@@ -10,6 +10,47 @@ import torch
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 
+class MilestoneCheckpoint(pl.Callback):
+    """Write a permanent full-state checkpoint at given epoch counts.
+
+    Distinct from ``ModelCheckpoint`` in two ways that matter for a long run
+    split across machines:
+
+    - it is keyed on the EPOCH COUNT, not on a monitored metric, so the file
+      you get back is the one you asked for;
+    - it is never pruned by ``save_top_k``, so an epoch-90 snapshot survives
+      another 200 epochs of better validation scores.
+
+    The file holds model + optimizer + scheduler + epoch (Lightning's full
+    checkpoint), so ``trainer.fit(..., ckpt_path=...)`` resumes exactly where
+    it stopped, with the schedule still tied to the ORIGINAL epoch budget.
+
+    Milestones count COMPLETED epochs: milestone 90 fires once the 90th epoch
+    has finished, and the file is named ``milestone-epoch090.ckpt``.
+    """
+
+    def __init__(self, milestones, dirpath: str):
+        self.milestones = sorted(set(milestones or []))
+        self.dirpath = dirpath
+        self.written = []
+
+    @staticmethod
+    def filename(epochs_completed: int) -> str:
+        return f"milestone-epoch{epochs_completed:03d}.ckpt"
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        completed = trainer.current_epoch + 1  # current_epoch is 0-based
+        if completed not in self.milestones:
+            return
+        path = os.path.join(self.dirpath, self.filename(completed))
+        os.makedirs(self.dirpath, exist_ok=True)
+        trainer.save_checkpoint(path)
+        self.written.append(path)
+        print(f"[milestone] epoch {completed}: saved full state -> {path}")
+
+
 class PrintEpochMetrics(pl.Callback):
     """One human-readable line per epoch (the CSV/W&B logs stay canonical)."""
 
@@ -88,6 +129,9 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
     silently created nested directories).
     """
     ckpt_dir = os.path.join(cfg["checkpoint_root"], cfg["run_name"])
+    # The schedule is always built for cfg["epochs"]; stop_at_epoch only ends
+    # the run early, so a resumed run picks up the same cosine.
+    max_epochs = cfg.get("stop_at_epoch") or cfg["epochs"]
     checkpoint_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
         monitor="val_acc",
@@ -102,15 +146,21 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         LearningRateMonitor(logging_interval="epoch"),
         PrintEpochMetrics(),
     ]
+    if cfg.get("milestones"):
+        callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
     if extra_callbacks:
         callbacks.extend(extra_callbacks)
 
     return pl.Trainer(
-        max_epochs=cfg["epochs"],
+        max_epochs=max_epochs,
         accelerator="auto",
         devices=1,
         precision=cfg["precision"] if torch.cuda.is_available() else 32,
         gradient_clip_val=cfg["optim"]["grad_clip"],
+        # micro-batch x this == cfg["effective_batch_size"], which is what the
+        # recipe's LR is calibrated for. Clipping is applied to the accumulated
+        # gradient by Lightning, i.e. once per optimizer step, as intended.
+        accumulate_grad_batches=cfg.get("accumulate_grad_batches", 1),
         # "warn" (not True): True would make PL call
         # torch.use_deterministic_algorithms without warn_only, turning
         # nondeterministic-op warnings into mid-run crashes.

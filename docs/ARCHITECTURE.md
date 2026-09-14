@@ -36,12 +36,92 @@ stage 4 is 8:2 GQA.
 
 `MoEMlp` replaces the entire dense FFN in placed blocks.
 
-**INVARIANT — the MoE branch has no DWConv.** PVT v2 carries its positional
-encoding as a depthwise 3×3 conv *inside* the FFN; the expert FFN drops it.
-That is why RoPE exists in this codebase: the default config enables RoPE in
-exactly the MoE blocks to reinject position. If you place MoE without RoPE,
-know that those blocks are position-blind (that is itself an ablation, but an
-intentional one).
+**INVARIANT — the routed MoE branch has no DWConv.** PVT v2 carries its
+positional encoding as a depthwise 3×3 conv *inside* the FFN; the expert FFN
+drops it. That is why RoPE exists in this codebase: the default config enables
+RoPE in exactly the MoE blocks to reinject position. If you place MoE without
+RoPE, know that those blocks are position-blind (that is itself an ablation,
+but an intentional one).
+
+**Shared expert (`moe.shared_expert`, optional, default off).** An always-on
+dense FFN added to the routed output for every token:
+
+```
+y = routed_moe(x) + shared_expert(x)          # DeepSeekMoE / Qwen-MoE style
+```
+
+It is a plain `Mlp` held by `MoEMlp` *outside* `moe_layer`, which has three
+consequences worth stating as invariants:
+
+1. **Backend-agnostic and init-safe.** Tutel and MegaBlocks each initialize
+   their own expert tensors at construction; the shared expert is outside that
+   blast radius, so it is the only branch whose weights are guaranteed to be
+   whatever we put there.
+2. **It can keep the DWConv** (`moe_block_dwconv`, default True), which
+   relaxes the invariant above: a shared-expert MoE block is *not*
+   position-blind, so RoPE becomes an independent axis rather than a
+   compensation for MoE.
+
+   *Why the routed branch still cannot have one.* Token-choice routing
+   destroys the grid: the router gathers each expert's tokens out of order
+   and pads them to `capacity`, so the `N` axis reaching an expert is a
+   ragged bag of tokens from arbitrary `(h, w)` positions — there is no
+   `H x W` to reshape to, and tokens over capacity are dropped entirely. A
+   depthwise conv is therefore only definable on the **unrouted** tensor.
+   `MoEMlp.forward` passes the flattened `x_flat` to `moe_layer` but the
+   original `(B, N, C)` `x` plus `H`/`W` to the shared expert, so the shared
+   branch is the one place inside an MoE block where the grid survives.
+   `tests/test_shared_expert.py::test_shared_expert_sees_the_token_grid`
+   pins this down: permuting tokens and un-permuting the output changes the
+   shared branch's result (and does not, with the DWConv off).
+
+   A second consequence of being unrouted: capacity-dropped tokens still get
+   a full FFN from the shared branch instead of zero.
+3. **`upcycle_init: "routed_zero"` gives exact function preservation.** Zeroing every
+   routed expert's fc2 at upcycle makes the block compute exactly the
+   pretrained dense FFN at step 0 (verified by
+   `tests/test_shared_expert.py::test_upcycled_block_reproduces_dense_ffn_exactly`),
+   with the routed experts learning a residual. fc2 still receives gradient
+   from the first step, so the experts are not frozen.
+
+Do NOT mark shared-expert parameters with `skip_allreduce` — they are ordinary
+data-parallel parameters, unlike the routed expert tensors.
+
+## 2b. MoE backends
+
+| Backend | Status | Needs |
+|---|---|---|
+| `tutel` | **default** | a CUDA extension built from source (compiler required) |
+| `native` | fallback | nothing beyond torch |
+| `megablocks` | experimental | `megablocks==0.10.0` + `grouped_gemm` |
+
+Tutel stays the default because it produced the recorded results; switching
+would make new runs incomparable to the 72.27%. `native`
+(`pvt_moe/models/moe_native.py`) exists so a box where Tutel will not build —
+Windows/WSL2, a fresh rental, a broken nvcc — cannot stop an ablation.
+
+**INVARIANT — the native backend mirrors Tutel's parameter layout.** Same key
+names, same shapes, including the detail that `batched_fc2_w` stores
+`fc2.weight.T`. Consequences worth relying on:
+
+- a run started on one backend **resumes on the other**;
+- `seed_moe_experts_from_dense` and `zero_routed_expert_output` need no
+  backend special-case;
+- `expert_utilization` reads `gates[0].wg` on either.
+
+Measured parity (`tests/test_native_moe.py`, and the derivation in the module
+docstring):
+
+| | Result |
+|---|---|
+| Expert FFN arithmetic, identical weights | **bit-exact** (max Δ = 0.0) |
+| Load-balancing aux loss vs Tutel `gshard_loss` | **identical** — gshard expands to `E · Σ(P_i·f_i)`, the Switch formula |
+| Top-1 gate scaling | identical: raw softmax score, unnormalized (Tutel normalizes only when `top_k > 1`) |
+| End-to-end `moe_layer` output | **not compared** — Tutel's dispatch needs a process group and reorders tokens through capacity buffers; the arithmetic it performs is what is verified above |
+
+Deliberate limits of the fallback: top-1 only (raises on `top_k > 1` rather
+than running an untested path), no expert parallelism, and a python loop over
+experts (E=4 makes it cheaper than the scatter/gather it replaces).
 
 **INVARIANT — aux-loss contract** (the "fixed aux" semantics that took the v3
 lineage several failed runs to get right):
