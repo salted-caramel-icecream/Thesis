@@ -165,7 +165,7 @@ instructions instead of silently re-downloading ~160 GB.
 | mode | What happens |
 |------|--------------|
 | `hf_pretrained` | remap `OpenGVLab/pvt_v2_b1` (kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling) |
-| | Set by `recipe: "pretrained"`; see `docs/HPARAMS.md` §3 for the two upcycling inits and why the spec's default is not function-preserving at `top_k: 1` |
+| | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`routed_zero_init`); `--shared-zero-init` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |
 | `resume` | full Lightning resume from `ckpt_path` |

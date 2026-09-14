@@ -83,12 +83,24 @@ def test_boolean_flags_and_their_negations():
 def test_unset_boolean_does_not_shadow_the_recipe():
     """--shared-expert unset must leave the recipe's True in place."""
     assert _cfg()["model"]["moe"]["shared_expert"] is True
-    assert _cfg("--recipe", "pretrained")["model"]["moe"]["shared_zero_init"] is True
+    assert _cfg("--recipe", "pretrained")["model"]["moe"]["routed_zero_init"] is True
 
 
 def test_zero_init_can_be_swapped_on_the_command_line():
-    c = _cfg("--recipe", "pretrained", "--routed-zero-init", "--no-shared-zero-init")
-    assert c["model"]["moe"]["routed_zero_init"] is True
+    """The recipe default is routed; --shared-zero-init opts into the spec's."""
+    c = _cfg("--recipe", "pretrained", "--shared-zero-init", "--no-routed-zero-init")
+    assert c["model"]["moe"]["shared_zero_init"] is True
+    assert c["model"]["moe"]["routed_zero_init"] is False
+    assert "-szi" in c["run_name"], "the two init schemes must not share a run name"
+    assert "-szi" not in _cfg("--recipe", "pretrained")["run_name"]
+
+
+def test_no_shared_expert_still_resolves_under_the_pretrained_recipe():
+    """--no-shared-expert inherits routed_zero_init from the recipe; it must be
+    dropped, not raise, and not zero the block."""
+    c = _cfg("--recipe", "pretrained", "--no-shared-expert")
+    assert c["model"]["moe"]["shared_expert"] is False
+    assert c["model"]["moe"]["routed_zero_init"] is False
     assert c["model"]["moe"]["shared_zero_init"] is False
 
 

@@ -94,11 +94,19 @@ RECIPES = {
             # ratio helps fine-tuning.
             "drop_path_rate": 0.1,
             "moe": {
-                # Upcycling init: routed experts replicate the pretrained FFN,
-                # the shared expert's output projection starts at zero so the
-                # layer does not output ~2x the dense layer at step 0.
-                "shared_zero_init": True,
-                "routed_zero_init": False,
+                # Upcycling init. The shared expert carries the pretrained FFN
+                # verbatim and the ROUTED experts' fc2 starts at zero, so the
+                # block computes exactly the pretrained dense FFN at step 0 and
+                # the routed experts learn a residual on top of it.
+                #
+                # This departs from the spec's table, which zeroes the shared
+                # expert instead. That scheme is only function-preserving when
+                # the combine weights are normalized per token, and Tutel
+                # normalizes gates ONLY when top_k > 1 (impls/fast_dispatch.py,
+                # extract_critical) — so at the spec's own top_k=1 it emits a
+                # fraction of the dense FFN. See docs/HPARAMS.md section 3.
+                "routed_zero_init": True,
+                "shared_zero_init": False,
             },
         },
     },
@@ -380,6 +388,7 @@ def build_run_tag(cfg: dict) -> str:
         # The random-expert-init control (pretrained ladder row 6) is
         # architecturally identical to the upcycled run it is compared against,
         # so the init has to appear in the name or the two overwrite each other.
+        szi = "-szi" if moe_cfg.get("shared_zero_init") else ""
         randexp = (
             "-randexp"
             if cfg.get("mode") == "hf_pretrained"
@@ -388,7 +397,7 @@ def build_run_tag(cfg: dict) -> str:
         )
         moe = (
             f"moe-{_placement_tag(moe_pl, depths)}-"
-            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{randexp}{backend}"
+            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{szi}{randexp}{backend}"
         )
     else:
         moe = "dense"
@@ -661,16 +670,18 @@ def validate_config(cfg: dict) -> dict:
             raise ValueError(f"num_heads {heads} must be divisible by num_kv_heads {kv}")
 
     moe = model["moe"]
-    if moe.get("routed_zero_init") and not moe.get("shared_expert"):
-        raise ValueError(
-            "moe.routed_zero_init requires moe.shared_expert: zeroing every "
-            "routed expert's fc2 without a shared expert makes the MoE block "
-            "output identically zero at init."
-        )
-    if moe.get("shared_zero_init") and not moe.get("shared_expert"):
-        # Vacuous rather than dangerous: there is no shared expert to zero.
-        # A recipe sets this globally, so a no-shared-expert arm (ladder row 3)
-        # must not be rejected for inheriting it.
+    if not moe.get("shared_expert"):
+        # Neither zero-init is meaningful without a shared expert, and a recipe
+        # sets them globally — so a no-shared-expert arm (ladder row 3, or a
+        # bare --no-shared-expert) must not be rejected for inheriting one.
+        if moe.get("routed_zero_init"):
+            # This one would have zeroed the block's ENTIRE output, so it is
+            # dropped loudly rather than silently.
+            print("[config] moe.routed_zero_init dropped: there is no shared "
+                  "expert to carry the pretrained FFN, so zeroing the routed "
+                  "experts' fc2 would make this MoE block output zero.")
+            moe["routed_zero_init"] = False
+        # Vacuous rather than dangerous: nothing to zero.
         moe["shared_zero_init"] = False
     if moe.get("shared_zero_init") and moe.get("routed_zero_init"):
         raise ValueError(

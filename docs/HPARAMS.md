@@ -113,30 +113,62 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 |---|---|---|
 | Routed experts | replicate the pretrained FFN into each expert | `model.seed_moe_from_dense` |
 | Router | random, zero-mean normal σ=0.02 | Tutel's own gate init (untouched by seeding) |
-| Combine weights | normalize per token to sum to 1 | Tutel `normalize_gate` — **see caveat** |
-| Shared expert | zero-init the output projection | `model.moe.shared_zero_init` |
+| Combine weights | normalize per token to sum to 1 | Tutel `normalize_gate` — **see below** |
+| Shared expert | carries the pretrained FFN verbatim (DWConv included) | `model.moe.shared_expert` |
+| Routed experts' fc2 | **zero-init** — the default here | `model.moe.routed_zero_init` |
 | Optimizer state | unavailable | — |
 | Expert symmetry breaking | none | Sparse Upcycling B.9 |
 
-> **Caveat — the spec's init is not function-preserving at `top_k: 1`.**
-> The doc's scheme (routed = pretrained FFN, shared = zero) is function-identical
-> to the dense layer *only if* the combine weights are normalized per token to
-> sum to 1. Tutel normalizes gates **only when `top_k > 1`**
-> (`tutel/impls/fast_dispatch.py`, `extract_critical`: the `if normalize_gate`
-> block sits inside `if top_k > 1`). At the spec's own `top_k: 1` the routed
-> branch is therefore scaled by the raw softmax score (< 1, ≈0.25–0.4 for a
-> freshly-initialized 4-expert router), so the block emits a *fraction* of the
-> dense FFN at step 0 rather than matching it.
->
-> `model.moe.routed_zero_init` is the alternative: put the pretrained FFN in
-> the **shared** branch and zero the **routed** experts' fc2 instead. That is
-> exactly function-preserving at any `top_k`
-> (`test_upcycled_block_reproduces_dense_ffn_exactly`), and the routed experts
-> still receive gradient from the first step. The two flags are mutually
-> exclusive.
->
-> The recipe default follows the spec (`shared_zero_init`). Switch to
-> `routed_zero_init` if you want the step-0 guarantee.
+### Which branch starts at zero — a deliberate departure from the spec
+
+Both branches copy the pretrained FFN, so one of them must start at zero or
+the block emits ~2× the dense layer at step 0. The spec zeroes the **shared**
+expert. **This codebase zeroes the routed experts instead**, and that is the
+`pretrained` recipe's default.
+
+| | spec (`shared_zero_init`) | **default here (`routed_zero_init`)** |
+|---|---|---|
+| Shared expert | zero output projection | carries the pretrained FFN verbatim |
+| Routed experts | replicate the pretrained FFN | fc2 starts at zero |
+| Block output at step 0 | `gate · FFN(x)` | `FFN(x)` — exact |
+| Exact at `top_k: 1`? | **no** | yes |
+| Exact at `top_k > 1`? | yes | yes |
+
+**Why.** The spec's scheme is function-identical to the dense layer *only if*
+the combine weights are normalized per token to sum to 1. Tutel normalizes
+gates **only when `top_k > 1`** — in `tutel/impls/fast_dispatch.py`,
+`extract_critical`, the `if normalize_gate:` block sits inside `if top_k > 1:`.
+At the spec's own `top_k: 1` the routed branch is therefore scaled by the raw
+softmax score (< 1, ≈0.25–0.4 for a freshly-initialized 4-expert router), so
+the block emits a *fraction* of the pretrained FFN at step 0 — the warm start
+is silently degraded exactly where it is supposed to be lossless.
+
+Zeroing the routed branch instead sidesteps the gate entirely: the shared
+expert is unrouted, so its output is never scaled, and the block reproduces
+the pretrained dense FFN exactly at any `top_k`
+(`tests/test_shared_expert.py::test_upcycled_block_reproduces_dense_ffn_exactly`).
+The routed experts are not frozen — fc2 receives gradient from the first step,
+and fc1 through it
+(`test_zeroed_routed_fc2_still_receives_gradient`).
+
+It also composes with the DWConv: the shared branch holds PVT v2's depthwise
+conv and loads it verbatim, so the pretrained positional component survives
+(see §5).
+
+**To run the spec's scheme instead** — worth doing as an ablation, since it is
+what Sparse Upcycling and ViMoE describe:
+
+```bash
+python train.py --recipe pretrained --shared-zero-init --no-routed-zero-init
+```
+
+Run names distinguish the two (`...+sh-szi_...` for the spec's), so the arms
+do not share a checkpoint directory.
+
+The two flags are mutually exclusive, and **both are dropped when there is no
+shared expert** (ladder row 3): there is nothing to carry the pretrained FFN,
+so zeroing the routed branch would make the block output zero. `routed_zero_init`
+prints a line when it is dropped; `shared_zero_init` is merely vacuous.
 
 ---
 

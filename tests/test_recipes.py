@@ -93,10 +93,20 @@ def test_spec_pretrained_deltas():
     assert pre["model"]["ablation"] == scratch["model"]["ablation"]
 
 
-def test_spec_pretrained_uses_shared_zero_init():
+def test_pretrained_defaults_to_routed_zero_init():
+    """Deliberate departure from the spec's table: routed_zero_init is exactly
+    function-preserving at top_k=1, shared_zero_init is not (Tutel normalizes
+    combine weights only when top_k > 1). See docs/HPARAMS.md section 3."""
     moe = _cfg(recipe="pretrained")["model"]["moe"]
-    assert moe["shared_zero_init"] is True
-    assert moe["routed_zero_init"] is False
+    assert moe["routed_zero_init"] is True
+    assert moe["shared_zero_init"] is False
+
+
+def test_shared_zero_init_remains_available():
+    moe = _cfg(recipe="pretrained",
+               model={"moe": {"routed_zero_init": False,
+                              "shared_zero_init": True}})["model"]["moe"]
+    assert moe["shared_zero_init"] is True and moe["routed_zero_init"] is False
 
 
 # --- epoch ladder & derived stochastic depth -------------------------------
@@ -190,14 +200,11 @@ def test_shared_zero_init_is_dropped_without_a_shared_expert():
     assert c["model"]["moe"]["shared_zero_init"] is False
 
 
-def test_routed_zero_init_without_shared_expert_still_raises():
-    """This one IS dangerous: it zeroes the block's entire output."""
-    try:
-        _cfg(model={"moe": {"shared_expert": False, "routed_zero_init": True}})
-    except ValueError as e:
-        assert "routed_zero_init" in str(e)
-        return
-    raise AssertionError("routed_zero_init without shared_expert must raise")
+def test_routed_zero_init_dropped_without_a_shared_expert():
+    """Would otherwise zero the block's entire output. A recipe sets it
+    globally, so the no-shared-expert arm must still resolve — with it off."""
+    c = _cfg(model={"moe": {"shared_expert": False, "routed_zero_init": True}})
+    assert c["model"]["moe"]["routed_zero_init"] is False
 
 
 def test_zero_shared_expert_output_zeros_only_shared_fc2():

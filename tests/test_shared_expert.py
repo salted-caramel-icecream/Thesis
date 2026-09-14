@@ -157,13 +157,14 @@ def test_upcycled_block_reproduces_dense_ffn_exactly():
 
 # --- config integration ----------------------------------------------------
 
-def test_config_rejects_zero_init_without_shared_expert():
-    try:
-        tiny_config(model={"moe": {"shared_expert": False, "routed_zero_init": True}})
-    except ValueError as e:
-        assert "shared_expert" in str(e)
-        return
-    raise AssertionError("routed_zero_init without shared_expert must raise")
+def test_zero_init_is_dropped_without_a_shared_expert():
+    """Both zero-inits are meaningless without a shared expert, and a recipe
+    sets them globally — so they are dropped rather than rejected. Zeroing the
+    routed fc2 here would make the block output identically zero."""
+    cfg = tiny_config(model={"moe": {"shared_expert": False,
+                                     "routed_zero_init": True}})
+    assert cfg["model"]["moe"]["routed_zero_init"] is False
+    assert cfg["model"]["moe"]["shared_zero_init"] is False
 
 
 def test_run_tag_marks_shared_expert():
