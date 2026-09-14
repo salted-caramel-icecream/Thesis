@@ -2,8 +2,9 @@
 
 PVT v2 B1 image classifier with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
-lineage (`PVT_Tutelmoe_fixedaux_v9_*` and earlier — kept untouched in the
-repo root / `Archive/` / `Others/` for provenance).
+lineage. The two source notebooks are kept untouched in the repo root for
+provenance — see `docs/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
+where each cell ended up.
 
 ```
 pvt_moe/        the package — ALL logic lives here
@@ -15,10 +16,10 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
                 NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
                 JEPA_GUIDE.md (SSL recipe)
-.claude/skills/ skill library for AI-assisted maintenance
+train.py        terminal entry point (thin shim over pvt_moe/cli.py)
 ```
 
-## Quickstart (B200 / RTX 5090)
+## Quickstart (B200 / RTX 5090 / RTX 5070)
 
 ```bash
 # 1) On the GPU box, from the repo root:
@@ -51,7 +52,7 @@ recipe**, so the command line stays short and `docs/HPARAMS.md` remains the
 source of truth. Precedence, lowest to highest:
 
 ```
-default_config()  <  --config file.json  <  --ladder N  <  named flags  <  --set a.b=v
+default_config()  <  --config file.yaml  <  --ladder N  <  named flags  <  --set a.b=v
 ```
 
 ```bash
@@ -60,6 +61,12 @@ python train.py --recipe pretrained --lr 5e-5 --warmup-epochs 5
 python train.py --no-moe --no-dwconv --rope            # a dense ablation arm
 python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
+
+python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
+python train.py --data-dir /mnt/imagenet_arrow --checkpoint-dir /mnt/runs
+python train.py --backend native                       # no-Tutel fallback
+python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
+python train.py --no-moe-dwconv --rope                 # position-encoding arm
 ```
 
 `--ladder N` (1–9) applies a row of the ablation ladder from
@@ -110,30 +117,46 @@ Warmup always starts from an absolute **1e-6** — `optim.warmup_start_factor`
 is derived from your peak LR rather than hand-set, so it stays right when you
 change `lr`. Run names carry the budget: `..._ln_scratch90`, `..._ln_ft100`.
 
-In `notebooks/01_train_supervised.ipynb` the top of the CONFIG cell exposes
-`RECIPE`, `EPOCHS`, `LR` and `WARMUP_EPOCHS` directly.
+In `notebooks/v11_train.ipynb` the top of the CONFIG cell exposes `RECIPE`,
+`EPOCHS`, `LR`, `WARMUP_EPOCHS`, `MILESTONES`, `STOP_AT` and `RESUME_FROM`
+directly, and prints the equivalent command line.
 
-## The five ablation axes
+## The seven ablation axes
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2 (+GQA) |
-| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices, e.g. `[[],[],[],[0,1]]`; or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
+| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[1]]` is stage 4's last block only. Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
 | 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
-| 7 | Conv positional encoding | `model.dense_dwconv` | `False` removes PVT v2's FFN DWConv from dense blocks too — the "no DWConv + RoPE" arm (ladder runs 2 and 6) |
+| 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
-Run names are derived from the flags (e.g. `v10_in1k_moe-s4-e8k1_rope-s4_ln`) —
-every W&B run self-documents its ablation.
+Run names are derived from the flags — every W&B run self-documents its
+ablation, and no two arms can share a checkpoint directory (tests enforce it):
+
+```
+v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+    └──────────────────────────────────── dataset
+    │        └─────────────────────────── stage 4, block 1
+    │        │    └────────────────────── 4 experts, top-1
+    │        │    │   └────────────────── shared expert
+    │        │    │   │   └────────────── RoPE placement
+    │        │    │   │   │         └──── norm
+    │        │    │   │   │         │  └─ recipe + epoch budget
+```
+
+Further markers appear only when they apply: `-nat`/`-mb` (backend),
+`+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
+theirs), `-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
 
 ## Shared expert (`model.moe.shared_expert`)
 
 An always-on dense FFN evaluated for every token alongside the routed
 experts, `y = routed_moe(x) + shared_expert(x)`. It lives outside the backend
-layer, so it is backend-agnostic and its weights are never touched by Tutel's
-or MegaBlocks' own expert initialization.
+layer, so it works identically under all three backends and its weights are
+never touched by their own expert initialization.
 
 | Knob | Effect |
 |------|--------|
@@ -145,8 +168,7 @@ With `mode: hf_pretrained`, the shared branch is loaded verbatim from the
 pretrained dense FFN — the one place a pretrained FFN survives intact rather
 than being replicated into E experts. Read the
 `seeded_shared=... zeroed_routed_fc2=...` fields of the `[HF pretrained]` line
-to confirm it happened. Run names gain `+sh`
-(e.g. `v10_in1k_moe-s4-e8k1+sh_rope-s4_ln`).
+to confirm it happened. Run names gain `+sh`.
 
 ## MoE backends
 
@@ -193,11 +215,16 @@ reproduces the paper's optimization exactly:
 batch: 128 micro x 8 accum = 1024 effective
 ```
 
-OOM? Halve one and double the other — the optimization is unchanged:
+OOM? Two levers, neither of which changes the optimization:
 
 ```bash
-python train.py --batch-size 64 --accum 16
+python train.py --batch-size 64 --accum 16              # smaller micro-batch
+python train.py --grad-checkpointing "[1]" --batch-size 256   # recompute stage 1
 ```
+
+Checkpointing saves in proportion to token count, so stage 1 (56×56 = 3136
+tokens) is worth ~64× stage 4 (7×7 = 49). `[1]` or `[1,2]` typically buys a
+2–4× larger micro-batch for ~30% per-stage slowdown.
 
 `setup_environment` measures free VRAM and warns before training if the
 micro-batch looks too large, instead of OOM-ing an hour into data loading.
