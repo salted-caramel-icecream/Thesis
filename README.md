@@ -85,7 +85,7 @@ cfg = merge_config(default_config(), {"recipe": "scratch"})   # or "pretrained"
 | Warmup epochs | 5 | 3 |
 | Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") |
 | Stage-4 LR multiplier | 1.0 | 1.0 |
-| Weight decay / clip / batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical |
+| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical |
 
 A recipe fills only fields left as `None`, so **anything you set explicitly
 wins**:
@@ -153,9 +153,34 @@ to confirm it happened. Run names gain `+sh`
   collected in eval, bias=True silently ignored) — all fixed in
   `pvt_moe/models/ffn.py`; the notebook's sanity cell checks each one.
 
+## Hardware sizing (single 12 GB card)
+
+`batch_size` is the **micro**-batch (what fits VRAM); `effective_batch_size`
+is what the LR is calibrated for. Accumulation is derived, so a 12 GB card
+reproduces the paper's optimization exactly:
+
+```
+batch: 128 micro x 8 accum = 1024 effective
+```
+
+OOM? Halve one and double the other — the optimization is unchanged:
+
+```bash
+python train.py --batch-size 64 --accum 16
+```
+
+`setup_environment` measures free VRAM and warns before training if the
+micro-batch looks too large, instead of OOM-ing an hour into data loading.
+Windows notes are handled in-code (no `fork`, no `expandable_segments`).
+
+**Budget honestly**: one ImageNet-1k epoch is an estimated 45–85 min on an
+RTX 5070, so a 90-epoch ablation run is 3–6 days and the 8-run ladder is
+4–8 weeks. Measure one epoch before committing. See `docs/HPARAMS.md` §5.
+
 ## Datasets
 
-ImageNet Arrow snapshots are expected at the paths in
+ImageNet-1k as Arrow is ~160 GB; **ImageNet-22k is ~1.3 TB and will not fit a
+579 GB disk**. Arrow snapshots are expected at the paths in
 `config.dataset.arrow_dirs` (map-style `load_from_disk`; **never**
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.
@@ -181,6 +206,23 @@ full training run that started from random weights (8.9% accuracy).
   broken W&B config filter, `/` in checkpoint filenames, hardcoded MoE
   hyperparameters, dead `qk_scale`/`patch_size` knobs, ...) are fixed in the
   package; see `docs/ARCHITECTURE.md` for the invariants that were kept.
+
+## Config management
+
+Plain nested dicts, no framework — see `pvt_moe/config.py`. The config is
+JSON-serializable by construction (a test enforces it), so it is logged to
+W&B and checkpointed verbatim, and `validate_config` does the domain checks a
+schema library would not give you for free (placement bounds, `head_dim % 4`,
+recipe resolution, batch divisibility, upcycle-init resolution).
+
+Unknown keys are **rejected**, because the one thing plain dicts get wrong is
+that a typo silently creates a new key that nothing reads:
+
+```
+$ python train.py --set model.moe.num_expert=16
+error: Unknown config key(s) — a typo here would silently do nothing:
+  model.moe.num_expert Did you mean 'model.moe.num_experts'?
+```
 
 ## Housekeeping
 

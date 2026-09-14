@@ -59,6 +59,10 @@ VALID_UPCYCLE_INITS = ("routed_zero", "shared_zero", "none")
 #: middle budget. Other values are allowed but are off-ladder.
 SCRATCH_EPOCH_CHOICES = (90, 150, 300)
 
+#: Batch size the recipes' peak LRs are calibrated for (PVT v2: 1e-3 @ 1024).
+#: Only the EFFECTIVE batch matters here — micro-batch is a memory choice.
+LR_REFERENCE_BATCH = 1024
+
 #: Absolute LR the linear warmup starts from (DeiT/PVT v2 convention:
 #: warmup_lr = 1e-6 regardless of peak LR). ``optim.warmup_start_factor`` is
 #: DERIVED from this and the peak LR so it stays correct when lr is overridden.
@@ -157,9 +161,23 @@ _DEFAULT: dict = {
     # stochastic depth follows automatically (scratch_drop_path).
     "epochs": None,
     "precision": "bf16-mixed",
-    "batch_size": 1024,
-    "val_batch_multiplier": 2,     # val batch = batch_size * this
-    "num_workers": 12,
+    # MICRO-batch: what actually fits in VRAM in one forward/backward.
+    # Defaults are sized for a 12 GB card (RTX 5070) at 224^2, bf16.
+    "batch_size": 128,
+    # What the LR is calibrated for (PVT v2: 1e-3 @ 1024). Gradient
+    # accumulation makes up the difference:
+    #     accumulate_grad_batches = effective_batch_size // batch_size
+    # so a 12 GB card reproduces the paper's optimization exactly, just
+    # slower. Set to None to disable accumulation (effective == batch_size),
+    # in which case scale the LR yourself.
+    "effective_batch_size": 1024,
+    # DERIVED from the two above by validate_config. Set explicitly only to
+    # override the derivation.
+    "accumulate_grad_batches": None,
+    "val_batch_multiplier": 2,     # val batch = batch_size * this (no grads)
+    # Windows has no fork(), so workers re-import the module (spawn) and each
+    # holds its own copy — keep this well under core count on a 32 GB box.
+    "num_workers": 8,
 
     "checkpoint_root": "/workspace/ModelTraining/checkpoints",
     "log_root": "/workspace/ModelTraining/logs",
@@ -607,6 +625,25 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
     if recipe is not None:
         filled = _fill_none(cfg, RECIPES[recipe])
 
+    # Gradient accumulation: micro-batch x accumulation = effective batch.
+    eff = cfg.get("effective_batch_size")
+    micro = cfg["batch_size"]
+    if cfg.get("accumulate_grad_batches") is None:
+        if eff is None:
+            cfg["accumulate_grad_batches"] = 1
+        elif eff % micro != 0:
+            nearest = [b for b in (16, 32, 64, 96, 128, 192, 256, 384, 512)
+                       if eff % b == 0]
+            raise ValueError(
+                f"effective_batch_size ({eff}) must be divisible by batch_size "
+                f"({micro}). Micro-batches that divide {eff}: {nearest}"
+            )
+        else:
+            cfg["accumulate_grad_batches"] = eff // micro
+        filled.append("accumulate_grad_batches")
+    if eff is None:
+        cfg["effective_batch_size"] = micro * cfg["accumulate_grad_batches"]
+
     # Anything still unset now has no recipe to come from.
     missing = [k for k in ("epochs", "mode") if cfg.get(k) is None]
     if cfg["optim"].get("lr") is None:
@@ -640,6 +677,74 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
     return cfg
 
 
+#: Subtrees whose KEYS are data rather than schema, so unknown keys are fine.
+_FREEFORM_SUBTREES = ("dataset.arrow_dirs",)
+
+
+def _schema_paths(node, prefix: str = "") -> set:
+    """Every dotted key path present in a template config."""
+    paths = set()
+    for key, value in node.items():
+        path = f"{prefix}{key}"
+        paths.add(path)
+        if isinstance(value, dict) and path not in _FREEFORM_SUBTREES:
+            paths |= _schema_paths(value, f"{path}.")
+    return paths
+
+
+def _suggest(unknown: str, known: set) -> str:
+    """Closest known key, for the 'did you mean' hint."""
+    import difflib
+
+    tail = unknown.rsplit(".", 1)[-1]
+    siblings = [k for k in known
+                if k.rsplit(".", 1)[0] == unknown.rsplit(".", 1)[0]] or list(known)
+    match = difflib.get_close_matches(tail, [k.rsplit(".", 1)[-1] for k in siblings],
+                                      n=1, cutoff=0.6)
+    if not match:
+        return ""
+    for k in siblings:
+        if k.rsplit(".", 1)[-1] == match[0]:
+            return f" Did you mean {k!r}?"
+    return ""
+
+
+def assert_known_keys(cfg: dict) -> None:
+    """Reject config keys that do not exist in ``default_config()``.
+
+    Without this a typo SILENTLY creates a new key and the run proceeds with
+    the default: ``--set model.moe.num_expert=16`` (no 's') leaves the model at
+    4 experts while the config claims 16. On a multi-day run that is an
+    expensive way to learn to spell.
+
+    Keys starting with ``_`` are internal (e.g. the CLI's ``_eval_only``) and
+    are allowed anywhere.
+    """
+    known = _schema_paths(_DEFAULT)
+
+    def walk(node, prefix=""):
+        unknown = []
+        for key, value in node.items():
+            if key.startswith("_"):
+                continue
+            path = f"{prefix}{key}"
+            if path not in known:
+                unknown.append(path)
+                continue
+            if isinstance(value, dict) and path not in _FREEFORM_SUBTREES:
+                unknown += walk(value, f"{path}.")
+        return unknown
+
+    unknown = walk(cfg)
+    if unknown:
+        lines = [f"  {u}{_suggest(u, known)}" for u in sorted(unknown)]
+        raise ValueError(
+            "Unknown config key(s) — a typo here would silently do nothing:\n"
+            + "\n".join(lines)
+            + "\n(keys are checked against pvt_moe.config.default_config())"
+        )
+
+
 def assert_json_safe(cfg: dict) -> None:
     """Raise if the config contains anything that is not JSON-serializable."""
     try:
@@ -654,6 +759,8 @@ def assert_json_safe(cfg: dict) -> None:
 def validate_config(cfg: dict) -> dict:
     """Validate and normalize a config in place (returns it for chaining).
 
+    - rejects unknown keys (``assert_known_keys``) — a typo must not silently
+      become a new key that nothing reads
     - applies the recipe preset to every field left as None (``apply_recipe``)
     - checks enum fields (mode / norm_type / backend / dataset name)
     - derives dataset.num_classes from dataset.name
@@ -661,6 +768,7 @@ def validate_config(cfg: dict) -> dict:
     - derives run_name when unset
     - asserts JSON-serializability
     """
+    assert_known_keys(cfg)
     apply_recipe(cfg)
 
     if cfg["mode"] not in VALID_MODES:
@@ -722,6 +830,18 @@ def validate_config(cfg: dict) -> dict:
                 raise ValueError(
                     f"RoPE enabled in stage {i + 1} but head_dim={head_dim} is not divisible by 4"
                 )
+
+    # The recipe's LR is calibrated for a specific effective batch; say so
+    # rather than silently rescaling, which would make runs incomparable.
+    eff = cfg["effective_batch_size"]
+    if eff != LR_REFERENCE_BATCH and cfg["recipe"] is not None:
+        suggested = cfg["optim"]["lr"] * eff / LR_REFERENCE_BATCH
+        print(
+            f"[config] effective_batch_size is {eff}, but the recipe's "
+            f"lr={cfg['optim']['lr']:.2e} is calibrated for "
+            f"{LR_REFERENCE_BATCH}. The linear-scaling rule would suggest "
+            f"lr={suggested:.2e}. Not applied automatically — pass --lr."
+        )
 
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)

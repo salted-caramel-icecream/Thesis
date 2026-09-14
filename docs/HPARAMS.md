@@ -66,6 +66,31 @@ Both of the first two need timm rather than torchvision:
   3× per epoch with different augmentations and the epoch is shortened to
   compensate. `dataset.repeated_aug: 1` disables it.
 
+### Batch size: micro vs effective
+
+The spec's **1024 is an optimization constraint, not a memory one** — it is
+what the 1e-3 peak LR is calibrated for. Three keys separate the two concerns:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `batch_size` | MICRO-batch: what fits in VRAM in one forward/backward | 128 |
+| `effective_batch_size` | what the LR is calibrated for | 1024 |
+| `accumulate_grad_batches` | derived: `effective // micro` | 8 |
+
+So a 12 GB card reproduces the paper's optimization exactly — same gradient,
+same LR — just in 8 smaller pieces. Gradient clipping is applied by Lightning
+once per optimizer step (to the accumulated gradient), which is the intended
+semantics.
+
+Changing `effective_batch_size` changes the optimization, so the config says
+so rather than silently rescaling:
+
+```
+[config] effective_batch_size is 512, but the recipe's lr=1.00e-03 is
+calibrated for 1024. The linear-scaling rule would suggest lr=5.00e-04.
+Not applied automatically — pass --lr.
+```
+
 ---
 
 ## 2. MoE — Tutel (identical in both recipes)
@@ -262,7 +287,68 @@ the upcycling claim itself — set `model.seed_moe_from_dense: False`.
 
 ---
 
-## 5. Known composition conflict (from the doc, unresolved)
+## 5. Single-GPU sizing (RTX 5070, 12 GB)
+
+Defaults are sized for a 12 GB card at 224², bf16:
+
+| Key | Value | Why |
+|---|---|---|
+| `batch_size` | 128 | micro-batch; ~0.035 GiB/image for PVT v2 B1 at 224² leaves headroom under the ~10.5 GB free after the desktop |
+| `accumulate_grad_batches` | 8 | derived, so the effective batch stays 1024 |
+| `val_batch_multiplier` | 2 | val batch 256 — no gradients, so roughly half the memory per image |
+| `num_workers` | 8 | Windows has no `fork()`, so workers **spawn** and each re-imports the module; 4–8 is the sweet spot on 32 GB |
+| `precision` | `bf16-mixed` | native on Blackwell (sm_120) |
+
+`setup_environment` prints the batch composition and warns *before* training
+if the micro-batch looks too large for the free VRAM it actually measures
+(`torch.cuda.mem_get_info`), rather than letting a run OOM an hour into data
+loading. The estimate is advisory and never changes the config.
+
+If you hit an OOM, halve `batch_size` and double `accumulate_grad_batches` —
+the optimization is unchanged:
+
+```bash
+python train.py --batch-size 64 --accum 16    # still 1024 effective
+```
+
+Two platform notes the code now handles: `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True` is Linux-only and is no longer set on Windows, and
+the DataLoader already falls back from `fork` to spawn off Linux.
+
+### Wall-clock reality
+
+At an estimated 250–500 img/s for PVT v2 B1 at 224² on this card, one
+ImageNet-1k epoch is roughly **45–85 minutes** (repeated augmentation shortens
+the epoch to ~77% of the dataset, which is included). That puts the spec's
+budgets at:
+
+| Budget | Estimated wall clock |
+|---|---|
+| 90 ep (one ablation run) | **3–6 days** |
+| 150 ep | 5–10 days |
+| 300 ep (final run) | 10–20 days |
+| the 8-run scratch ladder | **4–8 weeks** |
+
+**These are estimates, not measurements** — they were not benchmarked on the
+target card. Measure one epoch before committing to a ladder.
+
+The recipe is inherited from multi-GPU papers, and nothing about it assumes a
+single 12 GB card. If the full ladder does not fit the calendar, the usual
+levers are a reduced-resolution ablation phase (160² is ~2× faster), an
+ImageNet-100 subset for the ladder with IN-1k only for the final run, or
+`torch.compile`. Which to take is a thesis-design decision, not a config one.
+
+### Storage
+
+ImageNet-1k as an Arrow snapshot is ~160 GB, which fits a 579 GB disk with
+room for checkpoints. **ImageNet-22k is roughly 1.3 TB and will not fit** —
+`dataset.name: "imagenet-22k"` needs external storage. Checkpoints accumulate
+under `checkpoint_root/<run_name>/` (`save_top_k=2` plus `last`, so ~3 files
+× ~170 MB per run) and nothing deletes them automatically.
+
+---
+
+## 6. Known composition conflict (from the doc, unresolved)
 
 The RoPE edit discards PVT v2's FFN DWConv weights and introduces untrained
 positional parameters, so "off-the-shelf pretrained" and "no DWConv + RoPE"

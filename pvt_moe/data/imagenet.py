@@ -128,7 +128,8 @@ def build_datasets(cfg: dict):
         raise FileNotFoundError(
             f"No Arrow snapshot at {arrow_dir} for {ds_cfg['name']}.\n"
             "Deliberate: automatic rebuilds are disabled (a rebuild downloads/"
-            "writes ~160 GB for 1k, far more for 22k). Build it once:\n"
+            "writes ~160 GB for 1k, and roughly 1.3 TB for 22k — check free "
+            "space before starting the 22k build). Build it once:\n"
             "  from datasets import load_dataset\n"
             "  d = load_dataset('parquet', data_files={'train': ..., 'validation': ...})\n"
             f"  d.save_to_disk({arrow_dir!r})\n"

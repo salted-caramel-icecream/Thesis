@@ -130,7 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("data & run")
     g.add_argument("--dataset", dest="dataset_name",
                    choices=("imagenet-1k", "imagenet-22k"))
-    g.add_argument("--batch-size", type=int)
+    g.add_argument("--batch-size", type=int, metavar="N",
+                   help="MICRO-batch: what fits in VRAM (default: 128, sized "
+                        "for a 12 GB card at 224^2)")
+    g.add_argument("--effective-batch-size", type=int, metavar="N",
+                   help="what the LR is calibrated for (default: 1024). "
+                        "Accumulation makes up the difference")
+    g.add_argument("--accum", type=int, dest="accumulate_grad_batches",
+                   metavar="N",
+                   help="gradient accumulation steps (default: derived as "
+                        "effective // micro)")
     g.add_argument("--num-workers", type=int)
     g.add_argument("--repeated-aug", type=int, help="repeats per image (recipe: 3; 1 = off)")
     g.add_argument("--precision")
@@ -210,6 +219,8 @@ _FLAG_PATHS = {
     "dataset_name": "dataset.name",
     "repeated_aug": "dataset.repeated_aug",
     "batch_size": "batch_size",
+    "effective_batch_size": "effective_batch_size",
+    "accumulate_grad_batches": "accumulate_grad_batches",
     "num_workers": "num_workers",
     "precision": "precision",
     "seed": "seed",
@@ -282,8 +293,10 @@ def describe(cfg: dict) -> str:
         f"{o['lr'] * o['warmup_start_factor']:.1e}) | wd {o['weight_decay']} "
         f"| clip {o['grad_clip']} | stage4 LR x{o['stage4_lr_multiplier']}",
         f"  drop_path {m['drop_path_rate']} | norm {m['norm_type']} "
-        f"| dense_dwconv {m['dense_dwconv']} | batch {cfg['batch_size']} "
-        f"| {cfg['dataset']['name']}",
+        f"| dense_dwconv {m['dense_dwconv']} | {cfg['dataset']['name']}",
+        f"  batch: {cfg['batch_size']} micro x {cfg['accumulate_grad_batches']} "
+        f"accum = {cfg['effective_batch_size']} effective "
+        f"| {cfg['num_workers']} workers | {cfg['precision']}",
     ]
     if abl["use_moe"] and any(abl["moe_placement"]):
         lines.append(
@@ -311,7 +324,14 @@ def describe(cfg: dict) -> str:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    cfg = build_config(args)
+    try:
+        cfg = build_config(args)
+    except ValueError as e:
+        # Unknown keys, bad enum values, indivisible batch sizes: all user
+        # error with an actionable message. A traceback only buries it.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    cfg = dict(cfg)
     eval_only = cfg.pop("_eval_only", False)
 
     print(describe(cfg))

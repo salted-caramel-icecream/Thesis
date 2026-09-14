@@ -37,7 +37,10 @@ def test_spec_scratch_backbone_and_optimization():
     assert m["mlp_ratios"] == [8, 8, 4, 4]
     assert c["dataset"]["img_size"] == 224
     assert c["epochs"] == 90                      # ablations
-    assert c["batch_size"] == 1024
+    # The spec's "batch size 1024" constrains OPTIMIZATION, not memory: the
+    # micro-batch is a hardware choice and accumulation makes up the rest.
+    assert c["effective_batch_size"] == 1024
+    assert c["batch_size"] * c["accumulate_grad_batches"] == 1024
     assert o["betas"] == [0.9, 0.999]
     assert o["lr"] == 1e-3                        # peak LR @ batch 1024
     assert o["warmup_epochs"] == 5
@@ -52,6 +55,46 @@ def test_spec_no_differential_lr_in_either_recipe():
     """Sparse Upcycling B.9: differential expert/router LRs generally hurt."""
     for recipe in ("scratch", "pretrained"):
         assert _cfg(recipe=recipe)["optim"]["stage4_lr_multiplier"] == 1.0
+
+
+def test_micro_batch_and_accumulation_always_reach_the_effective_batch():
+    for micro in (32, 64, 128, 256, 512, 1024):
+        c = _cfg(batch_size=micro)
+        assert c["batch_size"] * c["accumulate_grad_batches"] == 1024, micro
+
+
+def test_indivisible_micro_batch_is_rejected_with_suggestions():
+    try:
+        _cfg(batch_size=100)
+    except ValueError as e:
+        assert "divisible" in str(e) and "128" in str(e)
+        return
+    raise AssertionError("a micro-batch that does not divide the effective "
+                         "batch must raise")
+
+
+def test_accumulation_can_be_disabled():
+    c = _cfg(batch_size=64, effective_batch_size=None)
+    assert c["accumulate_grad_batches"] == 1
+    assert c["effective_batch_size"] == 64
+
+
+def test_explicit_accumulation_wins_over_the_derivation():
+    c = _cfg(batch_size=128, accumulate_grad_batches=2)
+    assert c["accumulate_grad_batches"] == 2
+
+
+def test_trainer_receives_the_accumulation():
+    import pytorch_lightning as pl
+
+    from pvt_moe.engine.callbacks import build_trainer
+
+    cfg = tiny_config(batch_size=8, effective_batch_size=32,
+                      use_wandb=False, use_tensorboard=False)
+    assert cfg["accumulate_grad_batches"] == 4
+    trainer = build_trainer(cfg)
+    assert isinstance(trainer, pl.Trainer)
+    assert trainer.accumulate_grad_batches == 4
 
 
 def test_spec_augmentation_stack():
@@ -287,3 +330,43 @@ def test_repeat_aug_sampler_works_without_a_process_group():
         counts[i] = counts.get(i, 0) + 1
     assert len(drawn) == len(sampler)
     assert set(counts.values()) == {3}, "each selected image must appear 3x"
+
+
+# --- strict key validation (the config-management guard) -------------------
+
+def test_unknown_key_is_rejected_with_a_suggestion():
+    """A typo must not silently become a key nothing reads."""
+    try:
+        _cfg(model={"moe": {"num_expert": 16}})
+    except ValueError as e:
+        assert "model.moe.num_expert" in str(e)
+        assert "num_experts" in str(e), "should suggest the intended key"
+        return
+    raise AssertionError("an unknown config key must raise")
+
+
+def test_unknown_top_level_and_nested_keys_both_caught():
+    for bad in ({"epoch": 90}, {"optim": {"learning_rate": 1e-3}},
+                {"dataset": {"nmae": "imagenet-1k"}}):
+        try:
+            _cfg(**bad)
+        except ValueError as e:
+            assert "Unknown config key" in str(e), bad
+        else:
+            raise AssertionError(f"not caught: {bad}")
+
+
+def test_arrow_dirs_keys_are_data_not_schema():
+    """dataset.arrow_dirs is keyed by dataset name — new entries are legal."""
+    c = _cfg(dataset={"arrow_dirs": {"imagenet-100": "/data/in100"}})
+    assert c["dataset"]["arrow_dirs"]["imagenet-100"] == "/data/in100"
+
+
+def test_underscore_keys_are_internal_and_allowed():
+    _cfg(_scratch_note="anything")
+
+
+def test_default_config_passes_its_own_schema_check():
+    from pvt_moe.config import assert_known_keys
+
+    assert_known_keys(default_config())

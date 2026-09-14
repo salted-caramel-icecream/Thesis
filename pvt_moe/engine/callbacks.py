@@ -111,6 +111,10 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         devices=1,
         precision=cfg["precision"] if torch.cuda.is_available() else 32,
         gradient_clip_val=cfg["optim"]["grad_clip"],
+        # micro-batch x this == cfg["effective_batch_size"], which is what the
+        # recipe's LR is calibrated for. Clipping is applied to the accumulated
+        # gradient by Lightning, i.e. once per optimizer step, as intended.
+        accumulate_grad_batches=cfg.get("accumulate_grad_batches", 1),
         # "warn" (not True): True would make PL call
         # torch.use_deterministic_algorithms without warn_only, turning
         # nondeterministic-op warnings into mid-run crashes.

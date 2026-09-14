@@ -279,3 +279,35 @@ def test_random_expert_init_control_is_named_distinctly():
 def test_describe_mentions_the_key_numbers():
     text = describe(_cfg("--recipe", "pretrained"))
     assert "hf_pretrained" in text and "100 ep" in text and "upcycle:" in text
+
+
+# --- batch composition & error reporting -----------------------------------
+
+def test_micro_and_effective_batch_flags():
+    c = _cfg("--batch-size", "64", "--effective-batch-size", "512")
+    assert (c["batch_size"], c["accumulate_grad_batches"],
+            c["effective_batch_size"]) == (64, 8, 512)
+
+
+def test_explicit_accum_flag_wins():
+    c = _cfg("--batch-size", "128", "--accum", "3")
+    assert c["accumulate_grad_batches"] == 3
+
+
+def test_describe_reports_the_batch_composition():
+    text = describe(_cfg())
+    assert "micro" in text and "accum" in text and "effective" in text
+
+
+def test_config_errors_exit_2_instead_of_raising():
+    from pvt_moe.cli import main
+
+    for argv in (["--set", "model.moe.num_expert=16", "--dry-run"],
+                 ["--batch-size", "100", "--dry-run"],
+                 ["--upcycle-init", "nonsense"]):
+        try:
+            rc = main(argv)
+        except SystemExit as e:          # argparse rejects bad choices itself
+            assert e.code == 2, argv
+            continue
+        assert rc == 2, f"{argv} should exit 2, got {rc}"
