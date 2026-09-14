@@ -442,3 +442,25 @@ def test_check_env_does_not_need_a_gpu_to_import():
     assert "get_arch_list" in src, (
         "the decisive check is the wheel's arch list vs the device capability"
     )
+
+
+def test_check_env_batch_suggestion_reaches_the_effective_batch():
+    """Whatever micro-batch it suggests, micro * accum must equal 1024 — a
+    suggestion that quietly changes the optimization would be worse than none.
+    """
+    from pvt_moe.engine.env import _APPROX_GIB_PER_IMAGE
+
+    for free_gib in (10.3, 31.0, 79.5, 140.5, 179.5, 4.0, 1.0):
+        raw = int(free_gib * 0.7 / _APPROX_GIB_PER_IMAGE)
+        micro = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw),
+                    default=16)
+        accum = max(1, 1024 // micro)
+        assert micro * accum == 1024 or micro == 16, (free_gib, micro, accum)
+        assert micro <= raw or micro == 16, (free_gib, micro, raw)
+
+    # the documented rows land where the tables in README / HPARAMS say
+    expected = {10.3: 128, 31.0: 512, 79.5: 1024, 140.5: 1024, 179.5: 1024}
+    for free_gib, want in expected.items():
+        raw = int(free_gib * 0.7 / _APPROX_GIB_PER_IMAGE)
+        got = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw), default=16)
+        assert got == want, f"{free_gib} GiB -> {got}, docs say {want}"

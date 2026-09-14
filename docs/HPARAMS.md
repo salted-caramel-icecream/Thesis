@@ -352,6 +352,48 @@ the optimization is unchanged:
 python train.py --batch-size 64 --accum 16    # still 1024 effective
 ```
 
+### Starting points per GPU
+
+Micro-batch × accumulation always reaches the spec's **1024 effective**, so
+every row below trains the *same* optimization — only the memory strategy and
+the wall clock differ.
+
+| GPU | VRAM | `--batch-size` | `--accum` | `--num-workers` | Notes |
+|---|---|---|---|---|---|
+| RTX 5070 | 12 GB | **128** | **8** | 8 | the shipped default. On Windows the desktop holds ~1.7 GB, leaving ~10.3 GB |
+| RTX 5090 | 32 GB | 512 | 2 | 12 | prefetch buffers grow with the micro-batch — watch host RAM |
+| H100 | 80 GB | 1024 | 1 | 16–32 | no accumulation needed; **data loading becomes the bottleneck** |
+| H200 | 141 GB | 1024 | 1 | 16–32 | same |
+| B200 | 180 GB | 1024 | 1 | 16–32 | same |
+
+**These are estimates, not measurements.** They come from a planning figure of
+~0.035 GiB/image for PVT v2 B1 at 224² under bf16, times a 0.7 safety factor —
+not from profiling any of these cards. `python train.py --check-env` computes
+the same suggestion from the VRAM *actually free on your machine*, which is
+the number to trust:
+
+```
+suggested batch: --batch-size 128 --accum 8 (= 1024 effective; estimate from 10.3 GiB free)
+                 --grad-checkpointing "[1]" typically allows 256-512
+```
+
+Three things worth knowing before picking a row:
+
+- **Above ~40 GB the constraint stops being VRAM.** At 1024 images per step an
+  80 GB card wants roughly 2000+ img/s of JPEG decode plus RandAugment, which
+  is a CPU and disk problem. If GPU utilization sits low on an H100/H200/B200,
+  raise `--num-workers` and check the Arrow snapshot is on a fast local disk
+  before touching anything else.
+- **Bigger cards do not want a bigger effective batch.** You *could* run 2048+
+  on a B200, but the recipe's 1e-3 is calibrated for 1024 and the linear
+  scaling rule would put you at 2e-3 — a different optimization, and results
+  no longer comparable to the other arms. Keep 1024 and spend the headroom on
+  throughput instead.
+- **`--grad-checkpointing "[1]"` is the better lever on a small card.**
+  Recompute stage 1 (56×56 = 3136 tokens) and the micro-batch typically goes
+  up 2–4× for ~30% slowdown. Worth it when the alternative is `--accum 16`,
+  because accumulation costs the same time without the larger kernels.
+
 Two platform notes the code now handles: `PYTORCH_CUDA_ALLOC_CONF=
 expandable_segments:True` is Linux-only and is no longer set on Windows, and
 the DataLoader already falls back from `fork` to spawn off Linux.

@@ -382,8 +382,24 @@ Checkpointing saves in proportion to token count, so stage 1 (56×56 = 3136
 tokens) is worth ~64× stage 4 (7×7 = 49). `[1]` or `[1,2]` typically buys a
 2–4× larger micro-batch for ~30% per-stage slowdown.
 
-`setup_environment` measures free VRAM and warns before training if the
-micro-batch looks too large, instead of OOM-ing an hour into data loading.
+Starting points — every row is the **same optimization** (1024 effective),
+only the memory strategy differs:
+
+| GPU | VRAM | `--batch-size` | `--accum` | `--num-workers` |
+|---|---|---|---|---|
+| RTX 5070 | 12 GB | **128** (default) | **8** | 8 |
+| RTX 5090 | 32 GB | 512 | 2 | 12 |
+| H100 | 80 GB | 1024 | 1 | 16–32 |
+| H200 | 141 GB | 1024 | 1 | 16–32 |
+| B200 | 180 GB | 1024 | 1 | 16–32 |
+
+Estimates, not measurements — `python train.py --check-env` computes the same
+suggestion from the VRAM actually free on your box, and `setup_environment`
+warns before training if the micro-batch looks too large rather than OOM-ing
+an hour into data loading. Above ~40 GB the bottleneck stops being VRAM and
+becomes data loading; don't raise the *effective* batch past 1024 or the
+recipe's LR no longer matches. `docs/HPARAMS.md` §5 has the reasoning.
+
 Windows notes are handled in-code (no `fork`, no `expandable_segments`).
 
 **Budget honestly**: one ImageNet-1k epoch is an estimated 45–85 min on an

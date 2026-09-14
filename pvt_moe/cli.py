@@ -462,6 +462,23 @@ def check_environment() -> int:
         else:
             print("bf16           : UNSUPPORTED — use --precision 16-mixed or 32")
 
+        # Suggest a micro-batch from the VRAM actually free right now, rather
+        # than from a table someone has to match their card against. The
+        # per-image figure is a PLANNING ESTIMATE for PVT v2 B1 at 224^2 under
+        # bf16 — measure one epoch before trusting it.
+        from pvt_moe.engine.env import _APPROX_GIB_PER_IMAGE
+
+        budget = free * 0.7                      # leave room for fragmentation
+        raw = int(budget / _APPROX_GIB_PER_IMAGE)
+        micro = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw),
+                    default=16)
+        accum = max(1, 1024 // micro)
+        print(f"suggested batch: --batch-size {micro} --accum {accum} "
+              f"(= 1024 effective; estimate from {free:.1f} GiB free)")
+        if micro < 1024:
+            print(f"                 --grad-checkpointing \"[1]\" typically allows "
+                  f"{micro * 2}-{micro * 4}")
+
     import importlib.util
 
     required = ["pytorch_lightning", "torchmetrics", "timm", "datasets",
