@@ -28,9 +28,9 @@ reasons it matters here:
 1. It is the only place a pretrained dense FFN can be kept *exactly* rather
    than copied into E experts — and with ``shared_expert_dwconv`` it keeps the
    DWConv too, restoring the positional encoding the routed branch drops.
-2. With ``routed_zero_init`` the routed experts' fc2 starts at zero, so at
-   step 0 the block computes exactly the pretrained dense FFN and the routed
-   experts learn a residual on top of it.
+2. With ``upcycle_init="routed_zero"`` the routed experts' fc2 starts at zero,
+   so at step 0 the block computes exactly the pretrained dense FFN and the
+   routed experts learn a residual on top of it.
 
 Cost: one extra dense FFN per token (no routing, no capacity), i.e. the block
 goes from top-k to top-k+1 active FFNs per token.

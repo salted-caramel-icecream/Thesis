@@ -83,25 +83,37 @@ def test_boolean_flags_and_their_negations():
 def test_unset_boolean_does_not_shadow_the_recipe():
     """--shared-expert unset must leave the recipe's True in place."""
     assert _cfg()["model"]["moe"]["shared_expert"] is True
-    assert _cfg("--recipe", "pretrained")["model"]["moe"]["routed_zero_init"] is True
+    assert _cfg("--recipe", "pretrained")["model"]["moe"]["upcycle_init"] == "routed_zero"
 
 
-def test_zero_init_can_be_swapped_on_the_command_line():
-    """The recipe default is routed; --shared-zero-init opts into the spec's."""
-    c = _cfg("--recipe", "pretrained", "--shared-zero-init", "--no-routed-zero-init")
-    assert c["model"]["moe"]["shared_zero_init"] is True
-    assert c["model"]["moe"]["routed_zero_init"] is False
-    assert "-szi" in c["run_name"], "the two init schemes must not share a run name"
-    assert "-szi" not in _cfg("--recipe", "pretrained")["run_name"]
+def test_upcycle_init_can_be_swapped_on_the_command_line():
+    """The recipe default is routed_zero; --upcycle-init opts into the spec's."""
+    c = _cfg("--recipe", "pretrained", "--upcycle-init", "shared_zero")
+    assert c["model"]["moe"]["upcycle_init"] == "shared_zero"
+    assert "-szi" in c["run_name"], "the init arms must not share a run name"
+
+
+def test_all_three_init_arms_get_distinct_run_names():
+    names = {
+        init: _cfg("--recipe", "pretrained", "--upcycle-init", init)["run_name"]
+        for init in ("routed_zero", "shared_zero", "none")
+    }
+    assert len(set(names.values())) == 3, names
+
+
+def test_init_arm_is_not_tagged_on_runs_that_never_upcycle():
+    """A from-scratch run resolves to "none" but upcycles nothing — tagging it
+    would put a marker on every scratch run name."""
+    for marker in ("-szi", "-nozi"):
+        assert marker not in _cfg("--recipe", "scratch")["run_name"]
 
 
 def test_no_shared_expert_still_resolves_under_the_pretrained_recipe():
-    """--no-shared-expert inherits routed_zero_init from the recipe; it must be
-    dropped, not raise, and not zero the block."""
+    """--no-shared-expert inherits routed_zero from the recipe; it must resolve
+    to "none", not raise, and not zero the block."""
     c = _cfg("--recipe", "pretrained", "--no-shared-expert")
     assert c["model"]["moe"]["shared_expert"] is False
-    assert c["model"]["moe"]["routed_zero_init"] is False
-    assert c["model"]["moe"]["shared_zero_init"] is False
+    assert c["model"]["moe"]["upcycle_init"] == "none"
 
 
 # --- placements ------------------------------------------------------------

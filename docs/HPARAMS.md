@@ -115,7 +115,7 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 | Router | random, zero-mean normal σ=0.02 | Tutel's own gate init (untouched by seeding) |
 | Combine weights | normalize per token to sum to 1 | Tutel `normalize_gate` — **see below** |
 | Shared expert | carries the pretrained FFN verbatim (DWConv included) | `model.moe.shared_expert` |
-| Routed experts' fc2 | **zero-init** — the default here | `model.moe.routed_zero_init` |
+| Routed experts' fc2 | **zero-init** — the default here | `model.moe.upcycle_init: "routed_zero"` |
 | Optimizer state | unavailable | — |
 | Expert symmetry breaking | none | Sparse Upcycling B.9 |
 
@@ -126,7 +126,7 @@ the block emits ~2× the dense layer at step 0. The spec zeroes the **shared**
 expert. **This codebase zeroes the routed experts instead**, and that is the
 `pretrained` recipe's default.
 
-| | spec (`shared_zero_init`) | **default here (`routed_zero_init`)** |
+| | spec (`"shared_zero"`) | **default here (`"routed_zero"`)** |
 |---|---|---|
 | Shared expert | zero output projection | carries the pretrained FFN verbatim |
 | Routed experts | replicate the pretrained FFN | fc2 starts at zero |
@@ -155,20 +155,38 @@ It also composes with the DWConv: the shared branch holds PVT v2's depthwise
 conv and loads it verbatim, so the pretrained positional component survives
 (see §5).
 
-**To run the spec's scheme instead** — worth doing as an ablation, since it is
-what Sparse Upcycling and ViMoE describe:
+**`model.moe.upcycle_init`** selects the scheme — one key, three values, so
+the arms cannot contradict each other:
+
+| Value | Shared expert | Routed experts | Use |
+|---|---|---|---|
+| `"routed_zero"` | keeps the pretrained FFN | fc2 zeroed | **recipe default** — exact at any top_k |
+| `"shared_zero"` | output projection zeroed | replicate the FFN | the spec's scheme; exact only at top_k > 1 |
+| `"none"` | keeps the FFN | replicate the FFN | both branches copy it — the block emits ~2x the dense layer at step 0 |
 
 ```bash
-python train.py --recipe pretrained --shared-zero-init --no-routed-zero-init
+python train.py --recipe pretrained                            # routed_zero
+python train.py --recipe pretrained --upcycle-init shared_zero # the spec's
+python train.py --recipe pretrained --upcycle-init none        # no zeroing
 ```
 
-Run names distinguish the two (`...+sh-szi_...` for the spec's), so the arms
-do not share a checkpoint directory.
+All three get distinct run names (`+sh`, `+sh-szi`, `+sh-nozi`), so an init
+ablation cannot put two arms in one checkpoint directory. The marker appears
+only on runs that actually upcycle — a from-scratch run resolves to `"none"`
+but never seeds anything, so its name stays unmarked.
 
-The two flags are mutually exclusive, and **both are dropped when there is no
-shared expert** (ladder row 3): there is nothing to carry the pretrained FFN,
-so zeroing the routed branch would make the block output zero. `routed_zero_init`
-prints a line when it is dropped; `shared_zero_init` is merely vacuous.
+**With no shared expert** (ladder row 3, or a bare `--no-shared-expert`) the
+value resolves to `"none"` and says so:
+
+```
+[config] model.moe.upcycle_init 'routed_zero' -> 'none': no shared expert to
+carry the pretrained FFN.
+```
+
+Both schemes need one branch to hold the pretrained FFN while the other starts
+at zero; with no shared expert there is nothing to hold it, and `"routed_zero"`
+would zero the block's entire output. A recipe sets the value globally, so
+inheriting one it cannot use resolves rather than failing.
 
 ---
 

@@ -34,6 +34,7 @@ from pvt_moe.config import (
     VALID_MODES,
     VALID_NORMS,
     VALID_RECIPES,
+    VALID_UPCYCLE_INITS,
     default_config,
     ladder_overrides,
     merge_config,
@@ -119,10 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
     _bool_pair(g, "seed-experts", "seed_moe_from_dense",
                "replicate the pretrained FFN into each expert "
                "(--no-seed-experts = the random-init control)")
-    _bool_pair(g, "shared-zero-init", "shared_zero_init",
-               "zero the SHARED expert's output projection (spec default)")
-    _bool_pair(g, "routed-zero-init", "routed_zero_init",
-               "zero the ROUTED experts' fc2 instead (exact at any top_k)")
+    g.add_argument("--upcycle-init", choices=VALID_UPCYCLE_INITS,
+                   help="which branch starts at zero when upcycling. "
+                        "routed_zero (recipe default): the shared expert keeps "
+                        "the pretrained FFN, exact at any top_k. shared_zero: "
+                        "the spec's scheme, exact only when top_k > 1. none: "
+                        "zero nothing. Forced to none with no shared expert")
 
     g = p.add_argument_group("data & run")
     g.add_argument("--dataset", dest="dataset_name",
@@ -199,8 +202,7 @@ _FLAG_PATHS = {
     "gate_noise": "model.moe.gate_noise",
     "backend": "model.moe.backend",
     "shared_expert": "model.moe.shared_expert",
-    "shared_zero_init": "model.moe.shared_zero_init",
-    "routed_zero_init": "model.moe.routed_zero_init",
+    "upcycle_init": "model.moe.upcycle_init",
     "mode": "mode",
     "ckpt_path": "ckpt_path",
     "pretrained_hf_id": "model.pretrained_hf_id",
@@ -293,8 +295,7 @@ def describe(cfg: dict) -> str:
         if cfg["mode"] == "hf_pretrained":
             lines.append(
                 f"  upcycle: seed_experts {m['seed_moe_from_dense']} "
-                f"| shared_zero_init {moe['shared_zero_init']} "
-                f"| routed_zero_init {moe['routed_zero_init']}"
+                f"| upcycle_init {moe['upcycle_init']}"
             )
     else:
         lines.append("  MoE: off (dense arm)")

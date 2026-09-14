@@ -131,7 +131,7 @@ or MegaBlocks' own expert initialization.
 |------|--------|
 | `shared_expert: True` | build the shared branch (costs one extra FFN per token: top-k → top-k+1 active) |
 | `shared_expert_dwconv: True` | shared branch is a verbatim PVT v2 `Mlp`, **DWConv included** — restores the conv positional encoding the routed branch drops, so RoPE is no longer load-bearing in MoE blocks |
-| `routed_zero_init: True` | zero the routed experts' fc2 at upcycle, so the block starts out computing *exactly* the pretrained dense FFN and the routed experts learn a residual (requires `shared_expert`) |
+| `upcycle_init` | which branch starts at zero when upcycling: `"routed_zero"` (default — the block starts out computing *exactly* the pretrained dense FFN), `"shared_zero"` (the spec's scheme), or `"none"`. Resolves to `"none"` with no shared expert |
 
 With `mode: hf_pretrained`, the shared branch is loaded verbatim from the
 pretrained dense FFN — the one place a pretrained FFN survives intact rather
@@ -165,7 +165,7 @@ instructions instead of silently re-downloading ~160 GB.
 | mode | What happens |
 |------|--------------|
 | `hf_pretrained` | remap `OpenGVLab/pvt_v2_b1` (kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling) |
-| | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`routed_zero_init`); `--shared-zero-init` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
+| | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |
 | `resume` | full Lightning resume from `ckpt_path` |

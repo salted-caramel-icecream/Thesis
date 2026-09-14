@@ -1,6 +1,6 @@
 """Shared expert: construction, plumbing, seeding, and function preservation.
 
-The headline invariant: with ``shared_expert`` + ``routed_zero_init``, an
+The headline invariant: with ``shared_expert`` + ``upcycle_init="routed_zero"``, an
 upcycled MoE block computes EXACTLY the pretrained dense FFN at step 0.
 """
 
@@ -23,7 +23,7 @@ DIM, HIDDEN, E = 16, 32, 4
 _MOE_CFG = {
     "backend": "tutel", "num_experts": E, "top_k": 1,
     "capacity_factor": 2.0, "gate_noise": 0.5,
-    "shared_expert": True, "shared_expert_dwconv": True, "routed_zero_init": True,
+    "shared_expert": True, "shared_expert_dwconv": True, "upcycle_init": "routed_zero",
 }
 
 
@@ -40,7 +40,7 @@ def _moe_mlp(**over):
 def test_shared_expert_on_by_default_and_omittable():
     # The spec's MoE block is "1 shared expert, always-on".
     assert default_config()["model"]["moe"]["shared_expert"] is True
-    moe = _moe_mlp(shared_expert=False, routed_zero_init=False)
+    moe = _moe_mlp(shared_expert=False, upcycle_init="none")
     assert moe.shared_expert is None
 
 
@@ -127,12 +127,12 @@ def test_seed_shared_expert_copies_fc_and_dwconv_verbatim():
 
 
 def test_seed_shared_expert_noop_without_shared_branch():
-    moe = _moe_mlp(shared_expert=False, routed_zero_init=False)
+    moe = _moe_mlp(shared_expert=False, upcycle_init="none")
     assert seed_shared_expert_from_dense(moe, {}, "block4.0.") == 0
 
 
 def test_upcycled_block_reproduces_dense_ffn_exactly():
-    """shared_expert + routed_zero_init => block output == dense FFN output."""
+    """shared_expert + routed_zero => block output == dense FFN output."""
     moe = _moe_mlp()
     moe.eval()
     dense = Mlp(DIM, HIDDEN)
@@ -157,14 +157,13 @@ def test_upcycled_block_reproduces_dense_ffn_exactly():
 
 # --- config integration ----------------------------------------------------
 
-def test_zero_init_is_dropped_without_a_shared_expert():
-    """Both zero-inits are meaningless without a shared expert, and a recipe
-    sets them globally — so they are dropped rather than rejected. Zeroing the
-    routed fc2 here would make the block output identically zero."""
+def test_upcycle_init_resolves_to_none_without_a_shared_expert():
+    """Meaningless without a shared expert, and a recipe sets it globally — so
+    it resolves rather than being rejected. Zeroing the routed fc2 here would
+    make the block output identically zero."""
     cfg = tiny_config(model={"moe": {"shared_expert": False,
-                                     "routed_zero_init": True}})
-    assert cfg["model"]["moe"]["routed_zero_init"] is False
-    assert cfg["model"]["moe"]["shared_zero_init"] is False
+                                     "upcycle_init": "routed_zero"}})
+    assert cfg["model"]["moe"]["upcycle_init"] == "none"
 
 
 def test_run_tag_marks_shared_expert():
@@ -177,7 +176,7 @@ def test_run_tag_marks_shared_expert():
 def test_model_builds_with_shared_expert_end_to_end():
     cfg = tiny_config(model={
         "ablation": {"use_moe": True, "moe_placement": [[], [], [], [0]]},
-        "moe": {"shared_expert": True, "routed_zero_init": True},
+        "moe": {"shared_expert": True, "upcycle_init": "routed_zero"},
     })
     undo = install_fake_tutel_backend()
     try:

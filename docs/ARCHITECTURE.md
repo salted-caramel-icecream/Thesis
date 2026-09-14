@@ -77,7 +77,7 @@ consequences worth stating as invariants:
 
    A second consequence of being unrouted: capacity-dropped tokens still get
    a full FFN from the shared branch instead of zero.
-3. **`routed_zero_init` gives exact function preservation.** Zeroing every
+3. **`upcycle_init: "routed_zero"` gives exact function preservation.** Zeroing every
    routed expert's fc2 at upcycle makes the block compute exactly the
    pretrained dense FFN at step 0 (verified by
    `tests/test_shared_expert.py::test_upcycled_block_reproduces_dense_ffn_exactly`),

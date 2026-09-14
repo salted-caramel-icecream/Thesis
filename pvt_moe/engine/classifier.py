@@ -106,8 +106,7 @@ class LitClassifier(pl.LightningModule):
                 self.model,
                 cfg["model"]["pretrained_hf_id"],
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
-                routed_zero_init=cfg["model"]["moe"].get("routed_zero_init", False),
-                shared_zero_init=cfg["model"]["moe"].get("shared_zero_init", False),
+                upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"),
             )
         elif mode == "ssl_init":
             load_backbone_checkpoint(self.model, cfg["ckpt_path"], skip_head=True)

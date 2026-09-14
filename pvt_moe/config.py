@@ -41,6 +41,19 @@ VALID_NORMS = ("layernorm", "rmsnorm")
 VALID_BACKENDS = ("tutel", "megablocks")
 VALID_RECIPES = ("scratch", "pretrained")
 
+#: How an upcycled MoE block is initialized. Both branches copy the pretrained
+#: FFN, so one of them must start at zero or the block emits ~2x the dense
+#: layer at step 0. See docs/HPARAMS.md section 3.
+#:
+#:   "routed_zero" - shared expert carries the pretrained FFN verbatim, routed
+#:                   experts' fc2 starts at zero. Exact at any top_k.
+#:   "shared_zero" - routed experts replicate the FFN, shared expert's output
+#:                   projection starts at zero. The spec's scheme; exact only
+#:                   when top_k > 1 (Tutel normalizes gates only then).
+#:   "none"        - zero nothing. The only valid choice with no shared expert,
+#:                   and what a from-scratch run uses (nothing is upcycled).
+VALID_UPCYCLE_INITS = ("routed_zero", "shared_zero", "none")
+
 #: Sanctioned epoch budgets for the from-scratch ablation ladder.
 #: 90 = ablation runs, 300 = final run (PVT v2's own recipe); 150 is the
 #: middle budget. Other values are allowed but are off-ladder.
@@ -94,19 +107,17 @@ RECIPES = {
             # ratio helps fine-tuning.
             "drop_path_rate": 0.1,
             "moe": {
-                # Upcycling init. The shared expert carries the pretrained FFN
-                # verbatim and the ROUTED experts' fc2 starts at zero, so the
-                # block computes exactly the pretrained dense FFN at step 0 and
-                # the routed experts learn a residual on top of it.
+                # The shared expert carries the pretrained FFN verbatim and the
+                # ROUTED experts' fc2 starts at zero, so the block computes
+                # exactly the pretrained dense FFN at step 0 and the routed
+                # experts learn a residual on top of it.
                 #
-                # This departs from the spec's table, which zeroes the shared
-                # expert instead. That scheme is only function-preserving when
-                # the combine weights are normalized per token, and Tutel
-                # normalizes gates ONLY when top_k > 1 (impls/fast_dispatch.py,
-                # extract_critical) — so at the spec's own top_k=1 it emits a
-                # fraction of the dense FFN. See docs/HPARAMS.md section 3.
-                "routed_zero_init": True,
-                "shared_zero_init": False,
+                # This departs from the spec's table ("shared_zero"), which is
+                # only function-preserving when combine weights are normalized
+                # per token — and Tutel normalizes gates ONLY when top_k > 1
+                # (impls/fast_dispatch.py, extract_critical). At the spec's own
+                # top_k=1 it emits a fraction of the dense FFN.
+                "upcycle_init": "routed_zero",
             },
         },
     },
@@ -259,13 +270,12 @@ _DEFAULT: dict = {
             # Zero the routed experts' fc2 when upcycling, so the block starts
             # out computing EXACTLY the pretrained dense FFN and the routed
             # experts learn a residual. Requires shared_expert.
-            "routed_zero_init": None,
-            # Upcycling init from the spec: zero the SHARED expert's output
-            # projection instead, leaving the routed experts carrying the
-            # replicated pretrained FFN. Mutually exclusive with
-            # routed_zero_init. See docs/HPARAMS.md for which to prefer at
-            # top_k == 1.
-            "shared_zero_init": None,
+            # Which branch starts at zero when upcycling a pretrained FFN:
+            # "routed_zero" | "shared_zero" | "none" (VALID_UPCYCLE_INITS).
+            # None => recipe default. Resolves to "none" whenever there is no
+            # shared expert to carry the pretrained weights, and for any run
+            # that is not upcycling at all.
+            "upcycle_init": None,
         },
 
         "pretrained_hf_id": "OpenGVLab/pvt_v2_b1",
@@ -388,7 +398,17 @@ def build_run_tag(cfg: dict) -> str:
         # The random-expert-init control (pretrained ladder row 6) is
         # architecturally identical to the upcycled run it is compared against,
         # so the init has to appear in the name or the two overwrite each other.
-        szi = "-szi" if moe_cfg.get("shared_zero_init") else ""
+        # The init only applies to an upcycled run with a shared expert; tag
+        # the non-default arms there so an init ablation cannot put two runs in
+        # one checkpoint directory. Tagging it everywhere would put a marker on
+        # every from-scratch run, which never upcycles anything.
+        init_applies = (
+            cfg.get("mode") == "hf_pretrained"
+            and moe_cfg.get("shared_expert")
+            and cfg["model"].get("seed_moe_from_dense", True)
+        )
+        init = {"shared_zero": "-szi", "none": "-nozi"}.get(
+            moe_cfg.get("upcycle_init"), "") if init_applies else ""
         randexp = (
             "-randexp"
             if cfg.get("mode") == "hf_pretrained"
@@ -397,7 +417,7 @@ def build_run_tag(cfg: dict) -> str:
         )
         moe = (
             f"moe-{_placement_tag(moe_pl, depths)}-"
-            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{szi}{randexp}{backend}"
+            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{init}{randexp}{backend}"
         )
     else:
         moe = "dense"
@@ -608,11 +628,12 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         optim["warmup_start_factor"] = min(1.0, WARMUP_START_LR / optim["lr"])
         filled.append("optim.warmup_start_factor")
 
-    # Boolean knobs carry a None sentinel so a recipe can fill them; anything
-    # no recipe set is off.
-    for key in ("routed_zero_init", "shared_zero_init"):
-        if cfg["model"]["moe"].get(key) is None:
-            cfg["model"]["moe"][key] = False
+    # Upcycling init: a recipe may fill it; anything still unset upcycles
+    # nothing. The no-shared-expert case is resolved in validate_config, which
+    # is where shared_expert is known to be final.
+    if cfg["model"]["moe"].get("upcycle_init") is None:
+        cfg["model"]["moe"]["upcycle_init"] = "none"
+        filled.append("model.moe.upcycle_init")
 
     if verbose and filled:
         print(f"[recipe:{recipe}] filled {len(filled)} field(s): {', '.join(sorted(filled))}")
@@ -670,24 +691,21 @@ def validate_config(cfg: dict) -> dict:
             raise ValueError(f"num_heads {heads} must be divisible by num_kv_heads {kv}")
 
     moe = model["moe"]
-    if not moe.get("shared_expert"):
-        # Neither zero-init is meaningful without a shared expert, and a recipe
-        # sets them globally — so a no-shared-expert arm (ladder row 3, or a
-        # bare --no-shared-expert) must not be rejected for inheriting one.
-        if moe.get("routed_zero_init"):
-            # This one would have zeroed the block's ENTIRE output, so it is
-            # dropped loudly rather than silently.
-            print("[config] moe.routed_zero_init dropped: there is no shared "
-                  "expert to carry the pretrained FFN, so zeroing the routed "
-                  "experts' fc2 would make this MoE block output zero.")
-            moe["routed_zero_init"] = False
-        # Vacuous rather than dangerous: nothing to zero.
-        moe["shared_zero_init"] = False
-    if moe.get("shared_zero_init") and moe.get("routed_zero_init"):
+    if moe["upcycle_init"] not in VALID_UPCYCLE_INITS:
         raise ValueError(
-            "moe.shared_zero_init and moe.routed_zero_init are mutually "
-            "exclusive — enabling both zeroes the MoE block's entire output."
+            f"model.moe.upcycle_init must be one of {VALID_UPCYCLE_INITS}, "
+            f"got {moe['upcycle_init']!r}"
         )
+    if moe["upcycle_init"] != "none" and not moe.get("shared_expert"):
+        # Both schemes need a shared expert: one branch must hold the
+        # pretrained FFN while the other starts at zero. With no shared expert
+        # there is nothing to hold it — "routed_zero" would zero the block's
+        # entire output. A recipe sets this globally, so a no-shared-expert arm
+        # (ladder row 3, or a bare --no-shared-expert) resolves to "none"
+        # rather than being rejected for inheriting a value it cannot use.
+        print(f"[config] model.moe.upcycle_init {moe['upcycle_init']!r} -> "
+              f"'none': no shared expert to carry the pretrained FFN.")
+        moe["upcycle_init"] = "none"
 
     abl = model["ablation"]
     abl["moe_placement"] = resolve_placement(abl["moe_placement"], abl["moe_last_n_stages"], depths)

@@ -93,20 +93,30 @@ def test_spec_pretrained_deltas():
     assert pre["model"]["ablation"] == scratch["model"]["ablation"]
 
 
-def test_pretrained_defaults_to_routed_zero_init():
-    """Deliberate departure from the spec's table: routed_zero_init is exactly
-    function-preserving at top_k=1, shared_zero_init is not (Tutel normalizes
+def test_pretrained_defaults_to_routed_zero():
+    """Deliberate departure from the spec's table: "routed_zero" is exactly
+    function-preserving at top_k=1, "shared_zero" is not (Tutel normalizes
     combine weights only when top_k > 1). See docs/HPARAMS.md section 3."""
-    moe = _cfg(recipe="pretrained")["model"]["moe"]
-    assert moe["routed_zero_init"] is True
-    assert moe["shared_zero_init"] is False
+    assert _cfg(recipe="pretrained")["model"]["moe"]["upcycle_init"] == "routed_zero"
 
 
-def test_shared_zero_init_remains_available():
+def test_shared_zero_remains_available():
     moe = _cfg(recipe="pretrained",
-               model={"moe": {"routed_zero_init": False,
-                              "shared_zero_init": True}})["model"]["moe"]
-    assert moe["shared_zero_init"] is True and moe["routed_zero_init"] is False
+               model={"moe": {"upcycle_init": "shared_zero"}})["model"]["moe"]
+    assert moe["upcycle_init"] == "shared_zero"
+
+
+def test_scratch_upcycles_nothing():
+    assert _cfg(recipe="scratch")["model"]["moe"]["upcycle_init"] == "none"
+
+
+def test_invalid_upcycle_init_rejected():
+    try:
+        _cfg(model={"moe": {"upcycle_init": "zero_everything"}})
+    except ValueError as e:
+        assert "upcycle_init" in str(e)
+        return
+    raise AssertionError("an unknown upcycle_init must raise")
 
 
 # --- epoch ladder & derived stochastic depth -------------------------------
@@ -183,28 +193,15 @@ def test_recipes_only_contain_json_primitives():
 
 # --- zero-init mutual exclusion -------------------------------------------
 
-def test_both_zero_inits_together_rejected():
-    try:
-        _cfg(model={"moe": {"shared_expert": True,
-                            "shared_zero_init": True, "routed_zero_init": True}})
-    except ValueError as e:
-        assert "mutually exclusive" in str(e)
-        return
-    raise AssertionError("both zero-inits must raise")
-
-
-def test_shared_zero_init_is_dropped_without_a_shared_expert():
-    """Vacuous, not dangerous — there is no shared expert to zero. A recipe
-    sets it globally, so the no-shared-expert ladder arm must still resolve."""
-    c = _cfg(model={"moe": {"shared_expert": False, "shared_zero_init": True}})
-    assert c["model"]["moe"]["shared_zero_init"] is False
-
-
-def test_routed_zero_init_dropped_without_a_shared_expert():
-    """Would otherwise zero the block's entire output. A recipe sets it
-    globally, so the no-shared-expert arm must still resolve — with it off."""
-    c = _cfg(model={"moe": {"shared_expert": False, "routed_zero_init": True}})
-    assert c["model"]["moe"]["routed_zero_init"] is False
+def test_every_init_resolves_to_none_without_a_shared_expert():
+    """Both schemes need one branch to hold the pretrained FFN while the other
+    starts at zero. With no shared expert there is nothing to hold it, and
+    "routed_zero" would zero the block's entire output. A recipe sets this
+    globally, so the no-shared-expert arm resolves rather than being rejected.
+    """
+    for init in ("routed_zero", "shared_zero"):
+        c = _cfg(model={"moe": {"shared_expert": False, "upcycle_init": init}})
+        assert c["model"]["moe"]["upcycle_init"] == "none", init
 
 
 def test_zero_shared_expert_output_zeros_only_shared_fc2():

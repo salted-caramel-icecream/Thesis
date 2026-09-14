@@ -86,8 +86,7 @@ def load_hf_pretrained(
     model: nn.Module,
     hf_model_id: str = "OpenGVLab/pvt_v2_b1",
     seed_moe_experts: bool = True,
-    routed_zero_init: bool = False,
-    shared_zero_init: bool = False,
+    upcycle_init: str = "none",
     verbose: bool = True,
 ) -> dict:
     """Load HF PVT v2 weights into the backbone. Returns a stats dict.
@@ -95,11 +94,14 @@ def load_hf_pretrained(
     MoE blocks (from ``model.moe_placement``) skip their dense ``mlp.*``
     weights; when ``seed_moe_experts`` those weights seed the experts instead.
     A block with a shared expert additionally gets the dense FFN loaded into
-    that shared branch verbatim. Exactly one of the two zero-inits may then be
-    applied so the block does not emit ~2x the dense layer at step 0:
-    ``routed_zero_init`` zeros the routed experts' fc2 (exact function
-    preservation at any top_k), ``shared_zero_init`` zeros the shared expert's
-    fc2 instead (the spec's Sparse-Upcycling-style init).
+    that shared branch verbatim. ``upcycle_init`` then says which branch starts
+    at zero so the block does not emit ~2x the dense layer at step 0:
+
+    - ``"routed_zero"`` zeros the routed experts' fc2 — the shared branch
+      carries the pretrained FFN, exact at any top_k;
+    - ``"shared_zero"`` zeros the shared expert's fc2 instead — the routed
+      experts carry it (the spec's Sparse-Upcycling-style init);
+    - ``"none"`` zeros nothing.
     """
     from transformers import AutoModelForImageClassification  # lazy
 
@@ -184,9 +186,9 @@ def load_hf_pretrained(
             if getattr(moe_mlp, "shared_expert", None) is not None:
                 seed_shared_expert_from_dense(moe_mlp, dense_mlp_for_seeding, prefix)
                 stats["seeded_shared_experts"] += 1
-                if routed_zero_init:
+                if upcycle_init == "routed_zero":
                     stats["zeroed_routed_fc2"] += zero_routed_expert_output(moe_mlp)
-                if shared_zero_init:
+                elif upcycle_init == "shared_zero":
                     stats["zeroed_shared_fc2"] += zero_shared_expert_output(moe_mlp)
 
     if verbose:
@@ -359,7 +361,7 @@ def zero_shared_expert_output(moe_mlp) -> int:
     normalizes gates ONLY when ``top_k > 1`` (``impls/fast_dispatch.py``,
     ``extract_critical``), so at the default ``top_k: 1`` the routed branch is
     scaled by the raw softmax score (<1) and the block does NOT reproduce the
-    dense FFN exactly. ``routed_zero_init`` does, at any top_k.
+    dense FFN exactly. ``upcycle_init="routed_zero"`` does, at any top_k.
 
     Returns the number of tensors zeroed (0 when there is no shared expert).
     """
@@ -382,8 +384,9 @@ def zero_routed_expert_output(moe_mlp) -> int:
     output at step 0 exactly ``shared_expert(x)`` — i.e. exactly the
     pretrained dense FFN — while the routed experts stay fully trainable
     (fc2 receives gradient from the first step, then fc1 through it). This is
-    the residual-upcycling init; without a shared expert it would zero the
-    block's entire output, so ``validate_config`` forbids that combination.
+    the residual-upcycling init (``upcycle_init="routed_zero"``); without a
+    shared expert it would zero the block's entire output, which is why
+    ``validate_config`` resolves that case to ``"none"``.
 
     Returns the number of tensors zeroed; raises if none were recognized.
     """
