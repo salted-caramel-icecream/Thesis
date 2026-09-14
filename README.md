@@ -19,33 +19,189 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py)
 ```
 
-## Quickstart (B200 / RTX 5090 / RTX 5070)
+## Setting up a GPU box from scratch
+
+Worked for an RTX 5070 (12 GB, Blackwell / `sm_120`); the steps are the same
+for any card — only the torch build and the micro-batch change.
+
+### 1. Get the code and an isolated interpreter
 
 ```bash
-# 1) On the GPU box, from the repo root:
-export HF_TOKEN=...          # for HF pretrained weights
-export WANDB_API_KEY=...     # optional (or pass --no-wandb)
-
-# 2) Gate before any GPU time:
-python tests/run_all.py      # must print "N passed, 0 failed"
-
-# 3a) Terminal:
-python train.py --recipe scratch --epochs 90
-python train.py --recipe pretrained --lr 5e-5
-
-# 3b) ...or Jupyter: run notebooks/v11_train.ipynb and edit ONLY the CONFIG
-#     cell (same package underneath, same results — and it prints the
-#     equivalent command line so a notebook run is reproducible headless).
+git clone https://github.com/salted-caramel-icecream/Thesis.git
+cd Thesis
+python -m venv .venv && source .venv/bin/activate     # Linux / WSL2 / macOS
 ```
+
+```powershell
+git clone https://github.com/salted-caramel-icecream/Thesis.git
+cd Thesis
+py -m venv .venv; .\.venv\Scripts\Activate.ps1       # Windows PowerShell
+```
+
+### 2. Install PyTorch — matched to your GPU, not just "pip install torch"
+
+**This is the step that silently goes wrong.** A plain `pip install torch` can
+hand you a CPU-only wheel, or one whose CUDA kernels predate your card. Pick
+the command from the selector at
+<https://pytorch.org/get-started/locally/> for your CUDA version, then
+*verify* — do not assume:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+A recent card needs a recent CUDA build (Blackwell / `sm_120` needs CUDA 12.8
+or newer). `nvidia-smi` shows the CUDA version your driver supports.
+
+### 3. Install the package and check the environment
+
+```bash
+pip install -e .            # the package + its deps, editable
+python train.py --check-env
+```
+
+`--check-env` is the terminal equivalent of the notebook's environment cell,
+and it catches the failure above in seconds rather than at the first CUDA
+kernel:
+
+```
+torch          : 2.9.0+cu128  (CUDA build: 12.8)
+GPU            : NVIDIA GeForce RTX 5070 (sm_120, 11.9 GiB total, 10.2 GiB free)
+compiled for   : sm_75 sm_80 sm_86 sm_90 sm_100 sm_120
+arch support   : OK — this wheel has sm_120 kernels
+matmul smoke   : OK
+bf16           : OK (precision: bf16-mixed)
+required deps  : OK
+  tutel        OK      MoE backend 'tutel' (default) — else use --backend native
+  ...
+  HF_TOKEN       set     pretrained weights + gated datasets
+
+environment looks trainable.
+```
+
+If `arch support` says MISSING, the wheel has no kernels for your card — it
+will either PTX-JIT (very slow) or fail. Go back to step 2. It exits non-zero
+on any problem, so it can gate a script.
+
+### 4. The MoE backend
+
+Tutel compiles a CUDA extension, so it needs a compiler — `build-essential` on
+Linux, **MSVC Build Tools** on Windows:
+
+```bash
+pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
+```
+
+If that will not build (common on Windows without MSVC — WSL2 is usually the
+easier path), skip it and use the pure-PyTorch backend, which needs nothing:
+
+```bash
+python train.py --backend native ...
+```
+
+### 5. Credentials and data
+
+Environment variables only — nothing is read from a file in the repo.
+
+```bash
+export HF_TOKEN=hf_...          # Linux / WSL2 / macOS
+export WANDB_API_KEY=...
+```
+
+```powershell
+setx HF_TOKEN "hf_..."          # Windows — then open a NEW terminal
+setx WANDB_API_KEY "..."
+```
+
+Build the ImageNet Arrow snapshot once (~160 GB for 1k) and point at it —
+`docs/GUIDE.md` §2 has the script:
+
+```bash
+python train.py --data-dir /data/imagenet_arrow --checkpoint-dir /data/runs ...
+```
+
+### 6. Gate, smoke-test, then train
+
+```bash
+python tests/run_all.py                          # must print "N passed, 0 failed"
+python train.py --recipe scratch --dry-run       # resolve the config, train nothing
+```
+
+A ~2-minute real check before committing days of compute — one short epoch on
+a slice of the data, writing to a throwaway directory:
+
+```bash
+python train.py --recipe scratch --epochs 1 --no-wandb \
+    --checkpoint-dir /tmp/smoke --log-root /tmp/smoke
+```
+
+Then the real run. On a 12 GB card the defaults already fit (128 micro-batch ×
+8 accumulation = 1024 effective); `--grad-checkpointing "[1]"` buys a larger
+micro-batch if you want the speed:
+
+```bash
+python train.py --recipe scratch --epochs 90
+```
+
+### 7. Runs that outlive the terminal
+
+A 90-epoch run is days. Detach it, and keep a log:
+
+```bash
+# Linux / WSL2 — survives an SSH disconnect
+tmux new -s pvt
+python train.py --recipe scratch --epochs 90 2>&1 | tee runs/scratch90.log
+#   detach: Ctrl-b d      reattach: tmux attach -t pvt
+
+# or without tmux
+nohup python train.py --recipe scratch --epochs 90 > runs/scratch90.log 2>&1 &
+```
+
+```powershell
+# Windows — detached process, output to a file
+Start-Process -NoNewWindow -FilePath .\.venv\Scripts\python.exe `
+  -ArgumentList "train.py","--recipe","scratch","--epochs","90" `
+  -RedirectStandardOutput runs\scratch90.log -RedirectStandardError runs\scratch90.err
+```
+
+If it dies — power cut, OOM, a closed laptop — resume from the last milestone
+rather than restarting. Plan for that by asking for milestones up front:
+
+```bash
+python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]"
+python train.py --recipe scratch --epochs 300 \
+    --resume-from /data/runs/<run_name>/milestone-epoch090.ckpt
+```
+
+### 8. Running the whole ablation ladder
+
+```bash
+for f in configs/scratch_0*.yaml; do
+    python train.py --config "$f" --data-dir /data/imagenet_arrow || break
+done
+```
+
+Each arm has a distinct run name, so they cannot overwrite each other.
+**Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
+weeks, not days — see `docs/HPARAMS.md` §5.
+
+---
+
+## Or use the notebook
+
+`notebooks/v11_train.ipynb` — same package, same results, edit ONLY the CONFIG
+cell. It prints the equivalent command line, so anything tuned interactively
+can be handed to the CLI or another machine unchanged.
 
 **New here? Read `docs/GUIDE.md`** — tokens, dataset setup, every config knob
 in both front ends, and how to split a 300-epoch run across machines.
 
 Both front ends are thin: all logic lives in `pvt_moe/`. The notebooks and
-`train.py` add the repo root to `sys.path`; alternatively `pip install -e .`,
-which also installs the `pvt-moe-train` console script.
+`train.py` add the repo root to `sys.path`; `pip install -e .` also installs
+the `pvt-moe-train` console script, so `pvt-moe-train --recipe scratch` works
+from any directory.
 
-### `train.py`
+### `train.py` flags
 
 `python train.py --help` lists every flag. An **unset flag never shadows the
 recipe**, so the command line stays short and `docs/HPARAMS.md` remains the

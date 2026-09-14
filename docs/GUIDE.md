@@ -12,6 +12,18 @@ in one is reproducible in the other.
 The notebook prints the equivalent command line, so an experiment you tuned
 interactively can be handed to the CLI or to another machine unchanged.
 
+**On a new machine, start here:**
+
+```bash
+python train.py --check-env
+```
+
+It reports torch/CUDA, the GPU and its compute capability, whether your torch
+wheel actually contains kernels for that capability, a real matmul, bf16
+support, required and optional dependencies, and whether your tokens are set —
+then exits non-zero if anything would stop a run. README §"Setting up a GPU
+box from scratch" walks through fixing each line.
+
 ---
 
 ## 1. Credentials
@@ -135,6 +147,9 @@ key nothing reads.
 | MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
 | dataset | `--dataset imagenet-1k` | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
+
+Diagnostics, no training: `--check-env` (is this machine usable),
+`--dry-run` (resolve and print the config), `--print-config` / `--save-config`.
 
 `python train.py --help` is the full list. `--dry-run` resolves and prints
 without training; `--print-config` dumps the resolved JSON.

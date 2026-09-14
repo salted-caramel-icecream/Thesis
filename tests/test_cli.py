@@ -399,3 +399,46 @@ def test_missing_resume_checkpoint_exits_2():
     from pvt_moe.cli import main
 
     assert main(["--resume-from", "/nonexistent/x.ckpt"]) == 2
+
+
+# --- environment doctor -----------------------------------------------------
+
+def test_check_env_runs_and_reports_a_verdict():
+    """`--check-env` is the terminal equivalent of the notebook's env cell. It
+    must work on a machine with NO gpu and NO optional deps — that is exactly
+    the machine it exists to diagnose."""
+    import io
+    from contextlib import redirect_stdout
+
+    from pvt_moe.cli import check_environment
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = check_environment()
+    out = buf.getvalue()
+
+    assert rc in (0, 1)
+    for expected in ("torch", "required deps", "HF_TOKEN", "WANDB_API_KEY"):
+        assert expected in out, expected
+    # It must end with an actionable verdict, not just a data dump.
+    assert ("looks trainable" in out) == (rc == 0), out[-200:]
+
+
+def test_check_env_is_reachable_from_main_and_skips_config_resolution():
+    """It must run before config resolution, so a broken config cannot stop
+    you diagnosing the machine."""
+    from pvt_moe.cli import main
+
+    assert main(["--check-env", "--set", "model.moe.num_expert=16"]) in (0, 1)
+
+
+def test_check_env_does_not_need_a_gpu_to_import():
+    import inspect
+
+    from pvt_moe.cli import check_environment
+
+    src = inspect.getsource(check_environment)
+    assert "ModuleNotFoundError" in src, "must survive torch being absent"
+    assert "get_arch_list" in src, (
+        "the decisive check is the wheel's arch list vs the device capability"
+    )

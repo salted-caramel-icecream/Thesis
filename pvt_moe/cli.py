@@ -189,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
                         "(value parsed as JSON, else kept as a string). Repeatable")
+    g.add_argument("--check-env", action="store_true",
+                   help="check torch/CUDA/GPU-arch/deps/credentials and exit. "
+                        "Run this FIRST on a new machine — it catches a "
+                        "CPU-only wheel or an unsupported GPU arch in seconds "
+                        "instead of at the first CUDA kernel")
     g.add_argument("--print-config", action="store_true",
                    help="print the fully resolved config as JSON")
     g.add_argument("--dry-run", action="store_true",
@@ -398,8 +403,103 @@ def describe(cfg: dict) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def check_environment() -> int:
+    """Print what this machine can actually run. Returns 0 if trainable.
+
+    The failure this exists to catch: ``pip install torch`` on a box with a
+    new GPU happily gives you a wheel whose kernels predate it. Everything
+    imports, ``torch.cuda.is_available()`` may even say True, and then the
+    first real matmul is either absurdly slow (PTX JIT) or dies. Checking
+    ``get_arch_list()`` against the device's actual compute capability is the
+    decisive test, so it is done here rather than trusted.
+    """
+    ok = True
+
+    try:
+        import torch
+    except ModuleNotFoundError:
+        print("torch: NOT INSTALLED — see README, 'Running from the terminal'")
+        return 1
+
+    print(f"torch          : {torch.__version__}  (CUDA build: {torch.version.cuda})")
+
+    if not torch.cuda.is_available():
+        print("GPU            : NOT VISIBLE to torch")
+        print("                 If this box has a GPU, you almost certainly "
+              "installed a CPU-only wheel.")
+        print("                 Reinstall from the CUDA index for your driver: "
+              "https://pytorch.org/get-started/locally/")
+        ok = False
+    else:
+        props = torch.cuda.get_device_properties(0)
+        cap = f"sm_{props.major}{props.minor}"
+        free, total = (x / 1024**3 for x in torch.cuda.mem_get_info(0))
+        print(f"GPU            : {props.name} ({cap}, {total:.1f} GiB total, "
+              f"{free:.1f} GiB free)")
+
+        arches = torch.cuda.get_arch_list()
+        print(f"compiled for   : {' '.join(arches)}")
+        if cap in arches:
+            print(f"arch support   : OK — this wheel has {cap} kernels")
+        else:
+            newest = max((a for a in arches if a.startswith("sm_")), default="?")
+            print(f"arch support   : MISSING {cap}. This wheel's newest is {newest}.")
+            print("                 It may fall back to slow PTX JIT or fail "
+                  "outright. Install a build that lists your arch.")
+            ok = False
+
+        try:  # a real kernel, not just a capability query
+            a = torch.randn(512, 512, device="cuda")
+            torch.cuda.synchronize()
+            _ = (a @ a).sum().item()
+            print("matmul smoke   : OK")
+        except Exception as e:
+            print(f"matmul smoke   : FAILED — {type(e).__name__}: {e}")
+            ok = False
+
+        if torch.cuda.is_bf16_supported():
+            print("bf16           : OK (precision: bf16-mixed)")
+        else:
+            print("bf16           : UNSUPPORTED — use --precision 16-mixed or 32")
+
+    import importlib.util
+
+    required = ["pytorch_lightning", "torchmetrics", "timm", "datasets",
+                "transformers", "huggingface_hub", "numpy", "PIL"]
+    missing = [m for m in required if importlib.util.find_spec(m) is None]
+    print(f"required deps  : {'OK' if not missing else 'MISSING ' + ', '.join(missing)}")
+    if missing:
+        print("                 pip install -e .")
+        ok = False
+
+    optional = {"tutel": "MoE backend 'tutel' (default) — else use --backend native",
+                "yaml": "--config *.yaml  (pip install pyyaml)",
+                "wandb": "W&B logging     (else pass --no-wandb)",
+                "fvcore": "count_flops",
+                "matplotlib": "diagnostic plots"}
+    for mod, why in optional.items():
+        state = "OK" if importlib.util.find_spec(mod) is not None else "absent"
+        print(f"  {mod:<12} {state:<7} {why}")
+    if importlib.util.find_spec("tutel") is None:
+        print("                 tutel absent -> pass --backend native, or build it "
+              "(needs a compiler; see README)")
+
+    import os
+
+    for var, why in (("HF_TOKEN", "pretrained weights + gated datasets"),
+                     ("WANDB_API_KEY", "W&B logging")):
+        print(f"  {var:<14} {'set' if os.getenv(var) else 'NOT SET':<7} {why}")
+
+    print("\n" + ("environment looks trainable." if ok else
+                   "environment is NOT ready — fix the lines above."))
+    return 0 if ok else 1
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.check_env:
+        return check_environment()
+
     try:
         cfg = build_config(args)
     except ValueError as e:
