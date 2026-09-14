@@ -183,13 +183,21 @@ def test_both_zero_inits_together_rejected():
     raise AssertionError("both zero-inits must raise")
 
 
-def test_shared_zero_init_requires_shared_expert():
+def test_shared_zero_init_is_dropped_without_a_shared_expert():
+    """Vacuous, not dangerous — there is no shared expert to zero. A recipe
+    sets it globally, so the no-shared-expert ladder arm must still resolve."""
+    c = _cfg(model={"moe": {"shared_expert": False, "shared_zero_init": True}})
+    assert c["model"]["moe"]["shared_zero_init"] is False
+
+
+def test_routed_zero_init_without_shared_expert_still_raises():
+    """This one IS dangerous: it zeroes the block's entire output."""
     try:
-        _cfg(model={"moe": {"shared_expert": False, "shared_zero_init": True}})
+        _cfg(model={"moe": {"shared_expert": False, "routed_zero_init": True}})
     except ValueError as e:
-        assert "shared_expert" in str(e)
+        assert "routed_zero_init" in str(e)
         return
-    raise AssertionError("shared_zero_init without shared_expert must raise")
+    raise AssertionError("routed_zero_init without shared_expert must raise")
 
 
 def test_zero_shared_expert_output_zeros_only_shared_fc2():

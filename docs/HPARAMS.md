@@ -142,8 +142,33 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 
 ## 4. Ablation ladders
 
-`#` matches the doc. Set `moe_placement` per the table; run names
-self-document (`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`).
+`#` matches the doc, and `--ladder N` applies row N directly:
+
+```bash
+python train.py --recipe scratch --ladder 4
+for row in 1 2 3 4 6 7 8 9; do python train.py --recipe scratch --ladder $row; done
+```
+
+A row sets only what the spec's table names for it; everything else comes from
+the recipe and your own flags, and named flags override the row. Rows print a
+`[ladder]` line naming what they set, plus a note wherever the spec left a
+choice open (marked **(choice)** below). Run names self-document
+(`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`) and are distinct across
+every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
+enforces that, since a collision would mean two runs sharing a checkpoint
+directory and a W&B run.
+
+Three choices the spec does not pin, made explicit:
+
+- **(choice)** scratch row 2 removes the DWConv from *every* block, so RoPE is
+  placed in every block too — the architecture edit as a whole. Pass
+  `--rope-placement` for a narrower arm.
+- **(choice)** rows 8/9 move MoE to stages 3+4, and RoPE moves with it (this
+  repo's convention: RoPE goes where MoE is). Pass `--rope-placement` to
+  decouple the axes.
+- **(choice)** pretrained row 2 ("Dense, fine-tuned, no MoE") names only "no
+  MoE"; `dense_dwconv` and `use_rope` stay at your flags. For 2→3 to isolate
+  MoE alone, match them to your MoE runs.
 
 ### From scratch
 

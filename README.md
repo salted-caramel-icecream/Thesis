@@ -14,21 +14,59 @@ docs/           ARCHITECTURE.md (model & invariants), HPARAMS.md (the recipe
 .claude/skills/ skill library for AI-assisted maintenance
 ```
 
-## Quickstart (plain Jupyter on B200 / RTX 5090)
+## Quickstart (B200 / RTX 5090)
 
 ```bash
 # 1) On the GPU box, from the repo root:
 export HF_TOKEN=...          # for HF pretrained weights
-export WANDB_API_KEY=...     # optional (or set use_wandb: False)
+export WANDB_API_KEY=...     # optional (or pass --no-wandb)
 
 # 2) Gate before any GPU time:
 python tests/run_all.py      # must print "N passed, 0 failed"
 
-# 3) Launch Jupyter and run notebooks/01_train_supervised.ipynb.
-#    Edit ONLY the config cell.
+# 3a) Terminal:
+python train.py --recipe scratch --epochs 90
+python train.py --recipe pretrained --lr 5e-5
+
+# 3b) ...or Jupyter: run notebooks/01_train_supervised.ipynb and edit
+#     ONLY the config cell (same package underneath, same results).
 ```
 
-The notebooks add the repo root to `sys.path`; alternatively `pip install -e .`.
+Both front ends are thin: all logic lives in `pvt_moe/`. The notebooks and
+`train.py` add the repo root to `sys.path`; alternatively `pip install -e .`,
+which also installs the `pvt-moe-train` console script.
+
+### `train.py`
+
+`python train.py --help` lists every flag. An **unset flag never shadows the
+recipe**, so the command line stays short and `docs/HPARAMS.md` remains the
+source of truth. Precedence, lowest to highest:
+
+```
+default_config()  <  --config file.json  <  --ladder N  <  named flags  <  --set a.b=v
+```
+
+```bash
+python train.py --recipe scratch --epochs 300          # final run
+python train.py --recipe pretrained --lr 5e-5 --warmup-epochs 5
+python train.py --no-moe --no-dwconv --rope            # a dense ablation arm
+python train.py --set model.moe.gate_noise=0.0         # anything without a flag
+python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
+```
+
+`--ladder N` (1–9) applies a row of the ablation ladder from
+`docs/HPARAMS.md` §4 and prints what it set, so the whole sweep is a shell
+loop:
+
+```bash
+for row in 1 2 3 4 6 7 8 9; do
+    python train.py --recipe scratch --ladder $row
+done
+```
+
+Every row gets a distinct run name (a test enforces it — colliding names would
+share a checkpoint directory and a W&B run). `--dry-run` resolves the config
+and stops; `--print-config` / `--save-config FILE` dump the resolved JSON.
 
 ## Recipes: from scratch or pretrained
 

@@ -377,9 +377,18 @@ def build_run_tag(cfg: dict) -> str:
         moe_cfg = cfg["model"]["moe"]
         backend = "" if moe_cfg["backend"] == "tutel" else "-mb"
         shared = "+sh" if moe_cfg.get("shared_expert") else ""
+        # The random-expert-init control (pretrained ladder row 6) is
+        # architecturally identical to the upcycled run it is compared against,
+        # so the init has to appear in the name or the two overwrite each other.
+        randexp = (
+            "-randexp"
+            if cfg.get("mode") == "hf_pretrained"
+            and not cfg["model"].get("seed_moe_from_dense", True)
+            else ""
+        )
         moe = (
             f"moe-{_placement_tag(moe_pl, depths)}-"
-            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{backend}"
+            f"e{moe_cfg['num_experts']}k{moe_cfg['top_k']}{shared}{randexp}{backend}"
         )
     else:
         moe = "dense"
@@ -390,12 +399,147 @@ def build_run_tag(cfg: dict) -> str:
     else:
         rope = "norope"
 
+    # Without this, "conv-FFN intact" and "no DWConv" dense arms produce the
+    # same run name and overwrite each other's checkpoints.
+    dwconv = "" if cfg["model"].get("dense_dwconv", True) else "_nodw"
     norm = {"layernorm": "ln", "rmsnorm": "rms"}[cfg["model"]["norm_type"]]
     # Budget tag: the epoch count is an ablation axis of its own (90/150/300
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
     budget = {"scratch": "scratch", "pretrained": "ft"}.get(cfg.get("recipe"), "run")
-    budget = f"{budget}{cfg['epochs']}"
-    return f"{cfg['version']}_{ds}_{moe}_{rope}_{norm}_{budget}"
+    # epochs == 0 is the eval-only row of the pretrained ladder.
+    budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
+    return f"{cfg['version']}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
+
+
+# ---------------------------------------------------------------------------
+# Ablation ladders (docs/HPARAMS.md section 4)
+# ---------------------------------------------------------------------------
+
+#: Overrides for each numbered ladder row, keyed by recipe then row number.
+#: Each entry sets ONLY what the spec's table names for that row; everything
+#: else comes from the recipe and your own flags. ``_note`` is printed when
+#: the row is applied so nothing is silently assumed.
+LADDERS = {
+    "scratch": {
+        1: {"_desc": "Baseline, conv-FFN intact", "epochs": 90,
+            "model": {"dense_dwconv": True,
+                      "ablation": {"use_moe": False, "use_rope": False}}},
+        2: {"_desc": "Dense, no DWConv + RoPE", "epochs": 90,
+            "_note": "the DWConv is removed from EVERY block, so RoPE is "
+                     "placed in every block too — the architecture edit as a "
+                     "whole. Pass --rope-placement for a narrower arm.",
+            "model": {"dense_dwconv": False,
+                      "ablation": {"use_moe": False, "use_rope": True,
+                                   "rope_last_n_stages": 4}}},
+        3: {"_desc": "MoE, no shared", "epochs": 90,
+            "model": {"moe": {"num_experts": 4, "shared_expert": False},
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        4: {"_desc": "MoE + shared", "epochs": 90,
+            "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        5: {"_desc": "Final, best config", "epochs": 300,
+            "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
+                     "only; carry the winning architecture flags yourself."},
+        6: {"_desc": "Dense, no DWConv, no RoPE", "epochs": 90,
+            "model": {"dense_dwconv": False,
+                      "ablation": {"use_moe": False, "use_rope": False}}},
+        7: {"_desc": "N=8, last stage", "epochs": 90,
+            "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        8: {"_desc": "N=4, stages 3 & 4", "epochs": 90,
+            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                     "(this repo places RoPE where MoE is). Pass "
+                     "--rope-placement to decouple the two axes.",
+            "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [1], [1]],
+                                   "rope_placement": [[], [], [1], [1]]}}},
+        9: {"_desc": "N=8, stages 3 & 4", "epochs": 90,
+            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                     "(this repo places RoPE where MoE is). Pass "
+                     "--rope-placement to decouple the two axes.",
+            "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [1], [1]],
+                                   "rope_placement": [[], [], [1], [1]]}}},
+    },
+    "pretrained": {
+        1: {"_desc": "Pretrained PVT v2 B1, eval only", "epochs": 0,
+            "model": {"dense_dwconv": True,
+                      "ablation": {"use_moe": False, "use_rope": False}},
+            "_note": "epochs=0 runs validation only (no fit)."},
+        2: {"_desc": "Dense, fine-tuned, no MoE", "epochs": 100,
+            "model": {"ablation": {"use_moe": False}},
+            "_note": "the spec names only 'no MoE' for this row; dense_dwconv "
+                     "and use_rope stay at your flags/defaults. For 2->3 to "
+                     "isolate MoE alone, match them to your MoE runs."},
+        3: {"_desc": "MoE upcycled, no shared", "epochs": 100,
+            "model": {"moe": {"num_experts": 4, "shared_expert": False},
+                      "seed_moe_from_dense": True,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        4: {"_desc": "MoE upcycled + shared", "epochs": 100,
+            "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                      "seed_moe_from_dense": True,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        5: {"_desc": "Final, best config", "epochs": 300,
+            "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
+                     "only; carry the winning architecture flags yourself."},
+        6: {"_desc": "Random-init experts (control)", "epochs": 100,
+            "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                      "seed_moe_from_dense": False,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}},
+            "_note": "seed_moe_from_dense=False — this row IS the upcycling "
+                     "claim (replicated vs random expert init)."},
+        7: {"_desc": "N=8, last stage", "epochs": 100,
+            "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                      "seed_moe_from_dense": True,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [], [1]]}}},
+        8: {"_desc": "N=4, stages 3 & 4", "epochs": 100,
+            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                     "(this repo places RoPE where MoE is). Pass "
+                     "--rope-placement to decouple the two axes.",
+            "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                      "seed_moe_from_dense": True,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [1], [1]],
+                                   "rope_placement": [[], [], [1], [1]]}}},
+        9: {"_desc": "N=8, stages 3 & 4", "epochs": 100,
+            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                     "(this repo places RoPE where MoE is). Pass "
+                     "--rope-placement to decouple the two axes.",
+            "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                      "seed_moe_from_dense": True,
+                      "ablation": {"use_moe": True,
+                                   "moe_placement": [[], [], [1], [1]],
+                                   "rope_placement": [[], [], [1], [1]]}}},
+    },
+}
+
+
+def ladder_overrides(recipe: str, row: int) -> tuple:
+    """Return ``(overrides, description, note)`` for a ladder row.
+
+    ``overrides`` is a plain config fragment to merge; the ``_desc``/``_note``
+    metadata keys are stripped out of it.
+    """
+    if recipe not in LADDERS:
+        raise ValueError(f"No ablation ladder for recipe {recipe!r}; "
+                         f"have {tuple(LADDERS)}")
+    rows = LADDERS[recipe]
+    if row not in rows:
+        raise ValueError(f"Ladder row must be one of {tuple(sorted(rows))} "
+                         f"for recipe {recipe!r}, got {row}")
+    entry = copy.deepcopy(rows[row])
+    desc = entry.pop("_desc", "")
+    note = entry.pop("_note", "")
+    return entry, desc, note
 
 
 def _fill_none(dst: dict, src: dict) -> list:
@@ -524,7 +668,10 @@ def validate_config(cfg: dict) -> dict:
             "output identically zero at init."
         )
     if moe.get("shared_zero_init") and not moe.get("shared_expert"):
-        raise ValueError("moe.shared_zero_init requires moe.shared_expert")
+        # Vacuous rather than dangerous: there is no shared expert to zero.
+        # A recipe sets this globally, so a no-shared-expert arm (ladder row 3)
+        # must not be rejected for inheriting it.
+        moe["shared_zero_init"] = False
     if moe.get("shared_zero_init") and moe.get("routed_zero_init"):
         raise ValueError(
             "moe.shared_zero_init and moe.routed_zero_init are mutually "
