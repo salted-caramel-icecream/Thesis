@@ -456,3 +456,30 @@ def test_R5_checkpoint_round_trips_between_backends():
     shared_keys = {k for k in saved if not k.startswith("moe_layer.")}
     assert shared_keys == {k for k in tutel_side.state_dict()
                            if not k.startswith("moe_layer.")}
+
+
+def test_tutel_activation_fn_is_always_passed_explicitly():
+    """Regression guard for a bug in Tutel itself.
+
+    tutel/experts/ffn.py does::
+
+        if activation_fn is None:
+            activation_fn = lambda x: F.relu(x)
+
+    but the module imports only `torch` and `net` — never
+    `torch.nn.functional as F`. So omitting activation_fn raises
+    `NameError: name 'F' is not defined` from inside Tutel's forward, not at
+    construction, which makes it look like a model bug. Every call site must
+    supply it; this test fails if someone "simplifies" one away.
+    """
+    import inspect
+
+    from pvt_moe.models.ffn import MoEMlp
+
+    for builder in (MoEMlp._build_tutel, MoEMlp._build_native):
+        src = inspect.getsource(builder)
+        assert "activation_fn" in src, builder.__name__
+        assert "act_layer()" in src, (
+            f"{builder.__name__} must pass activation_fn explicitly — Tutel's "
+            "default branch references an unimported F"
+        )

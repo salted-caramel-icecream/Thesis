@@ -187,6 +187,13 @@ class MoEMlp(nn.Module):
                 "count_per_node": moe_cfg["num_experts"],
                 "type": "ffn",
                 "hidden_size_per_expert": hidden,
+                # LOAD-BEARING: activation_fn must ALWAYS be passed explicitly.
+                # tutel/experts/ffn.py uses `F.relu` in its default branch but
+                # never imports torch.nn.functional, so omitting this raises
+                #     NameError: name 'F' is not defined
+                # from inside Tutel's own forward. Present on main as of
+                # 9a70a681b7673ee23135aa54446ac2a03cf0a61d. Supplying it here
+                # means that code path never runs.
                 "activation_fn": act_layer(),
             },
             # Single-node training: exclude expert params from allreduce.

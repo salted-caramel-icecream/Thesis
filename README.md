@@ -8,6 +8,10 @@ where each cell ended up.
 
 ```
 pvt_moe/        the package — ALL logic lives here
+PVT_Tutelmoe_v10_patched.ipynb
+                the v9 notebook patched in place — SELF-CONTAINED, no
+                dependency on pvt_moe/ (verify: python tests/verify_patched_notebook.py)
+archive/        the original v9 notebook, unmaintained, kept for provenance
 notebooks/      thin launchers — v11_train.ipynb is the current one
                 (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA are older)
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
@@ -187,7 +191,35 @@ weeks, not days — see `docs/HPARAMS.md` §5.
 
 ---
 
-## Or use the notebook
+## Or use a notebook
+
+Two, for different purposes:
+
+| | |
+|---|---|
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 211 tests. Prefer this. |
+| `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
+
+The patched v10 carries these fixes into its own class definitions
+(each marked `v10 PATCH`):
+
+- `build_moe_ffn_layer` always passes `activation_fn`, working around Tutel's
+  missing `import torch.nn.functional as F` — and puts `capacity_factor` /
+  `gate_noise` **inside** `gate_type`, where Tutel actually reads them
+- an always-on shared expert, with `moe_block_dwconv` controlling whether the
+  MoE'd block keeps PVT v2's DWConv
+- **upcycling**: v9 discarded the stage-4 dense FFN and put nothing in its
+  place, so every "pretrained" MoE run trained stage 4 from random init. It
+  now seeds the shared expert and zeroes the routed experts' fc2, so the block
+  reproduces the dense FFN exactly at step 0 (verified: max|Δ| = 0.0)
+- gradient accumulation (micro-batch 128 × 8 = 1024 effective, for a 12 GB card)
+- milestone checkpoints + `stop_at_epoch` for resuming a long schedule
+- `weights_only=` removed from `trainer.fit` — not a valid argument, it raised
+  `TypeError` before training started
+- `/` removed from the checkpoint filename template, which was silently
+  creating a nested directory per checkpoint
+- the validation confusion matrix is reset each epoch; it had been
+  accumulating every epoch plus the sanity-check batches
 
 `notebooks/v11_train.ipynb` — same package, same results, edit ONLY the CONFIG
 cell. It prints the equivalent command line, so anything tuned interactively
