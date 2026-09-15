@@ -90,11 +90,15 @@ python download_data.py --out /data/imagenet_arrow        # Linux / macOS / WSL2
 python download_data.py --out D:/data/imagenet_arrow      # Windows
 ```
 
-`download_data.py` checks the licence/token and the free space on the drive
+`D:` is only an example, here and throughout this guide — substitute your own
+drive (`Get-PSDrive -PSProvider FileSystem` lists them with free space).
+
+`download_data.py` checks that `HF_TOKEN` is set and the free space on the drive
 that will actually hold the download **before** starting, so a 2–3 hour build
-fails in the first second rather than the last. It is a script rather than a
-snippet to paste for the same reason: on a remote box, run it detached so a
-dropped connection cannot kill it.
+fails in the first second rather than the last. (It cannot check that you
+accepted the licence — HF rejects the download itself if you have not.) It is
+a script rather than a snippet to paste for the same reason: on a remote box,
+run it detached so a dropped connection cannot kill it.
 
 ```bash
 tmux new -s dataprep
@@ -119,7 +123,8 @@ If the OS drive is small but a data drive is not, put the transient cache on
 the big one:
 
 ```bash
-python download_data.py --out D:/data/imagenet_arrow --hf-cache D:/hf_cache
+python download_data.py --out /data/imagenet_arrow --hf-cache /data/hf_cache    # Linux / macOS / WSL2
+python download_data.py --out D:/data/imagenet_arrow --hf-cache D:/hf_cache     # Windows
 ```
 
 ### Point the code at it
@@ -130,7 +135,8 @@ python train.py --data-dir D:/data/imagenet_arrow         # Windows
 ```
 
 ```python
-DATA_DIR = "/data/imagenet_arrow"           # notebook CONFIG cell (adjust per OS)
+DATA_DIR = "/data/imagenet_arrow"           # notebook CONFIG cell — Linux / macOS / WSL2
+# DATA_DIR = "D:/data/imagenet_arrow"       # Windows
 ```
 
 Or set it once in a config so you never pass the flag:
@@ -157,9 +163,7 @@ log_root: "D:/runs/logs"
 python train.py --config configs/my_paths.yaml --recipe scratch
 ```
 
-`D:` is only an example — substitute your own drive.
-`Get-PSDrive -PSProvider FileSystem` lists them with free space. Keep
-per-machine path configs **out of version control**, or as one file per
+Keep per-machine path configs **out of version control**, or as one file per
 machine, so a Windows path never lands on a Linux box and vice versa.
 
 A missing snapshot raises with these instructions rather than silently
@@ -249,15 +253,17 @@ python train.py --recipe scratch --epochs 300 \
     --milestones "[90,100,150,200]" --stop-at 90
 ```
 
-Writes `milestone-epoch090.ckpt` into `checkpoint_root/<run_name>/`, holding
-model + optimizer + scheduler + epoch. It is **never pruned** by the rolling
-`save_top_k`.
+Writes `milestone-epoch090.ckpt` into `checkpoint_root/<run_name>/` (set with
+`--checkpoint-root DIR` or `checkpoint_root:` in a config; `--checkpoint-dir`
+is accepted as an alias), holding model + optimizer + scheduler + epoch.
+It is **never pruned** by the rolling `save_top_k`.
 
 ```bash
 # session 2 — continue to 150, here or on another machine
 python train.py --recipe scratch --epochs 300 \
     --milestones "[100,150,200]" --stop-at 150 \
-    --resume-from D:/runs/checkpoints/<run_name>/milestone-epoch090.ckpt
+    --resume-from /data/runs/checkpoints/<run_name>/milestone-epoch090.ckpt
+#   Windows:  --resume-from D:/runs/checkpoints/<run_name>/milestone-epoch090.ckpt
 
 # ...or run it out to 300
 python train.py --recipe scratch --epochs 300 \

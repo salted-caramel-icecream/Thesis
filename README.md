@@ -122,15 +122,21 @@ Accept the licence at <https://huggingface.co/datasets/ILSVRC/imagenet-1k>,
 then build the Arrow snapshot once:
 
 ```bash
-python download_data.py --out /data/imagenet_arrow     # or D:/data/... on Windows
-python train.py --data-dir /data/imagenet_arrow --checkpoint-dir /data/runs ...
+# Linux / WSL2 / macOS
+python download_data.py --out /data/imagenet_arrow
+python train.py --data-dir /data/imagenet_arrow --checkpoint-root /data/runs ...
+
+# Windows — D: is only an example; substitute your own drive
+python download_data.py --out D:/data/imagenet_arrow
+python train.py --data-dir D:/data/imagenet_arrow --checkpoint-root D:/runs ...
 ```
 
 The snapshot settles at ~160 GB but needs **~320 GB free to build** —
 `datasets` keeps the raw download and the Arrow cache at the same time.
-`download_data.py` checks the licence, token and free space before starting,
-so a 2–3 hour build fails in the first second rather than the last. Run it
-under `tmux` on a remote box. `docs/GUIDE.md` §2 has the detail.
+`download_data.py` checks that `HF_TOKEN` is set and that there is enough free
+space before starting, so a 2–3 hour build fails in the first second rather
+than the last (accepting the licence is on you — HF refuses the download
+otherwise). Run it under `tmux` on a remote box. `docs/GUIDE.md` §2 has the detail.
 
 ### 6. Gate, smoke-test, then train
 
@@ -143,8 +149,13 @@ A ~2-minute real check before committing days of compute — one short epoch on
 a slice of the data, writing to a throwaway directory:
 
 ```bash
+# Linux / WSL2 / macOS
 python train.py --recipe scratch --epochs 1 --no-wandb \
-    --checkpoint-dir /tmp/smoke --log-root /tmp/smoke
+    --checkpoint-root /tmp/smoke --log-root /tmp/smoke
+```
+```powershell
+# Windows — D: is only an example; substitute your own drive
+python train.py --recipe scratch --epochs 1 --no-wandb --checkpoint-root D:/smoke --log-root D:/smoke
 ```
 
 Then the real run. On a 12 GB card the defaults already fit (128 micro-batch ×
@@ -183,14 +194,23 @@ rather than restarting. Plan for that by asking for milestones up front:
 python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]"
 python train.py --recipe scratch --epochs 300 \
     --resume-from /data/runs/<run_name>/milestone-epoch090.ckpt
+#   Windows:  --resume-from D:/runs/<run_name>/milestone-epoch090.ckpt
 ```
 
 ### 8. Running the whole ablation ladder
 
 ```bash
+# Linux / WSL2 / macOS
 for f in configs/scratch_0*.yaml; do
     python train.py --config "$f" --data-dir /data/imagenet_arrow || break
 done
+```
+```powershell
+# Windows — D: is only an example; substitute your own drive
+foreach ($f in Get-ChildItem configs/scratch_0*.yaml) {
+    python train.py --config $f.FullName --data-dir D:/data/imagenet_arrow
+    if ($LASTEXITCODE -ne 0) { break }
+}
 ```
 
 Each arm has a distinct run name, so they cannot overwrite each other.
@@ -259,11 +279,15 @@ python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
-python train.py --data-dir /mnt/imagenet_arrow --checkpoint-dir /mnt/runs
+python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
+python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --backend native                       # no-Tutel fallback
 python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
 python train.py --no-moe-dwconv --rope                 # position-encoding arm
 ```
+
+`--checkpoint-root` is the canonical name; `--checkpoint-dir` is an alias
+(shown in `--help` as such), so older commands still work.
 
 `--ladder N` (1–9) applies a row of the ablation ladder from
 `docs/HPARAMS.md` §4 and prints what it set, so the whole sweep is a shell
@@ -448,9 +472,10 @@ RTX 5070, so a 90-epoch ablation run is 3–6 days and the 8-run ladder is
 
 ## Datasets
 
-Build with `python download_data.py --out DIR` (checks licence, token and disk
-first). ImageNet-1k as Arrow is ~160 GB, **~320 GB to build**; ImageNet-22k is
-~1.3 TB and ~2.6 TB to build, so it will not fit a 579 GB disk. The dataset id
+Build with `python download_data.py --out DIR` (checks `HF_TOKEN` and disk
+space first; accept the licence on HF beforehand). ImageNet-1k as Arrow is
+~160 GB, **~320 GB to build**; ImageNet-22k is ~1.3 TB and ~2.6 TB to build,
+so it will not fit a 579 GB disk. The dataset id
 must be the full `namespace/name` (`ILSVRC/imagenet-1k`) — a bare name is
 rejected by current `huggingface_hub`. Arrow snapshots are expected at the
 paths in
