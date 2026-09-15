@@ -190,7 +190,11 @@ RECIPES = {
 # ---------------------------------------------------------------------------
 
 _DEFAULT: dict = {
-    "version": "v10",
+    # Run-name prefix. "sv1" = the September 2026 edit of the architecture
+    # (variants, MHA-by-default, depth-independent placement); the earlier
+    # code arch was "v10". Bump it when the architecture changes so old and
+    # new runs never share a W&B name or checkpoint directory.
+    "version": "sv1",
     # Which recipe fills the fields left as None below (see RECIPES).
     #   "scratch"    - full from-scratch training, PVT v2 recipe
     #   "pretrained" - warm start from the variant's OpenGVLab/pvt_v2_b*
@@ -224,6 +228,12 @@ _DEFAULT: dict = {
     # first 90 epochs of a 300-epoch schedule -- not a compressed 90-epoch one.
     # Resume later with mode "resume" and a larger (or absent) stop_at_epoch.
     "stop_at_epoch": None,
+    # Cap the batches per epoch (int = count, float = fraction, None = all).
+    # For throughput / wall-clock checks (notebooks/quick_bench.ipynb), never
+    # for a real run: the cosine still spans `epochs`, so a capped epoch is a
+    # shorter epoch, not a faster schedule.
+    "limit_train_batches": None,
+    "limit_val_batches": None,
 
     # None => recipe default (scratch: 90, pretrained: 100). For from-scratch
     # ablations pick one of config.SCRATCH_EPOCH_CHOICES == (90, 150, 300);
@@ -287,11 +297,12 @@ _DEFAULT: dict = {
         "variant": "b1",
         "embed_dims": None,               # b1: [64, 128, 320, 512]
         "num_heads": None,                # b1: [1, 2, 5, 8]
-        # Grouped-query attention: kv heads per stage (equal to num_heads =>
-        # standard MHA). Defaults (v9 lineage): stage 1 MHA, stages 2-3 MQA
-        # (1 kv head), stage 4 8:2 GQA. This repo's own choice, so it is NOT
-        # part of the variant table (every size has heads [1, 2, 5, 8]).
-        "num_kv_heads": [1, 1, 1, 2],
+        # kv heads per stage. None => equal to num_heads: standard multi-head
+        # attention, which takes the plain SDPA call and is eligible for the
+        # flash kernel under bf16 (attention.py). Set fewer kv heads per stage
+        # for grouped-query attention (the v9 lineage ran [1, 1, 1, 2]); that
+        # is an ablation, not the default, and not part of the variant table.
+        "num_kv_heads": None,
         "mlp_ratios": None,               # b1: [8, 8, 4, 4]
         "depths": None,                   # b1: [2, 2, 2, 2]
         "sr_ratios": None,                # b1: [8, 4, 2, 1]
@@ -511,7 +522,7 @@ def _placement_tag(placement, depths) -> str:
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
-    Example: ``v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+    Example: ``sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
 
     The variant sits right after the version: two sizes in one W&B project
     are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
@@ -748,6 +759,10 @@ def apply_variant(cfg: dict) -> list:
                 f"variant that has these values, or model.variant: custom to "
                 f"hand-tune the architecture (no official checkpoint then)."
             )
+
+    if model.get("num_kv_heads") is None:          # MHA unless asked otherwise
+        model["num_kv_heads"] = list(model["num_heads"])
+        filled.append("model.num_kv_heads")
 
     hf_id = model.get("pretrained_hf_id")
     if variant == "custom":

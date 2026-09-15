@@ -5,9 +5,13 @@ This is the attention used throughout the backbone:
 - **SRA** (PVT v2): keys/values are computed on a spatially reduced feature
   map — a strided ``sr_ratio`` conv (standard mode) or adaptive 7x7 average
   pooling (``linear_attention`` mode, "PVT v2-li").
-- **GQA**: ``num_kv_heads <= num_heads`` shares each kv head across a group
-  of query heads. Uses PyTorch SDPA with ``enable_gqa=True`` on torch >= 2.5
-  and falls back to ``repeat_interleave`` on older versions (so CPU tests run
+- **SDPA**: attention is ``F.scaled_dot_product_attention``. With the default
+  ``num_kv_heads == num_heads`` (plain MHA) it is the unmasked call that
+  dispatches to the flash kernel on CUDA under bf16/fp16 (head_dim 32/64,
+  no mask) — nothing to install or enable.
+- **GQA** (optional ablation): ``num_kv_heads < num_heads`` shares each kv
+  head across a group of query heads via ``enable_gqa=True`` on torch >= 2.5,
+  with a ``repeat_interleave`` fallback on older versions (so CPU tests run
   on torch 2.3).
 - **RoPE** (optional): queries are rotated on the full (H, W) grid, keys on
   the reduced (H_kv, W_kv) grid; values are never rotated. Coordinates scale

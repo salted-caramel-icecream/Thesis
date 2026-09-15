@@ -1,4 +1,4 @@
-# PVT v2 + MoE — thesis ablation framework (v10)
+# PVT v2 + MoE — thesis ablation framework (sv1)
 
 PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
 official size) with configurable Mixture-of-Experts, trained on
@@ -347,7 +347,7 @@ directly, and prints the equivalent command line.
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
-| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2 (+GQA) |
+| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16). GQA is available as an ablation via `model.num_kv_heads` |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
@@ -366,15 +366,16 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-    └─────────────────────────────────────────────── variant (b0…b5; a B2 run is v10_b2_…)
-    │  └──────────────────────────────────────────── dataset
-    │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
-    │  │        │    └────────────────────────────── 4 experts, top-1
-    │  │        │    │   └────────────────────────── shared expert
-    │  │        │    │   │   └────────────────────── RoPE placement
-    │  │        │    │   │   │         └──────────── norm
-    │  │        │    │   │   │         │  └───────── recipe + epoch budget
+sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+└─────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └─────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └──────────────────────────────────────────── dataset
+│   │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │        │    └────────────────────────────── 4 experts, top-1
+│   │  │        │    │   └────────────────────────── shared expert
+│   │  │        │    │   │   └────────────────────── RoPE placement
+│   │  │        │    │   │   │         └──────────── norm
+│   │  │        │    │   │   │         │  └───────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
@@ -505,7 +506,7 @@ instructions instead of silently re-downloading ~160 GB.
 
 | mode | What happens |
 |------|--------------|
-| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
+| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |

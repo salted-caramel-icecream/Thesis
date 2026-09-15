@@ -200,6 +200,9 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         callbacks=callbacks,
         logger=build_loggers(cfg),
         log_every_n_steps=50,
+        # None (the default) means Lightning's own default: every batch.
+        **{k: cfg[k] for k in ("limit_train_batches", "limit_val_batches")
+           if cfg.get(k) is not None},
     )
 
 

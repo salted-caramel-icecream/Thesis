@@ -24,6 +24,7 @@ your LR.
 |---|---|---|---|
 | Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
+| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | `model.num_kv_heads` (None = heads) | PVT v2; GQA (`[1,1,1,2]`, v9 lineage) stays available as an ablation |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
 | Epochs | **90** (ablations) / 150 / 300 (final) | `epochs` | ScMoE runs vision comparisons at 90 ep on IN-1K; PVT v2's own recipe is 300 |
@@ -48,14 +49,14 @@ Set `model.drop_path_rate` explicitly to override.
 
 ### Variants (`model.variant`, `--variant`)
 
-| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo MHA / this repo GQA default | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
+| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 / 3.38 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
-| **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 / 12.86 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |
-| b2 | [3,4,6,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 25.4 / 25.36 / 23.13 | 3.88 | 0.1 | — | `OpenGVLab/pvt_v2_b2` | 82.0 |
-| b3 | [3,4,18,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 45.2 / 45.24 / 41.03 | 6.68 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b3` | 83.1 |
-| b4 | [3,8,27,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 62.6 / 62.56 / 56.80 | 9.79 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b4` | 83.6 |
-| b5 | [3,6,40,3] | [64,128,320,512] | [1,2,5,8] | [4,4,4,4] | [8,4,2,1] | 82.0 / 81.96 / 74.10 | 11.35 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b5` | 83.8 |
+| b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
+| **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |
+| b2 | [3,4,6,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 25.4 / 25.36 | 3.88 | 0.1 | — | `OpenGVLab/pvt_v2_b2` | 82.0 |
+| b3 | [3,4,18,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 45.2 / 45.24 | 6.68 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b3` | 83.1 |
+| b4 | [3,8,27,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 62.6 / 62.56 | 9.79 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b4` | 83.6 |
+| b5 | [3,6,40,3] | [64,128,320,512] | [1,2,5,8] | [4,4,4,4] | [8,4,2,1] | 82.0 / 81.96 | 11.35 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b5` | 83.8 |
 
 Sources (the table in `config.VARIANTS` cites the same):
 
@@ -77,8 +78,10 @@ Sources (the table in `config.VARIANTS` cites the same):
   224². MACs from `torch.utils.flop_counter` (matmul/conv only, so a few
   percent under a paper GFLOPs count that includes norms and activations).
   The paper's own GFLOPs column (arXiv 2106.13797) was not reachable and is
-  not reproduced here. "GQA default" is this repo's `num_kv_heads [1,1,1,2]`,
-  which is not part of the official sizes.
+  not reproduced here. Attention is plain MHA by default (kv heads = heads),
+  so the parameter count matches the official one; the GQA ablation
+  (`model.num_kv_heads`, e.g. the v9 lineage's [1,1,1,2]) trims it slightly
+  (12.86 M for B1).
 
 Three rules the code enforces:
 
@@ -321,7 +324,7 @@ A row sets only what the spec's table names for it; everything else comes from
 the recipe and your own flags, and named flags override the row. Rows print a
 `[ladder]` line naming what they set, plus a note wherever the spec left a
 choice open (marked **(choice)** below). Run names self-document
-(`v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; the variant follows the version, and B2's stage-4 tag reads `s4b2`) and are distinct across
+(`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
 every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
 enforces that, since a collision would mean two runs sharing a checkpoint
 directory and a W&B run.

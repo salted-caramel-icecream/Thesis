@@ -18,21 +18,23 @@ Attribute naming is PVT-official (`patch_embed{i}`, `block{i}`, `norm{i}`,
 `head`) — **the HF pretrained remap in `models/pretrained.py` depends on these
 names.** Renaming them silently breaks warm starts (they load 0 weights).
 
-## 1. GQA attention (`models/attention.py`)
+## 1. Attention (`models/attention.py`)
 
-SRA (spatial-reduction attention) exactly as PVT v2, but with separate
-`q` / fused `kv` projections and grouped-query attention. With the default
-`num_kv_heads = [1,1,1,2]` vs `num_heads = [1,2,5,8]`: stage 1 is plain MHA
-(1:1), stages 2–3 are MQA (one kv head shared across 2 and 5 query heads),
-stage 4 is 8:2 GQA.
+SRA (spatial-reduction attention) exactly as PVT v2, with separate `q` /
+fused `kv` projections, computed by `F.scaled_dot_product_attention`. The
+default is plain multi-head attention (`num_kv_heads` = `num_heads`,
+[1,2,5,8]), which is the unmasked SDPA call that dispatches to the flash
+kernel on CUDA under bf16 — nothing to install. Grouped-query attention is
+an ablation: set fewer kv heads per stage (the v9 lineage ran
+`num_kv_heads = [1,1,1,2]`: stage 1 MHA, stages 2–3 MQA, stage 4 8:2 GQA).
 
-- SDPA `enable_gqa=True` needs torch ≥ 2.5; older torch takes a
+- Under GQA, SDPA `enable_gqa=True` needs torch ≥ 2.5; older torch takes a
   `repeat_interleave` fallback (correct, slower) so CPU tests run anywhere.
 - HF checkpoints have separate k/v — the loader **fuses** them
-  (`torch.cat([k, v], dim=0) → attn.kv`). Stages whose kv-head count differs
-  from HF's (stages 2–4 with the defaults — only stage 1's kv actually loads)
-  get a shape mismatch on the fused kv and are skipped by design (counted as
-  `kv_skipped`).
+  (`torch.cat([k, v], dim=0) → attn.kv`). With the MHA default every stage's
+  kv loads. Under a GQA ablation the stages whose kv-head count differs from
+  HF's get a shape mismatch on the fused kv and are skipped by design
+  (counted as `kv_skipped`).
 
 ## 2. MoE FFN (`models/ffn.py`)
 

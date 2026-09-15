@@ -183,7 +183,7 @@ def load_hf_pretrained(
                 filtered[custom_key] = fused
                 stats["kv_fused"] += 1
             else:
-                stats["kv_skipped"] += 1  # GQA shape mismatch — expected
+                stats["kv_skipped"] += 1  # kv-head mismatch: only under a GQA ablation
 
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     stats["loaded"] = len(filtered)
