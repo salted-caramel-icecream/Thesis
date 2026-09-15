@@ -429,18 +429,20 @@ suggested batch: --batch-size 128 --accum 8 (= 1024 effective for variant b1; es
                  --grad-checkpointing "[1]" typically allows 256-512
 ```
 
-**B2 needs roughly half the micro-batch.** Its activations cost ~1.9× B1's per
-image (MACs 3.88 G vs 2.03 G at 224²; `env.gib_per_image` scales the estimate
-by that), so the same rows for `--variant b2` are:
+**Other sizes scale the micro-batch by their activation cost** relative to
+B1 (MACs at 224²: B0 0.53 G, B1 2.03 G, B2 3.88 G; `env.gib_per_image`
+applies the ratio, ~0.27× for B0 and ~1.9× for B2). The same rows become:
 
-| GPU | VRAM | `--batch-size` | `--accum` | Notes |
+| GPU | VRAM | B0 `--batch-size` × `--accum` | B2 `--batch-size` × `--accum` | Notes |
 |---|---|---|---|---|
-| RTX 5070 | 12 GB | **64** | **16** | what `--check-env --variant b2` suggests from ~10.3 GB free |
-| RTX 5090 | 32 GB | 256 | 4 | |
-| H100 / H200 / B200 | 80–180 GB | 512–1024 | 2–1 | 1024 × 1 should fit on 80 GB; measure one epoch first |
+| RTX 5070 | 12 GB | **512 × 2** | **64 × 16** | what `--check-env --variant b0` / `b2` suggests from ~10.3 GB free |
+| RTX 5090 | 32 GB | 1024 × 1 | 256 × 4 | |
+| H100 / H200 / B200 | 80–180 GB | 1024 × 1 | 512 × 2 to 1024 × 1 | B2 at 1024 × 1 should fit on 80 GB; measure one epoch first |
 
 Effective batch stays 1024 in every row, so the recipe's LR is unchanged.
-Expect roughly 2× B1's wall clock per epoch.
+Expect roughly ¼ (B0) and 2× (B2) of B1's wall clock per epoch; B0 will be
+data-loader-bound on anything above a 5070, so raise `--num-workers` first.
+B3–B5 follow the same rule (3.3×, 4.8×, 5.6×) but were not sized here.
 
 Three things worth knowing before picking a row:
 

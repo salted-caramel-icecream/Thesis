@@ -168,8 +168,8 @@ def test_unknown_variant_is_rejected():
 
 # --- placement: "last block of stage 4" for ANY depth ----------------------
 
-def test_default_placement_is_the_last_block_of_stage4_for_b1_and_b2():
-    for v, last in (("b1", 1), ("b2", 2)):
+def test_default_placement_is_the_last_block_of_stage4_for_b0_b1_and_b2():
+    for v, last in (("b0", 1), ("b1", 1), ("b2", 2)):
         c = _cli("--variant", v)
         abl = c["model"]["ablation"]
         assert abl["moe_placement"] == [[], [], [], [last]], (v, abl["moe_placement"])
@@ -188,6 +188,7 @@ def test_default_placement_is_the_last_block_of_stage4_for_b1_and_b2():
         assert all(not isinstance(b.mlp, MoEMlp)
                    for st in (model.block1, model.block2, model.block3) for b in st), v
         assert stage4[-1].attn.use_rope and not any(b.attn.use_rope for b in stage4[:-1])
+        assert model.embed_dims == VARIANTS[v]["embed_dims"]
         with torch.no_grad():
             logits, aux = model.eval()(torch.randn(1, 3, 64, 64))
         assert logits.shape == (1, 1000) and aux is not None
@@ -293,7 +294,7 @@ def test_hf_loader_refuses_a_checkpoint_of_another_size():
 def test_batch_suggestion_is_variant_aware():
     assert suggest_micro_batch(10.2, "b1") == (128, 8)        # the shipped default
     assert suggest_micro_batch(10.2, "b2") == (64, 16)        # ~2x activations
-    assert suggest_micro_batch(10.2, "b0")[0] >= 128
+    assert suggest_micro_batch(10.2, "b0") == (512, 2)        # ~0.27x
     scale = [gib_per_image(v) for v in ("b0", "b1", "b2", "b3", "b4", "b5")]
     assert scale == sorted(scale) and gib_per_image("b1") == 0.035
     assert 1.8 <= gib_per_image("b2") / gib_per_image("b1") <= 2.0

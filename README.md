@@ -359,7 +359,8 @@ Orthogonal to all seven: **model size**, `model.variant` / `--variant b2`
 (b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
 pretrained HF checkpoint as one set and rejects a disagreeing explicit value,
 so B2 depths can never load B1 weights. `docs/HPARAMS.md` §1 has the table
-with sources; B2 is ~2× B1 in parameters and activations (see the GPU table).
+with sources; B2 is ~2× B1 in parameters and activations and B0 ~¼ (see the
+GPU table).
 
 Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
@@ -468,9 +469,11 @@ only the memory strategy differs:
 
 Those rows are for B1. **`--variant b2` needs roughly half the micro-batch**
 (~1.9× the activation memory per image): 64 × 16 on 12 GB, 256 × 4 on 32 GB,
-512 × 2 or 1024 × 1 from 80 GB up — still 1024 effective, so the recipe's LR is
-unchanged. `python train.py --check-env --variant b2` computes the suggestion
-from the VRAM actually free; `docs/HPARAMS.md` §5 has the B2 table.
+512 × 2 or 1024 × 1 from 80 GB up. **`--variant b0` needs about a quarter**
+(~0.27×): 512 × 2 on 12 GB, 1024 × 1 from 32 GB up. Effective batch stays 1024
+in every case, so the recipe's LR is unchanged. `python train.py --check-env
+--variant b2` (or `b0`) computes the suggestion from the VRAM actually free;
+`docs/HPARAMS.md` §5 has the per-variant table.
 
 Estimates, not measurements — `python train.py --check-env` computes the same
 suggestion from the VRAM actually free on your box, and `setup_environment`
