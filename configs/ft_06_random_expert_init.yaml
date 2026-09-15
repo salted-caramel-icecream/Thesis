@@ -18,4 +18,4 @@ model:
   seed_moe_from_dense: false
   ablation:
     use_moe: true
-    moe_placement: [[], [], [], [1]]
+    moe_placement: [[], [], [], [-1]]

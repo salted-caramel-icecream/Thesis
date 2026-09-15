@@ -22,7 +22,7 @@ your LR.
 
 | Parameter | Value | Config key | Basis |
 |---|---|---|---|
-| Backbone | PVT v2 B1, depths [2,2,2,2], dims [64,128,320,512] | `model.depths`, `model.embed_dims` | your choice |
+| Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
@@ -45,6 +45,58 @@ your LR.
 | `drop_path_rate` | 0.1 | 0.1 | 0.15 |
 
 Set `model.drop_path_rate` explicitly to override.
+
+### Variants (`model.variant`, `--variant`)
+
+| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo MHA / this repo GQA default | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 / 3.38 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
+| **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 / 12.86 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |
+| b2 | [3,4,6,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 25.4 / 25.36 / 23.13 | 3.88 | 0.1 | — | `OpenGVLab/pvt_v2_b2` | 82.0 |
+| b3 | [3,4,18,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 45.2 / 45.24 / 41.03 | 6.68 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b3` | 83.1 |
+| b4 | [3,8,27,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 62.6 / 62.56 / 56.80 | 9.79 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b4` | 83.6 |
+| b5 | [3,6,40,3] | [64,128,320,512] | [1,2,5,8] | [4,4,4,4] | [8,4,2,1] | 82.0 / 81.96 / 74.10 | 11.35 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b5` | 83.8 |
+
+Sources (the table in `config.VARIANTS` cites the same):
+
+- depths / dims / heads / ratios: [whai362/PVT](https://github.com/whai362/PVT),
+  branch `v2` @ `57e2dfaa5a46f9050d76f306a4fcd9a7c061f520`,
+  `classification/pvt_v2.py` (`pvt_v2_b0` … `pvt_v2_b5`). timm 1.0.29's
+  `timm/models/pvt_v2.py` defines the same sizes identically.
+- official `drop_path` / `clip_grad`: same repo,
+  `classification/configs/pvt_v2/pvt_v2_b*.py` — what each size was trained
+  with in the official 300-epoch recipe.
+- official params and top-1: same repo, README "PVTv2 on ImageNet-1K".
+- HF checkpoints: huggingface/transformers
+  `models/pvt_v2/convert_pvt_v2_to_pytorch.py` and the PvtV2 model doc (the
+  ids the port was converted to). The Hub itself was not reachable from the
+  machine this was verified on; `load_hf_pretrained` refuses any checkpoint
+  whose `depths` / `hidden_sizes` differ from the built model, so a wrong id
+  fails at load, never silently.
+- "this repo" columns: measured with `build_model` (dense, no MoE/RoPE) at
+  224². MACs from `torch.utils.flop_counter` (matmul/conv only, so a few
+  percent under a paper GFLOPs count that includes norms and activations).
+  The paper's own GFLOPs column (arXiv 2106.13797) was not reachable and is
+  not reproduced here. "GQA default" is this repo's `num_kv_heads [1,1,1,2]`,
+  which is not part of the official sizes.
+
+Three rules the code enforces:
+
+- **A variant is one set.** An explicit `model.depths` (or dims / heads /
+  ratios) that disagrees with `model.variant` is rejected, and so is another
+  variant's official checkpoint under `--hf-id`. `--variant custom` hands the
+  architecture to you (unset fields fall back to B1's) and never fills
+  `pretrained_hf_id`.
+- **Placement is depth-independent.** The default `[[],[],[],[-1]]` is the
+  last block of stage 4 whatever the depth (block 1 in B1, block 2 in B2);
+  see §2.
+- **Stochastic depth is still derived by the B1-anchored rule above** (B1 and
+  B2 were both officially trained at 0.1, so the derivation is identical for
+  the two sizes this thesis uses). B3–B5 were trained at 0.3; the derivation
+  does not know that yet and prints the discrepancy — pass `--drop-path 0.3`
+  for those sizes until the rule is made variant-aware.
+
+B2-Linear is not a variant: linear (pooling) attention is `model.linear_attention`.
 
 ### Augmentation — DeiT-1 stack, fixed across all runs
 
@@ -101,7 +153,7 @@ Not applied automatically — pass --lr.
 |---|---|---|---|
 | Experts (N) | 4 | `model.moe.num_experts` | Sweet Spot runs E=4 and 8 on IN-1k; larger counts need more data to avoid overfitting |
 | top-k | 1 | `model.moe.top_k` | Tutel: SwinV2-B is 85.5 at both k=1 and k=2; k=2 costs +25% activated params, ~17% train speed |
-| Placement | stage 4, last layer only — 1 MoE layer | `ablation.moe_placement: [[],[],[],[1]]` | ViMoE's representative config is L=1; Sparse Upcycling finds last-consecutive-layer conversion gives the smallest initial drop |
+| Placement | stage 4, last layer only — 1 MoE layer | `ablation.moe_placement: [[],[],[],[-1]]` (−1 = the stage's last block whatever the variant's depth: block 1 in B1, block 2 in B2) | ViMoE's representative config is L=1; Sparse Upcycling finds last-consecutive-layer conversion gives the smallest initial drop |
 | Shared expert | 1, always-on, added to routed output | `model.moe.shared_expert` | ViMoE 83.9 → 84.2; ScMoE 79.53 vs 78.95 (top-1) |
 | Capacity factor | 1.0 | `model.moe.capacity_factor` | Tutel's default; their Table 12 gives 38.5 @ 892 img/s vs 38.6 @ 839 for f=1.25 |
 | Aux loss coefficient | 0.01 | `loss.aux_weight` | Tutel, ScMoE, ViMoE, Sweet Spot — unanimous |
@@ -269,7 +321,7 @@ A row sets only what the spec's table names for it; everything else comes from
 the recipe and your own flags, and named flags override the row. Rows print a
 `[ladder]` line naming what they set, plus a note wherever the spec left a
 choice open (marked **(choice)** below). Run names self-document
-(`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`) and are distinct across
+(`v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; the variant follows the version, and B2's stage-4 tag reads `s4b2`) and are distinct across
 every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
 enforces that, since a collision would mean two runs sharing a checkpoint
 directory and a W&B run.
@@ -334,7 +386,7 @@ Defaults are sized for a 12 GB card at 224², bf16:
 
 | Key | Value | Why |
 |---|---|---|
-| `batch_size` | 128 | micro-batch; ~0.035 GiB/image for PVT v2 B1 at 224² leaves headroom under the ~10.5 GB free after the desktop |
+| `batch_size` | 128 | micro-batch; ~0.035 GiB/image for PVT v2 B1 at 224² leaves headroom under the ~10.5 GB free after the desktop. **B2 is ~1.9× that per image** — start at 64 × 16 (below) |
 | `accumulate_grad_batches` | 8 | derived, so the effective batch stays 1024 |
 | `val_batch_multiplier` | 2 | val batch 256 — no gradients, so roughly half the memory per image |
 | `num_workers` | 8 | Windows has no `fork()`, so workers **spawn** and each re-imports the module; 4–8 is the sweet spot on 32 GB |
@@ -373,9 +425,22 @@ the same suggestion from the VRAM *actually free on your machine*, which is
 the number to trust:
 
 ```
-suggested batch: --batch-size 128 --accum 8 (= 1024 effective; estimate from 10.3 GiB free)
+suggested batch: --batch-size 128 --accum 8 (= 1024 effective for variant b1; estimate from 10.3 GiB free)
                  --grad-checkpointing "[1]" typically allows 256-512
 ```
+
+**B2 needs roughly half the micro-batch.** Its activations cost ~1.9× B1's per
+image (MACs 3.88 G vs 2.03 G at 224²; `env.gib_per_image` scales the estimate
+by that), so the same rows for `--variant b2` are:
+
+| GPU | VRAM | `--batch-size` | `--accum` | Notes |
+|---|---|---|---|---|
+| RTX 5070 | 12 GB | **64** | **16** | what `--check-env --variant b2` suggests from ~10.3 GB free |
+| RTX 5090 | 32 GB | 256 | 4 | |
+| H100 / H200 / B200 | 80–180 GB | 512–1024 | 2–1 | 1024 × 1 should fit on 80 GB; measure one epoch first |
+
+Effective batch stays 1024 in every row, so the recipe's LR is unchanged.
+Expect roughly 2× B1's wall clock per epoch.
 
 Three things worth knowing before picking a row:
 

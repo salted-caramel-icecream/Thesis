@@ -33,7 +33,7 @@ a config file.
 
 | Variable | Needed for |
 |---|---|
-| `HF_TOKEN` | `recipe: pretrained` (downloads `OpenGVLab/pvt_v2_b1`), and the ImageNet-1k dataset (gated — accept the licence on the HF page first) |
+| `HF_TOKEN` | `recipe: pretrained` (downloads the variant's `OpenGVLab/pvt_v2_b*`, B1 by default), and the ImageNet-1k dataset (gated — accept the licence on the HF page first) |
 | `WANDB_API_KEY` | W&B logging. Without it, pass `--no-wandb` |
 
 ```bash
@@ -192,7 +192,7 @@ key nothing reads.
 
 | | `scratch` | `pretrained` |
 |---|---|---|
-| init | random | `OpenGVLab/pvt_v2_b1` + upcycled experts |
+| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts |
 | epochs | 90 (ladder: 90/150/300) | 100 |
 | peak LR | 1e-3 | 1e-4 |
 | warmup | 5 | 3 |
@@ -203,6 +203,7 @@ key nothing reads.
 
 | What | CLI | Notebook CONFIG cell |
 |---|---|---|
+| model size | `--variant b2` (b0…b5, default b1) | `VARIANT` |
 | recipe | `--recipe scratch\|pretrained` | `RECIPE` |
 | epoch budget | `--epochs 300` | `EPOCHS` |
 | LR / warmup | `--lr 5e-4 --warmup-epochs 10` | `LR`, `WARMUP_EPOCHS` |
@@ -211,7 +212,7 @@ key nothing reads.
 | MoE on/off | `--moe` / `--no-moe` | `ablation.use_moe` |
 | expert count | `--experts 8` | `moe.num_experts` |
 | shared expert | `--shared-expert` / `--no-shared-expert` | `moe.shared_expert` |
-| MoE placement | `--moe-placement "[[],[],[],[1]]"` | `ablation.moe_placement` |
+| MoE placement | `--moe-placement "[[],[],[],[-1]]"` (−1 = last block of the stage, for any variant) | `ablation.moe_placement` |
 | RoPE | `--rope` / `--no-rope` | `ablation.use_rope` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
@@ -333,7 +334,7 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`), so logs stay
+same thing (`v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `v10_b2_in1k_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
 Watch for these lines:

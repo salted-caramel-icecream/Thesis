@@ -37,6 +37,7 @@ from pvt_moe.config import (
     VALID_NORMS,
     VALID_RECIPES,
     VALID_UPCYCLE_INITS,
+    VALID_VARIANTS,
     default_config,
     ladder_overrides,
     merge_config,
@@ -60,12 +61,13 @@ def _bool_pair(parser, name: str, dest: str, help_on: str):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="train.py",
-        description="Train PVT v2 B1 (+MoE) per docs/HPARAMS.md.",
+        description="Train PVT v2 (B1 by default; --variant b0..b5) +MoE per docs/HPARAMS.md.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Unset flags fall back to the recipe (docs/HPARAMS.md).\n"
             "Examples:\n"
             "  python train.py --recipe scratch --epochs 300\n"
+            "  python train.py --variant b2 --recipe pretrained\n"
             "  python train.py --recipe pretrained --lr 5e-5\n"
             "  python train.py --recipe scratch --ladder 4 --dry-run\n"
             "  python train.py --set model.moe.gate_noise=0.0\n"
@@ -75,7 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("recipe & budget")
     g.add_argument("--recipe", choices=VALID_RECIPES, default="scratch",
                    help="scratch = full from-scratch training; pretrained = "
-                        "warm start from OpenGVLab/pvt_v2_b1 (default: scratch)")
+                        "warm start from the variant's OpenGVLab/pvt_v2_b* "
+                        "checkpoint (default: scratch)")
     g.add_argument("--epochs", type=int,
                    help=f"epoch budget. scratch ladder: "
                         f"{'/'.join(map(str, SCRATCH_EPOCH_CHOICES))}; "
@@ -101,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(1-9, docs/HPARAMS.md section 4)")
 
     g = p.add_argument_group("architecture ablations")
+    g.add_argument("--variant", choices=VALID_VARIANTS,
+                   help="official PVT v2 size (default: b1). Sets depths, dims, "
+                        "heads, mlp/sr ratios and the pretrained HF checkpoint "
+                        "as one set; explicit values that disagree are rejected. "
+                        "custom = hand-tune them via --set / a config file")
     g.add_argument("--norm", choices=VALID_NORMS, dest="norm_type")
     _bool_pair(g, "moe", "use_moe", "enable MoE (--no-moe for the dense arm)")
     _bool_pair(g, "rope", "use_rope", "enable RoPE (--no-rope to disable)")
@@ -120,7 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--gate-noise", type=float)
     g.add_argument("--backend", choices=VALID_BACKENDS)
     g.add_argument("--moe-placement", metavar="JSON",
-                   help='per-stage block indices, e.g. "[[],[],[],[1]]"')
+                   help='per-stage block indices; negative counts from the end '
+                        'of the stage, so the default "[[],[],[],[-1]]" is the '
+                        'LAST block of stage 4 for every variant (block 1 in '
+                        'B1, block 2 in B2). "[[],[],[],[0,1]]" = explicit indices')
     g.add_argument("--moe-last-n", type=int, dest="moe_last_n_stages",
                    help="convenience: MoE in all blocks of the last N stages")
     g.add_argument("--rope-placement", metavar="JSON")
@@ -139,7 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="resume model + optimizer + scheduler + epoch from a "
                         "checkpoint and continue the SAME schedule. Implies "
                         "--mode resume; works across machines and runs")
-    g.add_argument("--hf-id", dest="pretrained_hf_id")
+    g.add_argument("--hf-id", dest="pretrained_hf_id",
+                   help="HF checkpoint to warm-start from (default: the variant's "
+                        "official OpenGVLab/pvt_v2_b*). Another variant's official "
+                        "id is rejected; any other id is checked against the "
+                        "model's depths/dims when loaded")
     _bool_pair(g, "seed-experts", "seed_moe_from_dense",
                "replicate the pretrained FFN into each expert "
                "(--no-seed-experts = the random-init control)")
@@ -249,6 +264,7 @@ def _nest(dotted: str, value):
 #: flag dest -> dotted config path. Only entries whose value is not None are
 #: applied, so an unset flag never shadows the recipe.
 _FLAG_PATHS = {
+    "variant": "model.variant",
     "epochs": "epochs",
     "stop_at_epoch": "stop_at_epoch",
     "lr": "optim.lr",
@@ -338,7 +354,7 @@ def build_config(args, verbose: bool = True) -> dict:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as e:
                 raise SystemExit(f"--{dest.replace('_', '-')} must be JSON "
-                                 f"(e.g. '[[],[],[],[1]]'): {e}")
+                                 f"(e.g. '[[],[],[],[-1]]'): {e}")
             cfg = merge_config(cfg, _nest(path, parsed))
 
     for item in args.overrides:
@@ -360,6 +376,7 @@ def describe(cfg: dict) -> str:
     moe, abl = m["moe"], m["ablation"]
     lines = [
         f"run:  {cfg['run_name']}",
+        f"  pvt_v2 {m['variant']} | depths {m['depths']} | dims {m['embed_dims']}",
         f"  {cfg['mode']} | {cfg['epochs']} ep | lr {o['lr']:.2e} "
         f"(warmup {o['warmup_epochs']} ep from "
         f"{o['lr'] * o['warmup_start_factor']:.1e}) | wd {o['weight_decay']} "
@@ -403,8 +420,28 @@ def describe(cfg: dict) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def check_environment() -> int:
+def suggest_micro_batch(free_gib: float, variant: str = "b1") -> tuple:
+    """(micro_batch, accum) reaching 1024 effective from the VRAM free NOW.
+
+    Variant-aware: the per-image figure is B1's measured planning estimate
+    scaled by the variant's activation cost (``env.gib_per_image``), so B2 on
+    the same card is suggested roughly half the micro-batch of B1.
+    """
+    from pvt_moe.engine.env import gib_per_image
+
+    budget = free_gib * 0.7                  # leave room for fragmentation
+    raw = int(budget / gib_per_image(variant))
+    micro = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw),
+                default=16)
+    accum = max(1, 1024 // micro)
+    return micro, accum
+
+
+def check_environment(variant: str = "b1") -> int:
     """Print what this machine can actually run. Returns 0 if trainable.
+
+    ``variant`` only scales the micro-batch suggestion (B2 needs about twice
+    B1's activation memory per image).
 
     The failure this exists to catch: ``pip install torch`` on a box with a
     new GPU happily gives you a wheel whose kernels predate it. Everything
@@ -465,16 +502,11 @@ def check_environment() -> int:
         # Suggest a micro-batch from the VRAM actually free right now, rather
         # than from a table someone has to match their card against. The
         # per-image figure is a PLANNING ESTIMATE for PVT v2 B1 at 224^2 under
-        # bf16 — measure one epoch before trusting it.
-        from pvt_moe.engine.env import _APPROX_GIB_PER_IMAGE
-
-        budget = free * 0.7                      # leave room for fragmentation
-        raw = int(budget / _APPROX_GIB_PER_IMAGE)
-        micro = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw),
-                    default=16)
-        accum = max(1, 1024 // micro)
+        # bf16, scaled per variant — measure one epoch before trusting it.
+        micro, accum = suggest_micro_batch(free, variant)
         print(f"suggested batch: --batch-size {micro} --accum {accum} "
-              f"(= 1024 effective; estimate from {free:.1f} GiB free)")
+              f"(= 1024 effective for variant {variant}; estimate from "
+              f"{free:.1f} GiB free)")
         if micro < 1024:
             print(f"                 --grad-checkpointing \"[1]\" typically allows "
                   f"{micro * 2}-{micro * 4}")
@@ -515,7 +547,7 @@ def check_environment() -> int:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.check_env:
-        return check_environment()
+        return check_environment(args.variant or "b1")
 
     try:
         cfg = build_config(args)

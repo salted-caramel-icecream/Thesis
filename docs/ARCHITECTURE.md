@@ -1,6 +1,8 @@
 # Architecture & invariants
 
-The model is a **custom** PVT v2 B1 — not the stock implementation. Three
+The model is a **custom** PVT v2 (B1 by default; `model.variant` selects
+B0–B5, each an official size with its own checkpoint) — not the stock
+implementation. Three
 modifications distinguish it, and each carries invariants that must not be
 broken by future edits.
 
@@ -211,7 +213,7 @@ reads low by construction; report `val_acc`.
 
 - v9 lineage (Tutel MoE stage 4, HF-pretrained, full FT, discriminative LR):
   **72.27%** val top-1 @ epoch 53 (ImageNet-1k, B200, batch 1024).
-- PVT v2 B1 official supervised baseline: 78.7% (300-epoch recipe) — the gap
+- PVT v2 official supervised baselines: B1 78.7%, B2 82.0% (300-epoch recipe) — the gap
   is expected at these epoch budgets; compare ablations against each other,
   not against the official number.
 - Throughput anchor (A100, batch 128): ~468 img/s ≈ 47 min/epoch on full

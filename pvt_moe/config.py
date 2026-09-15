@@ -13,7 +13,7 @@ Typical use::
 
     cfg = merge_config(default_config(), {
         "model": {"norm_type": "rmsnorm",
-                  "ablation": {"moe_placement": [[], [], [], [1]]}},
+                  "ablation": {"moe_placement": [[], [], [], [-1]]}},
         "dataset": {"name": "imagenet-1k"},
     })
     cfg = validate_config(cfg)   # derives num_classes, run_name, placements
@@ -64,6 +64,57 @@ VALID_UPCYCLE_INITS = ("routed_zero", "shared_zero", "none")
 #: 90 = ablation runs, 300 = final run (PVT v2's own recipe); 150 is the
 #: middle budget. Other values are allowed but are off-ladder.
 SCRATCH_EPOCH_CHOICES = (90, 150, 300)
+
+#: Official PVT v2 sizes. Every value below was read from the official
+#: implementation, not inferred:
+#:
+#:   depths / embed_dims / num_heads / mlp_ratios / sr_ratios —
+#:     github.com/whai362/PVT, branch ``v2`` @ 57e2dfaa5a46f9050d76f306a4fcd9a7c061f520,
+#:     ``classification/pvt_v2.py`` (``pvt_v2_b0`` .. ``pvt_v2_b5``). timm 1.0.29
+#:     ``timm/models/pvt_v2.py`` defines the same seven sizes identically.
+#:   drop_path / clip_grad (the values the official 300-epoch recipe trained
+#:     each size with) — same repo, ``classification/configs/pvt_v2/pvt_v2_b*.py``.
+#:   params_m / top1 — same repo, README "PVTv2 on ImageNet-1K" table.
+#:   hf_id — huggingface/transformers ``models/pvt_v2/convert_pvt_v2_to_pytorch.py``
+#:     and ``docs/source/en/model_doc/pvt_v2.md`` (the checkpoints the HF port
+#:     was converted to). ``OpenGVLab/pvt_v2_b2_linear`` (B2-Li) is not listed
+#:     because linear attention is a separate flag here (``linear_attention``).
+#:
+#: A named variant fills the ``None`` architecture fields of ``_DEFAULT["model"]``
+#: as ONE set and rejects any explicit value that disagrees (``apply_variant``),
+#: so it is impossible to build B2 depths and load B1 weights into them.
+VARIANTS = {
+    "b0": {"depths": [2, 2, 2, 2],   "embed_dims": [32, 64, 160, 256],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 3.7,  "top1": 70.5,
+           "hf_id": "OpenGVLab/pvt_v2_b0"},
+    "b1": {"depths": [2, 2, 2, 2],   "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 14.0, "top1": 78.7,
+           "hf_id": "OpenGVLab/pvt_v2_b1"},
+    "b2": {"depths": [3, 4, 6, 3],   "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 25.4, "top1": 82.0,
+           "hf_id": "OpenGVLab/pvt_v2_b2"},
+    "b3": {"depths": [3, 4, 18, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 45.2, "top1": 83.1,
+           "hf_id": "OpenGVLab/pvt_v2_b3"},
+    "b4": {"depths": [3, 8, 27, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 62.6, "top1": 83.6,
+           "hf_id": "OpenGVLab/pvt_v2_b4"},
+    "b5": {"depths": [3, 6, 40, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [4, 4, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 82.0, "top1": 83.8,
+           "hf_id": "OpenGVLab/pvt_v2_b5"},
+}
+#: The architecture fields a variant owns, in the order they are reported.
+VARIANT_ARCH_KEYS = ("depths", "embed_dims", "num_heads", "mlp_ratios", "sr_ratios")
+#: ``"custom"`` leaves the architecture to you: fields you set are kept, fields
+#: you leave as None fall back to B1's, and ``pretrained_hf_id`` is never
+#: filled in (a custom architecture has no official checkpoint).
+VALID_VARIANTS = tuple(VARIANTS) + ("custom",)
 
 #: Batch size the recipes' peak LRs are calibrated for (PVT v2: 1e-3 @ 1024).
 #: Only the EFFECTIVE batch matters here — micro-batch is a memory choice.
@@ -142,7 +193,8 @@ _DEFAULT: dict = {
     "version": "v10",
     # Which recipe fills the fields left as None below (see RECIPES).
     #   "scratch"    - full from-scratch training, PVT v2 recipe
-    #   "pretrained" - warm start from OpenGVLab/pvt_v2_b1 + upcycled experts
+    #   "pretrained" - warm start from the variant's OpenGVLab/pvt_v2_b*
+    #                  checkpoint + upcycled experts
     # Setting `recipe` also sets `mode` unless you set `mode` yourself.
     "recipe": "scratch",
     # Derived by validate_config() from the ablation flags when left as None.
@@ -153,7 +205,7 @@ _DEFAULT: dict = {
     "deterministic": False,
     # How the model weights are initialized / training is started:
     #   scratch       - random init
-    #   hf_pretrained - load OpenGVLab/pvt_v2_b1 via key remap (+ MoE expert
+    #   hf_pretrained - load OpenGVLab/pvt_v2_b<variant> via key remap (+ MoE expert
     #                   seeding from the dense FFN when use_moe)
     #   ssl_init      - load a JEPA-pretrained backbone checkpoint
     #   resume        - full Lightning resume (model+optimizer+scheduler) from
@@ -226,16 +278,23 @@ _DEFAULT: dict = {
 
     "model": {
         "in_chans": 3,
-        # PVT v2 B1 sizing.
-        "embed_dims": [64, 128, 320, 512],
-        "num_heads": [1, 2, 5, 8],
+        # Which official PVT v2 size to build: "b0".."b5" (VARIANTS) or
+        # "custom". A named variant fills every None architecture field below
+        # as ONE coherent set — depths, dims, heads, mlp/sr ratios AND
+        # pretrained_hf_id — and rejects an explicit value that disagrees, so
+        # B2 depths can never be paired with B1 weights. Default b1: the
+        # resolved config is byte-for-byte what it was before variants existed.
+        "variant": "b1",
+        "embed_dims": None,               # b1: [64, 128, 320, 512]
+        "num_heads": None,                # b1: [1, 2, 5, 8]
         # Grouped-query attention: kv heads per stage (equal to num_heads =>
         # standard MHA). Defaults (v9 lineage): stage 1 MHA, stages 2-3 MQA
-        # (1 kv head), stage 4 8:2 GQA.
+        # (1 kv head), stage 4 8:2 GQA. This repo's own choice, so it is NOT
+        # part of the variant table (every size has heads [1, 2, 5, 8]).
         "num_kv_heads": [1, 1, 1, 2],
-        "mlp_ratios": [8, 8, 4, 4],
-        "depths": [2, 2, 2, 2],
-        "sr_ratios": [8, 4, 2, 1],
+        "mlp_ratios": None,               # b1: [8, 8, 4, 4]
+        "depths": None,                   # b1: [2, 2, 2, 2]
+        "sr_ratios": None,                # b1: [8, 4, 2, 1]
         "linear_attention": False,        # PVTv2-li pooling attention variant
         "qkv_bias": True,
         "drop_rate": 0.0,
@@ -270,19 +329,23 @@ _DEFAULT: dict = {
         # --- Placement ablations -------------------------------------------
         "ablation": {
             "use_moe": True,
-            # Per-stage list of block indices. [[], [], [], [0, 1]] == MoE in
-            # both blocks of stage 4 (the v9 configuration).
+            # Per-stage list of block indices. Negative indices count from the
+            # end of the stage (Python style), so -1 is "the last block"
+            # whatever the variant's depth: stage 4 has 2 blocks in B1 and 3 in
+            # B2, and a literal 1 would be the LAST block of one and the MIDDLE
+            # block of the other. [[], [], [], [0, 1]] == MoE in both blocks
+            # of stage 4 (the v9 configuration).
             # Stage 4, LAST block only — one MoE layer. Sparse Upcycling finds
             # last-consecutive-layer conversion gives the smallest initial
             # performance drop; ViMoE's representative config is L=1.
-            "moe_placement": [[], [], [], [1]],
+            "moe_placement": [[], [], [], [-1]],
             # Convenience: when not None, overrides moe_placement with
             # "all blocks of the last N stages".
             "moe_last_n_stages": None,
             "use_rope": True,
             # Matched to moe_placement by default: RoPE reinjects the position
             # the routed branch drops.
-            "rope_placement": [[], [], [], [1]],
+            "rope_placement": [[], [], [], [-1]],
             "rope_last_n_stages": None,
             "rope_theta": 50.0,           # 50 suits the 7x7 stage-4 grid
         },
@@ -332,7 +395,10 @@ _DEFAULT: dict = {
             "upcycle_init": None,
         },
 
-        "pretrained_hf_id": "OpenGVLab/pvt_v2_b1",
+        # None => the selected variant's official checkpoint (VARIANTS[..]["hf_id"],
+        # b1: OpenGVLab/pvt_v2_b1). Set it only for a checkpoint of your own;
+        # naming another variant's official id is rejected.
+        "pretrained_hf_id": None,
         # Seed MoE experts from the dense HF FFN weights (sparse upcycling).
         "seed_moe_from_dense": True,
         "num_frozen_stages": 0,
@@ -379,7 +445,7 @@ def merge_config(base: dict, override: dict) -> dict:
     """Deep-merge ``override`` into a copy of ``base`` and return it.
 
     Dict values merge recursively; everything else (including lists) replaces
-    wholesale, so ``{"ablation": {"moe_placement": [[], [], [], [1]]}}``
+    wholesale, so ``{"ablation": {"moe_placement": [[], [], [], [-1]]}}``
     swaps the full placement list.
     """
     out = copy.deepcopy(base)
@@ -395,8 +461,11 @@ def resolve_placement(placement, last_n, depths):
     """Resolve a per-stage/per-block placement specification.
 
     ``placement`` is the authoritative form: a list (length = num stages) of
-    lists of block indices. ``last_n`` is a convenience that, when not None,
-    generates "all blocks of the last N stages".
+    lists of block indices. A negative index counts from the end of the stage
+    (``-1`` = last block), which is how "last block of stage 4" stays correct
+    across variants of different depth; the resolved form is always
+    non-negative. ``last_n`` is a convenience that, when not None, generates
+    "all blocks of the last N stages".
     """
     num_stages = len(depths)
     if last_n is not None:
@@ -412,13 +481,17 @@ def resolve_placement(placement, last_n, depths):
         )
     resolved = []
     for i, blocks in enumerate(placement):
-        blocks = sorted(set(int(b) for b in blocks))
+        normalized = set()
         for b in blocks:
-            if not 0 <= b < depths[i]:
+            b = int(b)
+            if not -depths[i] <= b < depths[i]:
                 raise ValueError(
-                    f"placement stage {i}: block index {b} out of range (depth {depths[i]})"
+                    f"placement stage {i + 1}: block index {b} out of range "
+                    f"(depth {depths[i]}: valid 0..{depths[i] - 1}, or "
+                    f"-1..-{depths[i]} counting from the last block)"
                 )
-        resolved.append(blocks)
+            normalized.add(b % depths[i])
+        resolved.append(sorted(normalized))
     return resolved
 
 
@@ -438,9 +511,14 @@ def _placement_tag(placement, depths) -> str:
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
-    Example: ``v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+    Example: ``v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+
+    The variant sits right after the version: two sizes in one W&B project
+    are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
+    checkpoint directory.
     """
     ds = {"imagenet-1k": "in1k", "imagenet-22k": "in22k"}[cfg["dataset"]["name"]]
+    variant = cfg["model"]["variant"]
     abl = cfg["model"]["ablation"]
     depths = cfg["model"]["depths"]
 
@@ -499,7 +577,7 @@ def build_run_tag(cfg: dict) -> str:
     budget = {"scratch": "scratch", "pretrained": "ft"}.get(cfg.get("recipe"), "run")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
-    return f"{cfg['version']}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
+    return f"{cfg['version']}_{variant}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
 
 
 # ---------------------------------------------------------------------------
@@ -525,11 +603,11 @@ LADDERS = {
         3: {"_desc": "MoE, no shared", "epochs": 90,
             "model": {"moe": {"num_experts": 4, "shared_expert": False},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         4: {"_desc": "MoE + shared", "epochs": 90,
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         5: {"_desc": "Final, best config", "epochs": 300,
             "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
                      "only; carry the winning architecture flags yourself."},
@@ -539,23 +617,23 @@ LADDERS = {
         7: {"_desc": "N=8, last stage", "epochs": 90,
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         8: {"_desc": "N=4, stages 3 & 4", "epochs": 90,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
                      "--rope-placement to decouple the two axes.",
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
         9: {"_desc": "N=8, stages 3 & 4", "epochs": 90,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
                      "--rope-placement to decouple the two axes.",
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
     },
     "pretrained": {
         1: {"_desc": "Pretrained PVT v2 B1, eval only", "epochs": 0,
@@ -571,12 +649,12 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": False},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         4: {"_desc": "MoE upcycled + shared", "epochs": 100,
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         5: {"_desc": "Final, best config", "epochs": 300,
             "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
                      "only; carry the winning architecture flags yourself."},
@@ -584,14 +662,14 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": False,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}},
+                                   "moe_placement": [[], [], [], [-1]]}},
             "_note": "seed_moe_from_dense=False — this row IS the upcycling "
                      "claim (replicated vs random expert init)."},
         7: {"_desc": "N=8, last stage", "epochs": 100,
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         8: {"_desc": "N=4, stages 3 & 4", "epochs": 100,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
@@ -599,8 +677,8 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
         9: {"_desc": "N=8, stages 3 & 4", "epochs": 100,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
@@ -608,8 +686,8 @@ LADDERS = {
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
     },
 }
 
@@ -631,6 +709,64 @@ def ladder_overrides(recipe: str, row: int) -> tuple:
     desc = entry.pop("_desc", "")
     note = entry.pop("_note", "")
     return entry, desc, note
+
+
+def apply_variant(cfg: dict) -> list:
+    """Resolve ``model.variant`` into the architecture fields, as ONE set.
+
+    A named variant (``VARIANTS``) fills every architecture field still None
+    and REJECTS any explicit value that disagrees with it: the failure this
+    prevents is a config carrying B2 depths under variant b1 (or the other way
+    round) and then loading B1 weights into it. ``pretrained_hf_id`` follows
+    the same rule — None becomes the variant's official checkpoint, another
+    variant's official id is rejected, anything else (a checkpoint of your
+    own) is kept.
+
+    ``"custom"`` keeps whatever you set, falls back to B1's values for fields
+    left None, and never fills ``pretrained_hf_id``.
+
+    Returns the list of filled field paths. Called by ``validate_config``.
+    """
+    model = cfg["model"]
+    variant = model.get("variant")
+    if variant not in VALID_VARIANTS:
+        raise ValueError(
+            f"model.variant must be one of {VALID_VARIANTS}, got {variant!r}"
+        )
+    spec = VARIANTS["b1"] if variant == "custom" else VARIANTS[variant]
+
+    filled = []
+    for key in VARIANT_ARCH_KEYS:
+        if model.get(key) is None:
+            model[key] = list(spec[key])
+            filled.append(f"model.{key}")
+        elif variant != "custom" and list(model[key]) != list(spec[key]):
+            raise ValueError(
+                f"model.{key} {list(model[key])} disagrees with model.variant "
+                f"{variant!r} ({list(spec[key])}). A variant sets depths, dims, "
+                f"heads, ratios and the pretrained checkpoint together; pick the "
+                f"variant that has these values, or model.variant: custom to "
+                f"hand-tune the architecture (no official checkpoint then)."
+            )
+
+    hf_id = model.get("pretrained_hf_id")
+    if variant == "custom":
+        pass                                  # never filled; yours to set
+    elif hf_id is None:
+        model["pretrained_hf_id"] = spec["hf_id"]
+        filled.append("model.pretrained_hf_id")
+    elif hf_id != spec["hf_id"]:
+        other = next((v for v, sp in VARIANTS.items() if sp["hf_id"] == hf_id), None)
+        if other is not None:
+            raise ValueError(
+                f"model.pretrained_hf_id {hf_id!r} is the official {other} "
+                f"checkpoint but model.variant is {variant!r}; its weights do "
+                f"not fit this architecture. Use --variant {other}, or leave "
+                f"pretrained_hf_id unset to get {spec['hf_id']!r}."
+            )
+        # A non-official id (your own fine-tuned upload) is accepted here;
+        # load_hf_pretrained checks its depths/dims against the model.
+    return filled
 
 
 def _fill_none(dst: dict, src: dict) -> list:
@@ -699,9 +835,17 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         )
 
     # Stochastic depth for from-scratch runs scales with the epoch budget.
+    # The derivation is anchored on B1's official 0.1 (identical for B0-B2);
+    # B3-B5 were officially trained at 0.3, which this rule does not know.
     if cfg["model"].get("drop_path_rate") is None:
         cfg["model"]["drop_path_rate"] = scratch_drop_path(cfg["epochs"])
         filled.append("model.drop_path_rate")
+        official = VARIANTS.get(cfg["model"]["variant"], {}).get("drop_path")
+        if official is not None and official != VARIANTS["b1"]["drop_path"]:
+            print(f"[config] model.drop_path_rate derived as "
+                  f"{cfg['model']['drop_path_rate']} (B1-anchored rule); the "
+                  f"official PVT v2 {cfg['model']['variant']} recipe used "
+                  f"{official}. Pass --drop-path {official} to match it.")
 
     # Warmup starts at an absolute 1e-6, not at lr * 1e-6.
     optim = cfg["optim"]
@@ -805,6 +949,8 @@ def validate_config(cfg: dict) -> dict:
 
     - rejects unknown keys (``assert_known_keys``) — a typo must not silently
       become a new key that nothing reads
+    - resolves ``model.variant`` into depths / dims / heads / ratios /
+      pretrained_hf_id as one set, rejecting disagreements (``apply_variant``)
     - applies the recipe preset to every field left as None (``apply_recipe``)
     - checks enum fields (mode / norm_type / backend / dataset name)
     - derives dataset.num_classes from dataset.name
@@ -813,6 +959,7 @@ def validate_config(cfg: dict) -> dict:
     - asserts JSON-serializability
     """
     assert_known_keys(cfg)
+    apply_variant(cfg)
     apply_recipe(cfg)
 
     if cfg["mode"] not in VALID_MODES:

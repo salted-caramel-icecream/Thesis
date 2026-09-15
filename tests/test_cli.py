@@ -141,7 +141,8 @@ def test_last_n_convenience_flags():
 # --- --set escape hatch ----------------------------------------------------
 
 def test_set_parses_json_values():
-    c = _cfg("--set", "model.moe.gate_noise=0.0",
+    c = _cfg("--variant", "custom",
+             "--set", "model.moe.gate_noise=0.0",
              "--set", "model.moe.num_experts=16",
              "--set", "deterministic=true",
              "--set", "model.embed_dims=[16,32,48,64]")

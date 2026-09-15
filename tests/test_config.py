@@ -17,7 +17,7 @@ from pvt_moe.config import (
 def test_default_config_validates():
     cfg = validate_config(default_config())
     assert cfg["dataset"]["num_classes"] == 1000
-    assert cfg["run_name"] == "v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
+    assert cfg["run_name"] == "v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
     assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
 
 
@@ -61,7 +61,7 @@ def test_run_tag_variants():
         "model": {"norm_type": "rmsnorm",
                   "ablation": {"use_moe": False, "use_rope": False}},
     })
-    assert build_run_tag(validate_config(cfg)) == "v10_in1k_dense_norope_rms_scratch90"
+    assert build_run_tag(validate_config(cfg)) == "v10_b1_in1k_dense_norope_rms_scratch90"
 
     cfg2 = merge_config(default_config(), {
         "model": {"ablation": {"moe_placement": [[], [], [1], [0, 1]]},
@@ -93,7 +93,8 @@ def test_mode_validation():
 def test_rope_head_dim_check():
     cfg = merge_config(default_config(), {
         # stage-4 head_dim = 510/6 = 85 -> not divisible by 4 -> must raise
-        "model": {"embed_dims": [64, 128, 320, 510], "num_heads": [1, 2, 5, 6],
+        "model": {"variant": "custom",
+                  "embed_dims": [64, 128, 320, 510], "num_heads": [1, 2, 5, 6],
                   "num_kv_heads": [1, 1, 1, 2]},
     })
     try:
@@ -108,4 +109,4 @@ def test_merge_replaces_lists_wholesale():
         "model": {"ablation": {"moe_placement": [[], [], [], [1]]}}
     })
     assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
-    assert cfg["model"]["embed_dims"] == [64, 128, 320, 512]  # untouched
+    assert cfg["model"]["num_kv_heads"] == [1, 1, 1, 2]  # untouched

@@ -1,6 +1,7 @@
 # PVT v2 + MoE — thesis ablation framework (v10)
 
-PVT v2 B1 image classifier with configurable Mixture-of-Experts, trained on
+PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
+official size) with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
 lineage. The two source notebooks are kept untouched in the repo root for
 provenance — see `docs/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
@@ -281,6 +282,7 @@ python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no t
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
+python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
 python train.py --backend native                       # no-Tutel fallback
 python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
 python train.py --no-moe-dwconv --rope                 # position-encoding arm
@@ -346,25 +348,32 @@ directly, and prints the equivalent command line.
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2 (+GQA) |
-| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[1]]` is stage 4's last block only. Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
+| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
 | 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 | 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
+Orthogonal to all seven: **model size**, `model.variant` / `--variant b2`
+(b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
+pretrained HF checkpoint as one set and rejects a disagreeing explicit value,
+so B2 depths can never load B1 weights. `docs/HPARAMS.md` §1 has the table
+with sources; B2 is ~2× B1 in parameters and activations (see the GPU table).
+
 Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-    └──────────────────────────────────── dataset
-    │        └─────────────────────────── stage 4, block 1
-    │        │    └────────────────────── 4 experts, top-1
-    │        │    │   └────────────────── shared expert
-    │        │    │   │   └────────────── RoPE placement
-    │        │    │   │   │         └──── norm
-    │        │    │   │   │         │  └─ recipe + epoch budget
+v10_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+    └─────────────────────────────────────────────── variant (b0…b5; a B2 run is v10_b2_…)
+    │  └──────────────────────────────────────────── dataset
+    │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+    │  │        │    └────────────────────────────── 4 experts, top-1
+    │  │        │    │   └────────────────────────── shared expert
+    │  │        │    │   │   └────────────────────── RoPE placement
+    │  │        │    │   │   │         └──────────── norm
+    │  │        │    │   │   │         │  └───────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
@@ -457,6 +466,12 @@ only the memory strategy differs:
 | H200 | 141 GB | 1024 | 1 | 16–32 |
 | B200 | 180 GB | 1024 | 1 | 16–32 |
 
+Those rows are for B1. **`--variant b2` needs roughly half the micro-batch**
+(~1.9× the activation memory per image): 64 × 16 on 12 GB, 256 × 4 on 32 GB,
+512 × 2 or 1024 × 1 from 80 GB up — still 1024 effective, so the recipe's LR is
+unchanged. `python train.py --check-env --variant b2` computes the suggestion
+from the VRAM actually free; `docs/HPARAMS.md` §5 has the B2 table.
+
 Estimates, not measurements — `python train.py --check-env` computes the same
 suggestion from the VRAM actually free on your box, and `setup_environment`
 warns before training if the micro-batch looks too large rather than OOM-ing
@@ -487,7 +502,7 @@ instructions instead of silently re-downloading ~160 GB.
 
 | mode | What happens |
 |------|--------------|
-| `hf_pretrained` | remap `OpenGVLab/pvt_v2_b1` (kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling) |
+| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |

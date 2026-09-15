@@ -18,5 +18,5 @@ model:
   seed_moe_from_dense: true
   ablation:
     use_moe: true
-    moe_placement: [[], [], [1], [1]]
-    rope_placement: [[], [], [1], [1]]
+    moe_placement: [[], [], [-1], [-1]]
+    rope_placement: [[], [], [-1], [-1]]

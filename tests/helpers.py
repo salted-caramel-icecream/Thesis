@@ -26,6 +26,7 @@ def tiny_config(**overrides) -> dict:
             "num_workers": 0,
             "epochs": 4,
             "model": {
+                "variant": "custom",            # hand-tuned tiny architecture
                 # head_dims [16, 16, 12, 16] — all divisible by 4 (RoPE-safe)
                 "embed_dims": [16, 32, 48, 64],
                 "num_heads": [1, 2, 4, 4],

@@ -2,7 +2,7 @@
 
 Three entry points:
 
-- ``load_hf_pretrained(model, hf_id, ...)`` — load ``OpenGVLab/pvt_v2_b1``
+- ``load_hf_pretrained(model, hf_id, ...)`` — load ``OpenGVLab/pvt_v2_b*``
   (or any HF PVT v2) into our backbone: remaps HF key names, fuses the HF
   key/value projections into our ``attn.kv`` layout, skips the dense FFN of
   MoE blocks, and optionally seeds MoE experts from those skipped dense
@@ -82,6 +82,28 @@ _HF_KV_RE = re.compile(
 )
 
 
+def _assert_hf_architecture_matches(model, hf_config, hf_model_id: str) -> None:
+    """Refuse a checkpoint whose depths/widths differ from the built model.
+
+    ``load_state_dict(strict=False)`` would otherwise load the blocks that
+    exist in both and silently leave the rest at random init — exactly the
+    "B2 depths with B1 weights" run this guard exists to make impossible.
+    Compared: ``depths`` and ``hidden_sizes`` (the HF PvtV2Config names).
+    """
+    want = {"depths": [int(d) for d in getattr(model, "depths", [])],
+            "embed_dims": [int(d) for d in getattr(model, "embed_dims", [])]}
+    have = {"depths": [int(d) for d in getattr(hf_config, "depths", [])],
+            "embed_dims": [int(d) for d in getattr(hf_config, "hidden_sizes", [])]}
+    bad = [k for k in want if want[k] and have[k] and want[k] != have[k]]
+    if bad:
+        detail = "; ".join(f"{k}: model {want[k]} vs checkpoint {have[k]}" for k in bad)
+        raise ValueError(
+            f"pretrained checkpoint {hf_model_id!r} does not fit this model "
+            f"({detail}). Pick the --variant whose architecture matches the "
+            f"checkpoint, or the checkpoint that matches the variant."
+        )
+
+
 def load_hf_pretrained(
     model: nn.Module,
     hf_model_id: str = "OpenGVLab/pvt_v2_b1",
@@ -105,7 +127,9 @@ def load_hf_pretrained(
     """
     from transformers import AutoModelForImageClassification  # lazy
 
-    hf_state = AutoModelForImageClassification.from_pretrained(hf_model_id).state_dict()
+    hf_model = AutoModelForImageClassification.from_pretrained(hf_model_id)
+    _assert_hf_architecture_matches(model, hf_model.config, hf_model_id)
+    hf_state = hf_model.state_dict()
     model_state = model.state_dict()
 
     moe_placement = getattr(model, "moe_placement", [[] for _ in range(4)])
