@@ -21,6 +21,7 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming)
                 NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
                 JEPA_GUIDE.md (SSL recipe)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py)
+download_data.py  build the ImageNet Arrow snapshot (checks licence/disk first)
 ```
 
 ## Setting up a GPU box from scratch
@@ -117,12 +118,19 @@ setx HF_TOKEN "hf_..."          # Windows — then open a NEW terminal
 setx WANDB_API_KEY "..."
 ```
 
-Build the ImageNet Arrow snapshot once (~160 GB for 1k) and point at it —
-`docs/GUIDE.md` §2 has the script:
+Accept the licence at <https://huggingface.co/datasets/ILSVRC/imagenet-1k>,
+then build the Arrow snapshot once:
 
 ```bash
+python download_data.py --out /data/imagenet_arrow     # or D:/data/... on Windows
 python train.py --data-dir /data/imagenet_arrow --checkpoint-dir /data/runs ...
 ```
+
+The snapshot settles at ~160 GB but needs **~320 GB free to build** —
+`datasets` keeps the raw download and the Arrow cache at the same time.
+`download_data.py` checks the licence, token and free space before starting,
+so a 2–3 hour build fails in the first second rather than the last. Run it
+under `tmux` on a remote box. `docs/GUIDE.md` §2 has the detail.
 
 ### 6. Gate, smoke-test, then train
 
@@ -440,8 +448,12 @@ RTX 5070, so a 90-epoch ablation run is 3–6 days and the 8-run ladder is
 
 ## Datasets
 
-ImageNet-1k as Arrow is ~160 GB; **ImageNet-22k is ~1.3 TB and will not fit a
-579 GB disk**. Arrow snapshots are expected at the paths in
+Build with `python download_data.py --out DIR` (checks licence, token and disk
+first). ImageNet-1k as Arrow is ~160 GB, **~320 GB to build**; ImageNet-22k is
+~1.3 TB and ~2.6 TB to build, so it will not fit a 579 GB disk. The dataset id
+must be the full `namespace/name` (`ILSVRC/imagenet-1k`) — a bare name is
+rejected by current `huggingface_hub`. Arrow snapshots are expected at the
+paths in
 `config.dataset.arrow_dirs` (map-style `load_from_disk`; **never**
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.

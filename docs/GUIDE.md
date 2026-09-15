@@ -63,28 +63,89 @@ prompt for W&B if the variable is unset; the CLI never prompts.
 The pipeline expects a **map-style HF Arrow snapshot** (`load_from_disk`).
 `streaming=True` was tried and measured much slower, so it is not supported.
 
-Build the snapshot once:
+### Prerequisites
+
+1. **Accept the licence** at
+   <https://huggingface.co/datasets/ILSVRC/imagenet-1k> — a short
+   click-through form, usually approved quickly. Any HF account works; no
+   institutional email required.
+2. **Set your token:**
+
+   ```bash
+   export HF_TOKEN=hf_...          # Linux / macOS / WSL2
+   ```
+   ```powershell
+   setx HF_TOKEN "hf_..."          # Windows — then open a NEW terminal
+   ```
+
+3. **Budget the disk.** The snapshot settles at ~160 GB, but `datasets` keeps
+   **both** the raw download and the converted Arrow cache while it works —
+   so budget **~320 GB free** for the build. Delete the `downloads/` subfolder
+   of the HF cache once the snapshot is written to reclaim the difference.
+
+### Build the snapshot once
+
+```bash
+python download_data.py --out /data/imagenet_arrow        # Linux / macOS / WSL2
+python download_data.py --out D:/data/imagenet_arrow      # Windows
+```
+
+`download_data.py` checks the licence/token and the free space on the drive
+that will actually hold the download **before** starting, so a 2–3 hour build
+fails in the first second rather than the last. It is a script rather than a
+snippet to paste for the same reason: on a remote box, run it detached so a
+dropped connection cannot kill it.
+
+```bash
+tmux new -s dataprep
+python download_data.py --out /data/imagenet_arrow
+#   Ctrl-B then D to detach;  tmux attach -t dataprep  to return
+```
+
+Equivalent by hand, if you would rather:
 
 ```python
 from datasets import load_dataset
-d = load_dataset("imagenet-1k")             # needs HF_TOKEN + accepted licence
-d.save_to_disk("D:/data/imagenet_arrow")    # ~160 GB for 1k
+d = load_dataset("ILSVRC/imagenet-1k")      # needs HF_TOKEN + accepted licence
+d.save_to_disk("/data/imagenet_arrow")      # or "D:/data/imagenet_arrow"
 ```
 
-Then point the code at it:
+The dataset id **must** be the full `namespace/name`. A bare `"imagenet-1k"`
+is rejected by current `huggingface_hub` with
+`HfUriError: Repository id must be 'namespace/name'`. The id is identical on
+every platform; only the output path differs.
+
+If the OS drive is small but a data drive is not, put the transient cache on
+the big one:
 
 ```bash
-python train.py --data-dir D:/data/imagenet_arrow
+python download_data.py --out D:/data/imagenet_arrow --hf-cache D:/hf_cache
+```
+
+### Point the code at it
+
+```bash
+python train.py --data-dir /data/imagenet_arrow           # Linux / macOS / WSL2
+python train.py --data-dir D:/data/imagenet_arrow         # Windows
 ```
 
 ```python
-DATA_DIR = "D:/data/imagenet_arrow"         # notebook CONFIG cell
+DATA_DIR = "/data/imagenet_arrow"           # notebook CONFIG cell (adjust per OS)
 ```
 
-or set it once in the config so you never pass the flag:
+Or set it once in a config so you never pass the flag:
 
 ```yaml
-# configs/my_paths.yaml
+# configs/my_paths.yaml  —  Linux / macOS / WSL2
+dataset:
+  arrow_dirs:
+    imagenet-1k: "/data/imagenet_arrow"
+checkpoint_root: "/data/runs/checkpoints"
+log_root: "/data/runs/logs"
+```
+
+```yaml
+# configs/my_paths.yaml  —  Windows
 dataset:
   arrow_dirs:
     imagenet-1k: "D:/data/imagenet_arrow"
@@ -96,9 +157,18 @@ log_root: "D:/runs/logs"
 python train.py --config configs/my_paths.yaml --recipe scratch
 ```
 
+`D:` is only an example — substitute your own drive.
+`Get-PSDrive -PSProvider FileSystem` lists them with free space. Keep
+per-machine path configs **out of version control**, or as one file per
+machine, so a Windows path never lands on a Linux box and vice versa.
+
 A missing snapshot raises with these instructions rather than silently
-re-downloading 160 GB. **ImageNet-22k is ~1.3 TB** and will not fit a 579 GB
-disk.
+re-downloading 160 GB.
+
+### ImageNet-22k
+
+~1.3 TB, and ~2.6 TB to build. Check free space against the real figure before
+starting — it will not fit a 579 GB disk.
 
 ---
 

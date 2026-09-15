@@ -126,21 +126,28 @@ class HFImageDataset(Dataset):
 
 def build_datasets(cfg: dict):
     """Load the Arrow snapshot for ``cfg.dataset.name`` -> (train_ds, val_ds)."""
-    from datasets import DatasetDict  # lazy — heavy import
-
     ds_cfg = cfg["dataset"]
     arrow_dir = ds_cfg["arrow_dirs"][ds_cfg["name"]]
+    # Check the path BEFORE the heavy import: a missing snapshot should say so,
+    # not surface as ModuleNotFoundError on a box where `datasets` is absent.
     if not os.path.isdir(arrow_dir):
         raise FileNotFoundError(
             f"No Arrow snapshot at {arrow_dir} for {ds_cfg['name']}.\n"
             "Deliberate: automatic rebuilds are disabled (a rebuild downloads/"
-            "writes ~160 GB for 1k, and roughly 1.3 TB for 22k — check free "
-            "space before starting the 22k build). Build it once:\n"
+            "writes ~160 GB for 1k, and roughly 1.3 TB for 22k — and needs "
+            "about TWICE that free while building, since `datasets` keeps the "
+            "raw download and the Arrow cache at once). Build it once:\n"
+            f"  python download_data.py --out {arrow_dir}\n"
+            "which checks the licence, HF_TOKEN and free space first. By hand:\n"
             "  from datasets import load_dataset\n"
-            "  d = load_dataset('parquet', data_files={'train': ..., 'validation': ...})\n"
+            "  d = load_dataset('ILSVRC/imagenet-1k')   # full namespace/name; a\n"
+            "                                          # bare id is rejected\n"
             f"  d.save_to_disk({arrow_dir!r})\n"
             "then re-run."
         )
+
+    from datasets import DatasetDict  # lazy — heavy import
+
     raw = DatasetDict.load_from_disk(arrow_dir)
     val_split = "validation" if "validation" in raw else "val"
 
