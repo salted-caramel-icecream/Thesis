@@ -44,14 +44,14 @@ def _cfg(tmp, **over):
         optim={"warmup_epochs": 1}, **over)
 
 
-def _run(cfg, ckpt_path=None):
+def _run(cfg, ckpt_path=None, extra_callbacks=()):
     rec = _RecordLR()
     undo = install_fake_tutel_backend()
     try:
         model = LitClassifier(cfg)
     finally:
         undo()
-    trainer = build_trainer(cfg, extra_callbacks=[rec])
+    trainer = build_trainer(cfg, extra_callbacks=[rec, *extra_callbacks])
     trainer.fit(model, *_loaders(cfg), ckpt_path=ckpt_path)
     return trainer, rec
 
@@ -127,6 +127,61 @@ def test_resume_from_milestone_continues_the_identical_schedule():
     assert stitched == ref.lrs, (
         "the resumed run followed a different LR schedule:\n"
         f"  stop+resume: {stitched}\n  uninterrupted: {ref.lrs}"
+    )
+
+
+class _PinValAcc(pl.Callback):
+    """Hold the monitored metric flat, so no epoch after the second can enter
+    ModelCheckpoint's top-2 — the normal state of a long run whose val_acc
+    has plateaued."""
+
+    def on_validation_end(self, trainer, pl_module):
+        if not trainer.sanity_checking:
+            trainer.callback_metrics["val_acc"] = torch.tensor(0.5)
+
+
+def test_kill_and_resume_from_last_ckpt_continues_the_identical_schedule():
+    """A killed run leaves only the rolling ``last.ckpt`` — no milestone.
+
+    That file must hold the LAST completed epoch even when val_acc has not
+    improved for a while: Lightning's ``ModelCheckpoint(save_last=True)``
+    refreshes ``last.ckpt`` only in a step that also wrote a top-k file, so
+    on a plateau it silently falls behind and a resume replays epochs.
+    Resuming from it must then continue the same 6-epoch cosine exactly.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # phase 1 — killed after epoch 4 of a 6-epoch schedule, val_acc flat
+        cfg1 = _cfg(tmp, epochs=6, stop_at_epoch=4)
+        _, rec1 = _run(cfg1, extra_callbacks=[_PinValAcc()])
+        assert rec1.epochs == [0, 1, 2, 3], rec1.epochs
+
+        last = os.path.join(tmp, cfg1["run_name"], "last.ckpt")
+        assert os.path.exists(last), os.listdir(os.path.dirname(last))
+        ckpt = torch.load(last, map_location="cpu", weights_only=False)
+        for key in ("state_dict", "optimizer_states", "lr_schedulers", "epoch"):
+            assert key in ckpt, f"last.ckpt lacks {key}"
+        processed = ckpt["loops"]["fit_loop"]["epoch_progress"]["current"]["processed"]
+        assert processed == 4, (
+            f"last.ckpt is stale: it holds {processed} completed epochs, the run did 4")
+
+        # phase 2 — same budget, no stop, resume from last.ckpt
+        cfg2 = _cfg(tmp, epochs=6, mode="resume", ckpt_path=last)
+        trainer2, rec2 = _run(cfg2, ckpt_path=last)
+        assert rec2.epochs[0] == 4, f"resumed at epoch {rec2.epochs[0]}, expected 4"
+        assert trainer2.current_epoch == 6, trainer2.current_epoch
+
+        # the resumed run must itself keep last.ckpt current
+        ckpt = torch.load(last, map_location="cpu", weights_only=False)
+        processed = ckpt["loops"]["fit_loop"]["epoch_progress"]["current"]["processed"]
+        assert processed == 6, processed
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, ref = _run(_cfg(tmp, epochs=6))
+
+    stitched = rec1.lrs + rec2.lrs
+    assert stitched == ref.lrs, (
+        "the resumed run followed a different LR schedule:\n"
+        f"  kill+resume: {stitched}\n  uninterrupted: {ref.lrs}"
     )
 
 

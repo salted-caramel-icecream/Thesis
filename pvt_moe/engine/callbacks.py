@@ -7,7 +7,7 @@ import time
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Checkpoint, LearningRateMonitor, ModelCheckpoint
 
 
 class MilestoneCheckpoint(pl.Callback):
@@ -49,6 +49,34 @@ class MilestoneCheckpoint(pl.Callback):
         trainer.save_checkpoint(path)
         self.written.append(path)
         print(f"[milestone] epoch {completed}: saved full state -> {path}")
+
+
+class RollingCheckpoint(Checkpoint):
+    """Overwrite ``last.ckpt`` with the full training state after EVERY epoch.
+
+    This is the file a killed run resumes from, so it must always hold the
+    most recent completed epoch. ``ModelCheckpoint(save_last=True)`` does not
+    guarantee that: Lightning (2.6) refreshes ``last.ckpt`` only in a step
+    that also wrote a top-k file, so on any epoch whose ``val_acc`` does not
+    enter the top-k — most epochs of a long run — ``last.ckpt`` is left at the
+    last improvement, and a resume from it silently replays the epochs since.
+
+    Subclasses ``Checkpoint`` (not ``Callback``) so Lightning runs it in the
+    checkpoint pass, after ``ModelCheckpoint``: the saved state then already
+    carries this epoch's top-k bookkeeping. Keep ``ModelCheckpoint`` first in
+    the callback list so ``trainer.checkpoint_callback`` stays the val_acc one.
+    """
+
+    FILENAME = "last.ckpt"
+
+    def __init__(self, dirpath: str):
+        self.dirpath = dirpath
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        os.makedirs(self.dirpath, exist_ok=True)
+        trainer.save_checkpoint(os.path.join(self.dirpath, self.FILENAME))
 
 
 class PrintEpochMetrics(pl.Callback):
@@ -137,12 +165,15 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         monitor="val_acc",
         mode="max",
         save_top_k=2,
-        save_last=True,
+        # last.ckpt is owned by RollingCheckpoint (see its docstring); with
+        # save_last=True Lightning would write it only on top-k epochs.
+        save_last=False,
         auto_insert_metric_name=False,
         filename="epoch{epoch:03d}-valacc{val_acc:.4f}",
     )
     callbacks = [
         checkpoint_cb,
+        RollingCheckpoint(ckpt_dir),
         LearningRateMonitor(logging_interval="epoch"),
         PrintEpochMetrics(),
     ]
