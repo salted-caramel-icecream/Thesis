@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--checkpoint-root", dest="checkpoint_root", metavar="DIR",
                    help="where run directories (checkpoints) are written")
     g.add_argument("--checkpoint-dir", dest="checkpoint_root",
-                   metavar="DIR", help=argparse.SUPPRESS)  # alias
+                   metavar="DIR", help="alias for --checkpoint-root")
     g.add_argument("--log-root", metavar="DIR")
     g.add_argument("--data-dir", metavar="DIR",
                    help="directory holding the Arrow snapshot for the selected "
