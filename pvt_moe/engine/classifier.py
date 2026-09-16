@@ -130,7 +130,9 @@ class LitClassifier(pl.LightningModule):
         elif mode == "ssl_init":
             load_backbone_checkpoint(
                 self.model, cfg["ckpt_path"], skip_head=True, expected_cfg=cfg,
-                check_arch=cfg["model"].get("ssl_init_check_arch", True))
+                check_arch=cfg["model"].get("ssl_init_check_arch", True),
+                seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
+                upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"))
         # mode == "scratch": nothing; mode == "resume": Lightning restores
         # the full state via trainer.fit(ckpt_path=...).
 

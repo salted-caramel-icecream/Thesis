@@ -157,7 +157,8 @@ def test_dense_checkpoint_may_feed_a_moe_run_but_moe_checkpoints_must_match():
         finally:
             undo()
         assert stats["arch_mismatches"] == []                  # sparse upcycling is allowed
-        assert "start at RANDOM init" in buf.getvalue()         # ...but said out loud
+        assert stats["seeded_moe_blocks"] == 1 and stats["zeroed_routed_fc2"] >= 1, stats
+        assert "RANDOM init" not in buf.getvalue()             # the block was upcycled, not left random
         # a checkpoint that itself has MoE weights must match the run's placement
         state = {k: v for k, v in model.state_dict().items()}
         q = os.path.join(d, "moe.pt"); torch.save({"state_dict": state, "cfg": moe_cfg}, q)
@@ -206,3 +207,92 @@ def test_lit_classifier_applies_the_guard():
         else:
             raise AssertionError("LitClassifier must surface the mismatch")
         LitClassifier(_run_cfg(p))                                # matching: fine
+
+
+# --- ssl_init upcycles the backbone's own FFN (same bar as the HF path) -------
+
+def _forward_features(model, x):
+    out = model.forward_features(x)
+    return out if isinstance(out, torch.Tensor) else out[0]
+
+
+def _ssl_backbone_file(d, ablation):
+    cfg = tiny_config(model={"ablation": ablation})
+    torch.manual_seed(0)
+    backbone = build_ssl_backbone(cfg).eval()
+    p = os.path.join(d, "jepa_backbone.pt")
+    torch.save({"state_dict": backbone.state_dict(), "cfg": cfg}, p)
+    return backbone, p
+
+
+def test_ssl_init_upcycled_model_matches_the_dense_backbone_to_1e4():
+    """THE bar, on both CPU backends: fake Tutel (Tutel's parameter layout,
+    all tokens to expert 0, no real dispatch) and the native backend (real
+    top-1 routing). Real Tutel is covered by tools/verify_upcycling.py on a GPU."""
+    for backend in ("tutel", "native"):
+        with tempfile.TemporaryDirectory() as d:
+            backbone, p = _ssl_backbone_file(d, ROPE_ALL_S4)
+            cfg = tiny_config(mode="ssl_init", ckpt_path=p,
+                              model={"moe": {"backend": backend},
+                                     "ablation": {**ROPE_ALL_S4, "use_moe": True,
+                                                  "moe_placement": [[], [], [], [-1]]}})
+            assert cfg["model"]["moe"]["upcycle_init"] == "routed_zero"   # the recipe rule
+            undo = install_fake_tutel_backend()
+            try:
+                lit = LitClassifier(cfg)                    # applies the warm start
+            finally:
+                undo()
+            lit.eval()
+            x = torch.randn(2, 3, 64, 64)
+            with torch.no_grad():
+                err = (_forward_features(backbone, x) - _forward_features(lit.model, x)).abs().max().item()
+            assert err < 1e-4, (backend, err)
+            moe_mlp = lit.model.block4[-1].mlp
+            assert moe_mlp.shared_expert is not None
+            # the routed fc2 really starts at zero, the experts really carry fc1
+            zero = [n for n, prm in moe_mlp.named_parameters()
+                    if "fc2" in n and "shared" not in n and prm.abs().sum() == 0]
+            assert zero, [n for n, _ in moe_mlp.named_parameters()]
+
+
+def test_ssl_init_without_seeding_or_shared_expert_is_explicit():
+    with tempfile.TemporaryDirectory() as d:
+        backbone, p = _ssl_backbone_file(d, ROPE_ALL_S4)
+        moe = {"use_moe": True, "moe_placement": [[], [], [], [-1]]}
+        # explicit "none" with a shared expert: refused, never silent
+        try:
+            tiny_config(mode="ssl_init", ckpt_path=p,
+                        model={"moe": {"upcycle_init": "none"}, "ablation": {**ROPE_ALL_S4, **moe}})
+        except ValueError as e:
+            assert "upcycle_init" in str(e) and "twice" in str(e)
+        else:
+            raise AssertionError("ssl_init + shared expert + upcycle_init none must raise")
+        # no shared expert: nothing to zero, resolves to none without complaint
+        cfg = tiny_config(mode="ssl_init", ckpt_path=p,
+                          model={"moe": {"shared_expert": False}, "ablation": {**ROPE_ALL_S4, **moe}})
+        assert cfg["model"]["moe"]["upcycle_init"] == "none"
+        # seeding switched off on purpose: random experts, said out loud
+        cfg = tiny_config(mode="ssl_init", ckpt_path=p, model={"seed_moe_from_dense": False,
+                                                                "ablation": {**ROPE_ALL_S4, **moe}})
+        undo = install_fake_tutel_backend()
+        try:
+            model = build_model(cfg)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stats = load_backbone_checkpoint(model, p, expected_cfg=cfg, seed_moe_experts=False)
+        finally:
+            undo()
+        assert stats["seeded_moe_blocks"] == 0 and "RANDOM init" in buf.getvalue()
+        # shared_zero is tagged so it cannot share a directory with routed_zero
+        cfg_sz = tiny_config(mode="ssl_init", ckpt_path=p,
+                             model={"moe": {"upcycle_init": "shared_zero"}, "ablation": {**ROPE_ALL_S4, **moe}})
+        assert cfg_sz["run_name"].count("-szi") == 1
+        cfg_rz = tiny_config(mode="ssl_init", ckpt_path=p, model={"ablation": {**ROPE_ALL_S4, **moe}})
+        assert cfg_rz["run_name"] != cfg_sz["run_name"]
+
+
+def test_hf_and_ssl_paths_share_one_upcycling_routine():
+    import inspect
+    from pvt_moe.models import pretrained
+    assert "upcycle_moe_blocks(" in inspect.getsource(pretrained.load_hf_pretrained)
+    assert "upcycle_moe_blocks(" in inspect.getsource(pretrained.load_backbone_checkpoint)

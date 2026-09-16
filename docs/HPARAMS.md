@@ -280,6 +280,20 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 | Optimizer state | unavailable | — |
 | Expert symmetry breaking | none | Sparse Upcycling B.9 |
 
+### What the function-preservation claim has been verified against
+
+| Check | Backend it ran on | Where |
+|---|---|---|
+| HF path: whole model, dense vs upcycled, < 1e-4 | fake Tutel (Tutel's parameter layout, every token to expert 0, no dispatch) | `tests/test_shared_expert.py::test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval` |
+| HF path: block-level, < 1e-5 | fake Tutel; native (real top-1 routing) | `test_shared_expert.py`, `test_native_moe.py::test_R2_*` |
+| ssl_init path: whole model, < 1e-4 (measured 0.0) | fake Tutel **and** native | `tests/test_ssl_init.py::test_ssl_init_upcycled_model_matches_the_dense_backbone_to_1e4` |
+| Real Tutel expert arithmetic (`FusedExpertsNetwork`): seeded expert == dense FFN, zeroed expert == 0 | real Tutel *expert module only* (no `moe_layer` dispatch/combine), CPU, one-off script | not in the suite |
+| Real Tutel `moe_layer` end to end, both paths, 224², GPU | **never run yet** | `python tools/verify_upcycling.py --variant b1 --hf` on the GPU box |
+
+The suite always uses the fake Tutel layer even when Tutel is installed, so
+a green suite says nothing about Tutel's dispatch/combine. Run the tool once
+on the GPU box (Tutel pinned to `9a70a681`) before trusting the claim there.
+
 ### Which branch starts at zero — a deliberate departure from the spec
 
 Both branches copy the pretrained FFN, so one of them must start at zero or

@@ -191,29 +191,7 @@ def load_hf_pretrained(
     stats["unexpected"] = list(unexpected)
 
     if seed_moe_experts and moe_block_prefixes:
-        for prefix in sorted(moe_block_prefixes):
-            fc1_w = dense_mlp_for_seeding.get(f"{prefix}mlp.fc1.weight")
-            fc1_b = dense_mlp_for_seeding.get(f"{prefix}mlp.fc1.bias")
-            fc2_w = dense_mlp_for_seeding.get(f"{prefix}mlp.fc2.weight")
-            fc2_b = dense_mlp_for_seeding.get(f"{prefix}mlp.fc2.bias")
-            if fc1_w is None or fc2_w is None:
-                continue
-            stage = int(prefix.split(".")[0].removeprefix("block")) - 1
-            blk = int(prefix.split(".")[1])
-            moe_mlp = getattr(model, f"block{stage + 1}")[blk].mlp
-            seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b)
-            stats["seeded_moe_blocks"] += 1
-
-            # Shared expert (when enabled): takes the dense FFN verbatim,
-            # DWConv included, so the pretrained function is kept exactly
-            # rather than replicated across experts.
-            if getattr(moe_mlp, "shared_expert", None) is not None:
-                seed_shared_expert_from_dense(moe_mlp, dense_mlp_for_seeding, prefix)
-                stats["seeded_shared_experts"] += 1
-                if upcycle_init == "routed_zero":
-                    stats["zeroed_routed_fc2"] += zero_routed_expert_output(moe_mlp)
-                elif upcycle_init == "shared_zero":
-                    stats["zeroed_shared_fc2"] += zero_shared_expert_output(moe_mlp)
+        upcycle_moe_blocks(model, dense_mlp_for_seeding, moe_block_prefixes, upcycle_init, stats)
 
     if verbose:
         print(
@@ -240,6 +218,55 @@ def load_hf_pretrained(
 # ---------------------------------------------------------------------------
 # Expert seeding (sparse upcycling)
 # ---------------------------------------------------------------------------
+
+def moe_block_prefixes_of(model) -> set:
+    """``{"block4.1.", ...}`` for every block the model converted to MoE."""
+    placement = getattr(model, "moe_placement", None) or []
+    return {f"block{i + 1}.{j}." for i, blocks in enumerate(placement) for j in blocks}
+
+
+def upcycle_moe_blocks(model, dense_mlp: dict, moe_block_prefixes, upcycle_init: str,
+                       stats: dict | None = None) -> dict:
+    """Seed every MoE'd block from the dense FFN it replaced — the ONE
+    upcycling routine, shared by the HF and the ssl_init warm starts.
+
+    ``dense_mlp`` maps full dense-model keys (``block4.1.mlp.fc1.weight``,
+    ``...mlp.dwconv.dwconv.weight``, ...) to tensors. Per block: the routed
+    experts are replicated from fc1/fc2, the shared expert (when present)
+    takes the FFN verbatim (DWConv included), and ``upcycle_init`` picks the
+    branch that starts at zero so the block reproduces the dense FFN exactly
+    at step 0 (``routed_zero``: the shared branch carries it, exact at any
+    top_k). Returns / updates the stats counters.
+    """
+    stats = stats if stats is not None else {}
+    for key in ("seeded_moe_blocks", "seeded_shared_experts",
+                "zeroed_routed_fc2", "zeroed_shared_fc2"):
+        stats.setdefault(key, 0)
+    for prefix in sorted(moe_block_prefixes):
+        fc1_w = dense_mlp.get(f"{prefix}mlp.fc1.weight")
+        fc1_b = dense_mlp.get(f"{prefix}mlp.fc1.bias")
+        fc2_w = dense_mlp.get(f"{prefix}mlp.fc2.weight")
+        fc2_b = dense_mlp.get(f"{prefix}mlp.fc2.bias")
+        if fc1_w is None or fc2_w is None:
+            continue
+        stage = int(prefix.split(".")[0].removeprefix("block")) - 1
+        blk = int(prefix.split(".")[1])
+        moe_mlp = getattr(model, f"block{stage + 1}")[blk].mlp
+        seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b)
+        stats["seeded_moe_blocks"] += 1
+
+        # Shared expert (when enabled): takes the dense FFN verbatim,
+        # DWConv included, so the pretrained function is kept exactly
+        # rather than replicated across experts.
+        if getattr(moe_mlp, "shared_expert", None) is not None:
+            seed_shared_expert_from_dense(moe_mlp, dense_mlp, prefix)
+            stats["seeded_shared_experts"] += 1
+            if upcycle_init == "routed_zero":
+                stats["zeroed_routed_fc2"] += zero_routed_expert_output(moe_mlp)
+            elif upcycle_init == "shared_zero":
+                stats["zeroed_shared_fc2"] += zero_shared_expert_output(moe_mlp)
+    return stats
+
 
 @torch.no_grad()
 def seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b) -> int:
@@ -532,6 +559,8 @@ def load_backbone_checkpoint(
     verbose: bool = True,
     expected_cfg: dict | None = None,
     check_arch: bool = True,
+    seed_moe_experts: bool = True,
+    upcycle_init: str | None = None,
 ) -> dict:
     """Load a backbone state_dict from ``path`` into ``model``.
 
@@ -540,11 +569,23 @@ def load_backbone_checkpoint(
     prefixes. Skips ``head.*`` by default (class count may differ). Keys with
     no destination or mismatched shapes are dropped and counted.
 
+    Sparse upcycling, exactly as ``load_hf_pretrained``: a dense checkpoint's
+    ``mlp.*`` tensors for blocks the model converted to MoE are not dropped
+    but handed to ``upcycle_moe_blocks`` (when ``seed_moe_experts``), which
+    seeds the routed experts and the shared expert and applies
+    ``upcycle_init`` — so a JEPA backbone's own stage-4 FFN is the dense
+    teacher and the MoE'd block reproduces it at step 0.
+
     With ``expected_cfg`` (the run's validated config) the checkpoint's saved
     architecture is compared first (``check_backbone_architecture``): a
     mismatch raises when ``check_arch`` is True and is printed as a loud
     warning otherwise. A checkpoint with no saved config is always a warning.
     """
+    if upcycle_init is None:
+        # Taken from the run's config so a caller cannot forget it and get
+        # the pre-fix behaviour (a doubled FFN) by omission.
+        upcycle_init = (expected_cfg["model"]["moe"].get("upcycle_init", "none")
+                        if expected_cfg is not None else "none")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt
     for wrapper in ("state_dict", "model"):
@@ -563,7 +604,10 @@ def load_backbone_checkpoint(
         cleaned[k] = v
 
     stats = {"loaded": 0, "skipped_head": 0, "dropped_no_target": 0, "skipped_shape": 0,
-             "arch_mismatches": []}
+             "arch_mismatches": [], "dense_mlp_for_seeding": 0, "seeded_moe_blocks": 0,
+             "seeded_shared_experts": 0, "zeroed_routed_fc2": 0, "zeroed_shared_fc2": 0}
+    moe_prefixes = moe_block_prefixes_of(model)
+    dense_mlp_for_seeding = {}
     if expected_cfg is not None:
         problems = check_backbone_architecture(_checkpoint_cfg(ckpt), expected_cfg, cleaned, path)
         stats["arch_mismatches"] = problems
@@ -583,6 +627,10 @@ def load_backbone_checkpoint(
         if skip_head and k.startswith("head."):
             stats["skipped_head"] += 1
             continue
+        if k not in model_state and any(k.startswith(p + "mlp.") for p in moe_prefixes):
+            dense_mlp_for_seeding[k] = v          # the dense teacher of a MoE'd block
+            stats["dense_mlp_for_seeding"] += 1
+            continue
         if k not in model_state:
             stats["dropped_no_target"] += 1
             continue
@@ -595,11 +643,17 @@ def load_backbone_checkpoint(
     stats["loaded"] = len(filtered)
     stats["missing"] = list(missing)
     stats["unexpected"] = list(unexpected)
+    if seed_moe_experts and dense_mlp_for_seeding:
+        upcycle_moe_blocks(model, dense_mlp_for_seeding, moe_prefixes, upcycle_init, stats)
     if verbose:
         print(
             f"[backbone ckpt] loaded={stats['loaded']} head_skipped={stats['skipped_head']} "
             f"no_target={stats['dropped_no_target']} shape_skipped={stats['skipped_shape']} "
-            f"missing={len(stats['missing'])}"
+            f"missing={len(stats['missing'])} | upcycled: dense_mlp={stats['dense_mlp_for_seeding']} "
+            f"seeded_moe_blocks={stats['seeded_moe_blocks']} "
+            f"seeded_shared={stats['seeded_shared_experts']} "
+            f"zeroed_routed_fc2={stats['zeroed_routed_fc2']} "
+            f"zeroed_shared_fc2={stats['zeroed_shared_fc2']} (upcycle_init={upcycle_init})"
         )
         if stats["loaded"] == 0:
             print("  !! 0 weights loaded — wrong file or key prefix. First source keys: "
@@ -610,7 +664,7 @@ def load_backbone_checkpoint(
             print(f"  RoPE-Mixed frequencies left at RANDOM init: {rope_random or 'none'}; "
                   f"in the checkpoint but unused: {rope_dropped or 'none'}")
         moe_random = [k for k in stats["missing"] if ".mlp.moe_layer." in k or ".mlp.shared_expert." in k]
-        if moe_random:
-            print(f"  MoE'd blocks start at RANDOM init ({len(moe_random)} tensors): this path "
-                  "does not seed experts from the checkpoint's dense FFN.")
+        if moe_random and not stats["seeded_moe_blocks"]:
+            print(f"  MoE'd blocks start at RANDOM init ({len(moe_random)} tensors): the "
+                  "checkpoint had no dense FFN for them or seed_moe_experts is off.")
     return stats

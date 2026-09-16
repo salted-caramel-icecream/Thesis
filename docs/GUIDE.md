@@ -224,6 +224,11 @@ key nothing reads.
 | dataset | `--dataset imagenet-1k` | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
+Before the first upcycled run on a new box: `python tools/verify_upcycling.py
+--variant b1 --hf` checks, on the real MoE backend, that the upcycled model
+reproduces the dense one at step 0 (the CPU suite only proves it on the fake
+Tutel layer and the native backend).
+
 Diagnostics, no training: `--check-env` (is this machine usable),
 `--dry-run` (resolve and print the config), `--print-config` / `--save-config`.
 

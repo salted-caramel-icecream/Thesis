@@ -12,7 +12,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 - `pvt_moe/engine/` — `classifier.py` (LitClassifier, optimizer groups), `callbacks.py` (checkpoints, `RopeFreqSnapshot`, `build_trainer`), `env.py`
 - `pvt_moe/data/` — ImageNet Arrow pipeline; `pvt_moe/utils/` — FLOPs, expert diagnostics; `pvt_moe/ssl/` — JEPA
 - `tests/` — plain `test_*` functions in `test_*.py`; `tests/helpers.py` gives `tiny_config(**overrides)` and `install_fake_tutel_backend()` (returns an undo fn; needed around `build_model` / `LitClassifier` whenever `use_moe` is on)
-- `tools/` — standalone CPU scripts (`plot_rope_freqs.py`); `configs/` — one YAML per ablation arm
+- `tools/` — standalone scripts: `plot_rope_freqs.py` (CPU), `verify_upcycling.py` (function preservation on the REAL MoE backend — the suite only covers fake Tutel + native); `configs/` — one YAML per ablation arm
 - `docs/` — `GUIDE.md` (how to run), `HPARAMS.md` (recipes, ladders), `ARCHITECTURE.md` (invariants), `NOTEBOOK_TO_PACKAGE.md`, `JEPA_GUIDE.md`
 - `notebooks/` — `v11_train.ipynb` is the current launcher (edit only its CONFIG cell, via json load/dump); `archive/` — v9 provenance, unmaintained
 - `figures/` — thesis figures, vector PDF only

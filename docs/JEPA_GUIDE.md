@@ -96,7 +96,14 @@ stable signal early on, and JEPA's collapse dynamics (EMA target chasing a
 moving context) are already delicate; adding top-1 routing noise compounds the
 risk for no measured benefit. The project's existing warm-start path is
 *sparse upcycling* — pretrain dense, seed experts from the dense FFN at
-fine-tune time. The JEPA backbone slots directly into that flow.
+fine-tune time. `mode: ssl_init` runs exactly that on the JEPA backbone:
+`load_backbone_checkpoint` hands the backbone's own `mlp.*` tensors of every
+MoE'd block to `upcycle_moe_blocks` (the same routine the HF path uses), the
+routed experts and the shared expert are seeded from them, and
+`upcycle_init` — which resolves to `routed_zero` for `ssl_init` whatever the
+recipe — zeros the routed fc2, so the converted block reproduces the backbone
+exactly at step 0 (`tests/test_ssl_init.py` asserts it to 1e-4 on both
+backends).
 
 ### 3.4 Predictor — `ssl/predictor.py`
 
@@ -145,8 +152,17 @@ this is the collapse alarm; healthy runs sit well above 0 and drift slowly),
    (`model.ssl_init_check_arch: false` turns that into a warning), so a
    RoPE'd block cannot silently end up with random RoPE-Mixed frequencies.
    Key names match exactly (same classes), so the load reports ~0 drops;
-   MoE experts start random (no dense teacher) — expect slower first epochs
-   than HF-seeded runs.
+   the MoE'd blocks are upcycled from the backbone's dense FFN
+   (`seeded_moe_blocks` / `zeroed_routed_fc2` in the loader's print line),
+   so the fine-tune starts from the backbone's exact function.
+
+**Open risk — the notebook has never run end to end.** Until this branch,
+its CONFIG cell was rejected by `assert_known_keys` (the `ssl` block was not
+a known key), so no JEPA pretraining has ever been launched from it. The
+config cell now validates and the JEPA math is covered by CPU tests, but the
+full pretrain → `save_backbone` → `ssl_init` fine-tune loop has not been
+exercised on a GPU. Treat the first real run as a smoke test: a few epochs,
+then the linear probe, before committing the budget.
 
 Sanity anchors: I-JEPA ViT-B/16 @600 ep ≈ 72% linear probe. A 100-epoch
 PVT-B1 run lands far lower — track trends across your own runs, not the paper
