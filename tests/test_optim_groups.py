@@ -37,9 +37,17 @@ def test_four_param_groups_with_correct_lr_and_wd():
 def test_all_1d_params_in_nodecay_groups():
     lit, _ = _build()
     out = lit.configure_optimizers()
+    names = {id(p): n for n, p in lit.model.named_parameters()}
     for g in out["optimizer"].param_groups:
         if "nodecay" in g["name"]:
-            assert all(p.ndim <= 1 for p in g["params"]), g["name"]
+            # timm rule (ndim <= 1) plus the learnable RoPE-Mixed frequencies:
+            # the (2, heads, head_dim//2) `*.rope.freqs` tensors are 3-D and
+            # must not be decayed either (see test_rope_mixed).
+            assert all(
+                p.ndim <= 1
+                or (p.ndim == 3 and p.shape[0] == 2 and names[id(p)].endswith("rope.freqs"))
+                for p in g["params"]
+            ), g["name"]
         else:
             assert all(p.ndim > 1 for p in g["params"]), g["name"]
 

@@ -28,29 +28,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pvt_moe.config import merge_config, validate_config
+from pvt_moe.config import SSL_DEFAULTS, merge_config, validate_config
 from pvt_moe.models.pvt import build_model
 from pvt_moe.ssl.masking import sample_batch_masks, upsample_mask
 from pvt_moe.ssl.predictor import JEPAPredictor
 
-#: SSL-specific defaults; merge as cfg["ssl"] (see notebooks/03_jepa_pretrain).
-DEFAULT_SSL = {
-    "epochs": 100,
-    "lr": 1.5e-3,                 # for global batch ~2048; scale linearly
-    "warmup_epochs": 15,
-    "final_lr": 1e-6,
-    "weight_decay": 0.04,         # cosine-ramped to weight_decay_end
-    "weight_decay_end": 0.4,
-    "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
-    "ema_momentum_end": 1.0,
-    "mask_n_blocks": 4,
-    "mask_block_area": [0.10, 0.20],
-    "mask_aspect_ratio": [0.75, 1.5],
-    "predictor_dim": 384,
-    "predictor_depth": 6,
-    "predictor_heads": 6,
-    "grad_clip": 3.0,
-}
+#: SSL defaults now live in pvt_moe.config.SSL_DEFAULTS (so validate_config
+#: accepts and typo-checks cfg["ssl"]); kept under the old name for imports.
+DEFAULT_SSL = SSL_DEFAULTS
 
 
 def build_ssl_backbone(cfg: dict) -> nn.Module:
@@ -73,6 +58,19 @@ class LitJEPA(pl.LightningModule):
         self.cfg = cfg
         self.ssl = cfg["ssl"]
         self.save_hyperparameters({"cfg": cfg})
+
+        # The LR is used AS-IS (no automatic linear scaling, same policy as
+        # the supervised recipe). Say what that means for this batch.
+        micro = cfg["batch_size"]
+        accum = cfg.get("accumulate_grad_batches") or 1
+        eff = micro * accum
+        ref = self.ssl["lr_reference_batch"]
+        line = (f"[jepa] lr {self.ssl['lr']:.2e} (reference batch {ref}) | "
+                f"batch {micro} micro x {accum} accum = {eff} effective")
+        if eff != ref:
+            line += (f" | linear scaling would give lr {self.ssl['lr'] * eff / ref:.2e} "
+                     f"— NOT applied; set ssl.lr yourself")
+        print(line)
 
         img_size = cfg["dataset"]["img_size"]
         if img_size % 32 != 0:
@@ -188,10 +186,13 @@ class LitJEPA(pl.LightningModule):
         decay, no_decay = [], []
         modules = [self.context, self.predictor]
         for module in modules:
-            for p in module.parameters():
+            # The backbone's own no-decay list (RoPE-Mixed frequencies) on
+            # top of the ndim<=1 rule — same policy as LitClassifier.
+            listed = module.no_weight_decay() if hasattr(module, "no_weight_decay") else set()
+            for name, p in module.named_parameters():
                 if not p.requires_grad:
                     continue
-                (no_decay if p.ndim <= 1 else decay).append(p)
+                (no_decay if p.ndim <= 1 or name in listed else decay).append(p)
         no_decay.append(self.input_mask_token)
 
         optimizer = torch.optim.AdamW(

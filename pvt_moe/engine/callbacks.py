@@ -79,6 +79,83 @@ class RollingCheckpoint(Checkpoint):
         trainer.save_checkpoint(os.path.join(self.dirpath, self.FILENAME))
 
 
+class RopeFreqSnapshot(pl.Callback):
+    """Save the learnable RoPE-Mixed frequencies at step 0 and as they train.
+
+    ``rope_freqs_init.pt`` is what the drift plot (tools/plot_rope_freqs.py)
+    overlays the trained values on; without it the "spread init -> cluster"
+    finding cannot be made. Keys are the model's parameter names
+    (``block4.1.attn.rope.freqs``), values ``(2, heads, head_dim//2)`` fp32
+    CPU tensors.
+
+    The step-0 values are captured ONCE, the first time a run starts without
+    a checkpoint, and kept in this callback's state, which Lightning stores
+    inside every checkpoint (``ckpt["callbacks"]``). A resumed run, in the
+    same directory or on another machine, therefore rewrites the init file
+    from that state — never from the restored (already trained) weights,
+    which is what a naive "save on fit start" would do, because Lightning
+    restores the checkpoint before ``on_fit_start`` fires.
+
+    ``rope_freqs_final.pt`` is refreshed after every epoch (so a killed run
+    still leaves the latest values; ``last.ckpt`` carries them as well).
+    """
+
+    INIT = "rope_freqs_init.pt"
+    FINAL = "rope_freqs_final.pt"
+
+    def __init__(self, dirpath: str):
+        self.dirpath = dirpath
+        self._init: dict | None = None        # captured step-0 frequencies
+
+    # -- persisted with every checkpoint --------------------------------------
+    def state_dict(self) -> dict:
+        return {"init": self._init}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._init = state_dict.get("init")
+
+    @staticmethod
+    def _freqs(pl_module) -> dict:
+        model = getattr(pl_module, "model", pl_module)
+        return {n: p.detach().float().cpu().clone()
+                for n, p in model.named_parameters() if n.endswith("rope.freqs")}
+
+    def _write(self, freqs: dict, name: str, overwrite: bool = True) -> None:
+        if not freqs:
+            return
+        os.makedirs(self.dirpath, exist_ok=True)
+        path = os.path.join(self.dirpath, name)
+        if os.path.exists(path) and not overwrite:
+            return                                # same-directory resume
+        torch.save(freqs, path)
+        print(f"[rope] saved {len(freqs)} frequency tensor(s) -> {path}")
+
+    def on_fit_start(self, trainer, pl_module):
+        if not self._freqs(pl_module):
+            return                                # axial / no RoPE: nothing to track
+        if trainer.ckpt_path is None:
+            # A fresh run: these ARE the step-0 values (warm starts happen in
+            # LitClassifier.__init__, before fit).
+            if self._init is None:
+                self._init = self._freqs(pl_module)
+        elif self._init is None:
+            # Resumed from a checkpoint written before this state existed:
+            # the restored weights are trained, so no init file can be made.
+            print("[rope] WARNING: checkpoint carries no step-0 frequencies; "
+                  f"{self.INIT} is not written (the restored values are trained).")
+            return
+        if trainer.is_global_zero:
+            self._write(self._init, self.INIT, overwrite=False)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.is_global_zero and not trainer.sanity_checking:
+            self._write(self._freqs(pl_module), self.FINAL)
+
+    def on_fit_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self._write(self._freqs(pl_module), self.FINAL)
+
+
 class PrintEpochMetrics(pl.Callback):
     """One human-readable line per epoch (the CSV/W&B logs stay canonical)."""
 
@@ -174,6 +251,7 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
     callbacks = [
         checkpoint_cb,
         RollingCheckpoint(ckpt_dir),
+        RopeFreqSnapshot(ckpt_dir),
         LearningRateMonitor(logging_interval="epoch"),
         PrintEpochMetrics(),
     ]
@@ -200,6 +278,9 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         callbacks=callbacks,
         logger=build_loggers(cfg),
         log_every_n_steps=50,
+        # None (the default) means Lightning's own default: every batch.
+        **{k: cfg[k] for k in ("limit_train_batches", "limit_val_batches")
+           if cfg.get(k) is not None},
     )
 
 
@@ -211,7 +292,7 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         monitor="ssl_loss",
         mode="min",
         save_top_k=1,
-        save_last=True,
+        save_last=False,          # last.ckpt: RollingCheckpoint (see its docstring)
         auto_insert_metric_name=False,
         filename="epoch{epoch:03d}-loss{ssl_loss:.4f}",
     )
@@ -221,12 +302,16 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         devices=1,
         precision=cfg["precision"] if torch.cuda.is_available() else 32,
         gradient_clip_val=cfg["ssl"]["grad_clip"],
+        # micro-batch x this = the effective batch LitJEPA prints; the EMA
+        # update is per optimizer step, so accumulation is safe here.
+        accumulate_grad_batches=cfg.get("accumulate_grad_batches") or 1,
         # "warn" (not True): True would make PL call
         # torch.use_deterministic_algorithms without warn_only, turning
         # nondeterministic-op warnings into mid-run crashes.
         deterministic=("warn" if cfg["deterministic"] else None),
         benchmark=not cfg["deterministic"],
-        callbacks=[checkpoint_cb, LearningRateMonitor(logging_interval="step")],
+        callbacks=[checkpoint_cb, RollingCheckpoint(ckpt_dir),
+                   LearningRateMonitor(logging_interval="step")],
         logger=build_loggers(cfg),
         log_every_n_steps=50,
     )

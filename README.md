@@ -1,6 +1,7 @@
-# PVT v2 + MoE — thesis ablation framework (v10)
+# PVT v2 + MoE — thesis ablation framework (sv1)
 
-PVT v2 B1 image classifier with configurable Mixture-of-Experts, trained on
+PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
+official size) with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
 lineage. The two source notebooks are kept untouched in the repo root for
 provenance — see `docs/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
@@ -21,7 +22,7 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming)
                 NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
                 JEPA_GUIDE.md (SSL recipe)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py)
-download_data.py  build the ImageNet Arrow snapshot (checks licence/disk first)
+download_data.py  build the ImageNet / PASS Arrow snapshot (checks token/disk first, staged to cap disk peak)
 ```
 
 ## Setting up a GPU box from scratch
@@ -225,7 +226,7 @@ Two, for different purposes:
 
 | | |
 |---|---|
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 211 tests. Prefer this. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 241 tests. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
@@ -281,9 +282,11 @@ python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no t
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
+python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
 python train.py --backend native                       # no-Tutel fallback
 python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
 python train.py --no-moe-dwconv --rope                 # position-encoding arm
+python train.py --rope-mode axial                      # fixed-frequency (axial) RoPE control, run tag -ax
 ```
 
 `--checkpoint-root` is the canonical name; `--checkpoint-dir` is an alias
@@ -345,31 +348,60 @@ directly, and prints the equivalent command line.
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
-| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2 (+GQA) |
-| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[1]]` is stage 4's last block only. Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
+| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16). GQA is available as an ablation via `model.num_kv_heads` |
+| 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
-| 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
-| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
+| 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
+| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 | 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
+
+Orthogonal to all seven: **model size**, `model.variant` / `--variant b2`
+(b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
+pretrained HF checkpoint as one set and rejects a disagreeing explicit value,
+so B2 depths can never load B1 weights. `docs/HPARAMS.md` §1 has the table
+with sources; B2 is ~2× B1 in parameters and activations and B0 ~¼ (see the
+GPU table).
 
 Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-    └──────────────────────────────────── dataset
-    │        └─────────────────────────── stage 4, block 1
-    │        │    └────────────────────── 4 experts, top-1
-    │        │    │   └────────────────── shared expert
-    │        │    │   │   └────────────── RoPE placement
-    │        │    │   │   │         └──── norm
-    │        │    │   │   │         │  └─ recipe + epoch budget
+sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+└─────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └─────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └──────────────────────────────────────────── dataset
+│   │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │        │    └────────────────────────────── 4 experts, top-1
+│   │  │        │    │   └────────────────────────── shared expert
+│   │  │        │    │   │   └────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
+│   │  │        │    │   │   │         └──────────── norm
+│   │  │        │    │   │   │         │  └───────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
-theirs), `-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
+`-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+
+## RoPE frequency diagnostics
+
+RoPE-Mixed learns its frequencies, so every run with `use_rope` writes the
+`(2, heads, head_dim//2)` tensor of each RoPE'd block twice, into
+`<checkpoint_root>/<run_name>/`: `rope_freqs_init.pt` at step 0 (kept inside every checkpoint too, so a resume on
+another machine rewrites the true init rather than the restored weights) and
+`rope_freqs_final.pt` (refreshed every epoch; a killed run's latest values are
+also in `last.ckpt`, which the plot tool accepts directly).
+
+```bash
+python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
+    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
+python tools/plot_rope_freqs.py --selftest          # synthetic spread / collapsed / axial cases
+```
+
+CPU only, torch + matplotlib, no dataset or Tutel — so it runs on a laptop
+while the GPU trains. `docs/GUIDE.md` §7 is the reading guide and
+`docs/HPARAMS.md` §2 the healthy-vs-collapsed table.
 
 ## Shared expert (`model.moe.shared_expert`)
 
@@ -457,6 +489,14 @@ only the memory strategy differs:
 | H200 | 141 GB | 1024 | 1 | 16–32 |
 | B200 | 180 GB | 1024 | 1 | 16–32 |
 
+Those rows are for B1. **`--variant b2` needs roughly half the micro-batch**
+(~1.9× the activation memory per image): 64 × 16 on 12 GB, 256 × 4 on 32 GB,
+512 × 2 or 1024 × 1 from 80 GB up. **`--variant b0` needs about a quarter**
+(~0.27×): 512 × 2 on 12 GB, 1024 × 1 from 32 GB up. Effective batch stays 1024
+in every case, so the recipe's LR is unchanged. `python train.py --check-env
+--variant b2` (or `b0`) computes the suggestion from the VRAM actually free;
+`docs/HPARAMS.md` §5 has the per-variant table.
+
 Estimates, not measurements — `python train.py --check-env` computes the same
 suggestion from the VRAM actually free on your box, and `setup_environment`
 warns before training if the micro-batch looks too large rather than OOM-ing
@@ -483,11 +523,29 @@ paths in
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.
 
+**PASS** (`--dataset pass`, SSL pretraining only): 1,439,588 unlabelled
+images, no people, CC-BY 4.0, not gated — `python download_data.py --dataset
+pass --out DIR` (~166 GB, ~333 GB free while building; the script deletes
+only PASS's raw download between the conversion and the save). It has no
+labels and no validation split, so `train.py` and every supervised recipe
+refuse it; the JEPA notebook uses it by default. Evaluation still happens on
+a labelled set (`docs/JEPA_GUIDE.md` §5).
+
+### Dataset citations
+
+- ImageNet: Deng et al., "ImageNet: A large-scale hierarchical image
+  database", CVPR 2009; Russakovsky et al., "ImageNet Large Scale Visual
+  Recognition Challenge", IJCV 2015.
+- PASS: Asano, Vedaldi, Rupprecht et al., "PASS: An ImageNet replacement for
+  self-supervised pretraining without humans", NeurIPS Datasets and
+  Benchmarks 2021. <https://www.robots.ox.ac.uk/~vgg/research/pass/> —
+  images and dataset CC-BY 4.0; attribution required.
+
 ## Warm starts (`mode`)
 
 | mode | What happens |
 |------|--------------|
-| `hf_pretrained` | remap `OpenGVLab/pvt_v2_b1` (kv fused for GQA, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling) |
+| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |

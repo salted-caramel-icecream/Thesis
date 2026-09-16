@@ -5,13 +5,20 @@ This is the attention used throughout the backbone:
 - **SRA** (PVT v2): keys/values are computed on a spatially reduced feature
   map — a strided ``sr_ratio`` conv (standard mode) or adaptive 7x7 average
   pooling (``linear_attention`` mode, "PVT v2-li").
-- **GQA**: ``num_kv_heads <= num_heads`` shares each kv head across a group
-  of query heads. Uses PyTorch SDPA with ``enable_gqa=True`` on torch >= 2.5
-  and falls back to ``repeat_interleave`` on older versions (so CPU tests run
+- **SDPA**: attention is ``F.scaled_dot_product_attention``. With the default
+  ``num_kv_heads == num_heads`` (plain MHA) it is the unmasked call that
+  dispatches to the flash kernel on CUDA under bf16/fp16 (head_dim 32/64,
+  no mask) — nothing to install or enable.
+- **GQA** (optional ablation): ``num_kv_heads < num_heads`` shares each kv
+  head across a group of query heads via ``enable_gqa=True`` on torch >= 2.5,
+  with a ``repeat_interleave`` fallback on older versions (so CPU tests run
   on torch 2.3).
-- **RoPE** (optional): queries are rotated on the full (H, W) grid, keys on
-  the reduced (H_kv, W_kv) grid; values are never rotated. Coordinates scale
-  correctly because axial RoPE phases depend only on grid indices.
+- **RoPE** (optional; ``rope_mode`` "mixed" = learnable per-head 2D
+  frequencies, the default, or "axial" = fixed): queries are rotated on the
+  full (H, W) grid, keys on the reduced (H_kv, W_kv) grid; values are never
+  rotated. Coordinates scale correctly because the phases depend only on
+  grid coordinates. Mixed frequencies are per QUERY head, so mixed RoPE
+  requires ``num_kv_heads == num_heads`` (keys carry one set per head).
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ class GQAttention(nn.Module):
         norm_layer=nn.LayerNorm,
         use_rope: bool = False,
         rope_theta: float = 100.0,
+        rope_mode: str = "axial",
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -77,7 +85,13 @@ class GQAttention(nn.Module):
             self.act = nn.GELU()
 
         if use_rope:
-            self.rope = RotaryEmbedding2D(self.head_dim, theta=rope_theta)
+            if rope_mode == "mixed" and num_kv_heads != num_heads:
+                raise ValueError(
+                    "rope_mode 'mixed' learns one frequency set per query head, so "
+                    f"keys need the same head count: num_kv_heads={num_kv_heads} != "
+                    f"num_heads={num_heads}. Use rope_mode 'axial' with GQA.")
+            self.rope = RotaryEmbedding2D(self.head_dim, theta=rope_theta,
+                                          mode=rope_mode, num_heads=num_heads)
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, N, C = x.shape
@@ -107,11 +121,13 @@ class GQAttention(nn.Module):
             # in FULL-grid units (scale_h/scale_w) so q–k relative phases stay
             # geometrically meaningful when sr_ratio > 1 or in linear mode.
             # For sr_ratio == 1 the scales are 1 → identical to v9 behavior.
-            q = apply_rotary_emb(q, self.rope.get(H, W, x.device))
-            k = apply_rotary_emb(
-                k,
-                self.rope.get(H_kv, W_kv, x.device, scale_h=H / H_kv, scale_w=W / W_kv),
-            )
+            q_cis = self.rope.get(H, W, x.device)
+            q = apply_rotary_emb(q, q_cis)
+            # Same grid (sr_ratio 1, e.g. stage 4): the key phases are the
+            # query phases — no second computation.
+            k_cis = q_cis if (H_kv, W_kv) == (H, W) else self.rope.get(
+                H_kv, W_kv, x.device, scale_h=H / H_kv, scale_w=W / W_kv)
+            k = apply_rotary_emb(k, k_cis)
 
         dropout_p = self.attn_drop.p if self.training else 0.0
         if self.num_kv_heads == self.num_heads:

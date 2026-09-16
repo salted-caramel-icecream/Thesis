@@ -22,9 +22,11 @@ your LR.
 
 | Parameter | Value | Config key | Basis |
 |---|---|---|---|
-| Backbone | PVT v2 B1, depths [2,2,2,2], dims [64,128,320,512] | `model.depths`, `model.embed_dims` | your choice |
+| Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
+| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | `model.num_kv_heads` (None = heads) | PVT v2; GQA (`[1,1,1,2]`, v9 lineage) stays available as an ablation |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
+| RoPE | mode **mixed** (RoPE-Mixed: learnable per-head 2D frequencies, one `attn.rope.freqs` per RoPE'd block, no weight decay, MHA only); `--rope-mode axial` = fixed frequencies (run tag `-ax`). theta: **10** for mixed — sets only the init spread of the frequencies — / **50** for axial — the frequencies themselves | `ablation.rope_mode`, `ablation.rope_theta` (None = per-mode default) | rope-vit (Heo et al. ECCV'24): RoPE-Mixed models use theta 10, axial 100; 50 is this repo's axial choice for the 7×7 stage-4 grid |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
 | Epochs | **90** (ablations) / 150 / 300 (final) | `epochs` | ScMoE runs vision comparisons at 90 ep on IN-1K; PVT v2's own recipe is 300 |
 | Batch size | 1024 | `batch_size` | PVT v2 |
@@ -45,6 +47,60 @@ your LR.
 | `drop_path_rate` | 0.1 | 0.1 | 0.15 |
 
 Set `model.drop_path_rate` explicitly to override.
+
+### Variants (`model.variant`, `--variant`)
+
+| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
+| **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |
+| b2 | [3,4,6,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 25.4 / 25.36 | 3.88 | 0.1 | — | `OpenGVLab/pvt_v2_b2` | 82.0 |
+| b3 | [3,4,18,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 45.2 / 45.24 | 6.68 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b3` | 83.1 |
+| b4 | [3,8,27,3] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 62.6 / 62.56 | 9.79 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b4` | 83.6 |
+| b5 | [3,6,40,3] | [64,128,320,512] | [1,2,5,8] | [4,4,4,4] | [8,4,2,1] | 82.0 / 81.96 | 11.35 | 0.3 | 1.0 | `OpenGVLab/pvt_v2_b5` | 83.8 |
+
+Sources (the table in `config.VARIANTS` cites the same):
+
+- depths / dims / heads / ratios: [whai362/PVT](https://github.com/whai362/PVT),
+  branch `v2` @ `57e2dfaa5a46f9050d76f306a4fcd9a7c061f520`,
+  `classification/pvt_v2.py` (`pvt_v2_b0` … `pvt_v2_b5`). timm 1.0.29's
+  `timm/models/pvt_v2.py` defines the same sizes identically.
+- official `drop_path` / `clip_grad`: same repo,
+  `classification/configs/pvt_v2/pvt_v2_b*.py` — what each size was trained
+  with in the official 300-epoch recipe.
+- official params and top-1: same repo, README "PVTv2 on ImageNet-1K".
+- HF checkpoints: huggingface/transformers
+  `models/pvt_v2/convert_pvt_v2_to_pytorch.py` and the PvtV2 model doc (the
+  ids the port was converted to). The Hub itself was not reachable from the
+  machine this was verified on; `load_hf_pretrained` refuses any checkpoint
+  whose `depths` / `hidden_sizes` differ from the built model, so a wrong id
+  fails at load, never silently.
+- "this repo" columns: measured with `build_model` (dense, no MoE/RoPE) at
+  224². MACs from `torch.utils.flop_counter` (matmul/conv only, so a few
+  percent under a paper GFLOPs count that includes norms and activations).
+  The paper's own GFLOPs column (arXiv 2106.13797) was not reachable and is
+  not reproduced here. Attention is plain MHA by default (kv heads = heads),
+  so the parameter count matches the official one; the GQA ablation
+  (`model.num_kv_heads`, e.g. the v9 lineage's [1,1,1,2]) trims it slightly
+  (12.86 M for B1).
+
+Three rules the code enforces:
+
+- **A variant is one set.** An explicit `model.depths` (or dims / heads /
+  ratios) that disagrees with `model.variant` is rejected, and so is another
+  variant's official checkpoint under `--hf-id`. `--variant custom` hands the
+  architecture to you (unset fields fall back to B1's) and never fills
+  `pretrained_hf_id`.
+- **Placement is depth-independent.** The default `[[],[],[],[-1]]` is the
+  last block of stage 4 whatever the depth (block 1 in B1, block 2 in B2);
+  see §2.
+- **Stochastic depth is still derived by the B1-anchored rule above** (B1 and
+  B2 were both officially trained at 0.1, so the derivation is identical for
+  the two sizes this thesis uses). B3–B5 were trained at 0.3; the derivation
+  does not know that yet and prints the discrepancy — pass `--drop-path 0.3`
+  for those sizes until the rule is made variant-aware.
+
+B2-Linear is not a variant: linear (pooling) attention is `model.linear_attention`.
 
 ### Augmentation — DeiT-1 stack, fixed across all runs
 
@@ -101,7 +157,7 @@ Not applied automatically — pass --lr.
 |---|---|---|---|
 | Experts (N) | 4 | `model.moe.num_experts` | Sweet Spot runs E=4 and 8 on IN-1k; larger counts need more data to avoid overfitting |
 | top-k | 1 | `model.moe.top_k` | Tutel: SwinV2-B is 85.5 at both k=1 and k=2; k=2 costs +25% activated params, ~17% train speed |
-| Placement | stage 4, last layer only — 1 MoE layer | `ablation.moe_placement: [[],[],[],[1]]` | ViMoE's representative config is L=1; Sparse Upcycling finds last-consecutive-layer conversion gives the smallest initial drop |
+| Placement | stage 4, last layer only — 1 MoE layer | `ablation.moe_placement: [[],[],[],[-1]]` (−1 = the stage's last block whatever the variant's depth: block 1 in B1, block 2 in B2) | ViMoE's representative config is L=1; Sparse Upcycling finds last-consecutive-layer conversion gives the smallest initial drop |
 | Shared expert | 1, always-on, added to routed output | `model.moe.shared_expert` | ViMoE 83.9 → 84.2; ScMoE 79.53 vs 78.95 (top-1) |
 | Capacity factor | 1.0 | `model.moe.capacity_factor` | Tutel's default; their Table 12 gives 38.5 @ 892 img/s vs 38.6 @ 839 for f=1.25 |
 | Aux loss coefficient | 0.01 | `loss.aux_weight` | Tutel, ScMoE, ViMoE, Sweet Spot — unanimous |
@@ -124,7 +180,11 @@ tokens out of order and pads to capacity, so the routed branch has no H×W to
 convolve over. A block with `shared_expert: false` therefore has no conv at
 all, and the flag resolves to false.
 
-Independent of `use_rope`, giving four arms, all distinctly named:
+Independent of `use_rope`, giving four arms, all distinctly named. The RoPE
+in these arms is **RoPE-Mixed** by default (`rope_mode: mixed`, learnable
+per-head frequencies, so the MoE'd block can tune *which* directions and
+frequencies it attends by); `--rope-mode axial` is the fixed-frequency
+control and appends `-ax` to the rope fragment:
 
 | Arm | Flags | Run name fragment |
 |---|---|---|
@@ -132,6 +192,7 @@ Independent of `use_rope`, giving four arms, all distinctly named:
 | RoPE replaces the conv | `--no-moe-dwconv --rope` | `+sh-plain_rope-s4b1` |
 | both | `--moe-dwconv --rope` | `+sh_rope-s4b1` |
 | neither | `--no-moe-dwconv --no-rope` | `+sh-plain_norope` |
+| both, fixed axial RoPE | `--moe-dwconv --rope --rope-mode axial` | `+sh_rope-s4b1-ax` |
 
 Ready-made: `configs/scratch_10..12_*.yaml`.
 
@@ -150,6 +211,40 @@ in full and reports the skip rather than dropping it silently:
 
 Any *other* source tensor without a destination is a `WARNING`, not a quiet
 drop — `tests/test_shared_expert.py` asserts both messages.
+
+### RoPE-Mixed frequency diagnostics
+
+With the default `rope_mode: mixed` every RoPE'd block trains a
+`(2, heads, head_dim//2)` frequency tensor (`[0]` = ω_x, `[1]` = ω_y).
+`RopeFreqSnapshot` saves those tensors to
+`<checkpoint_root>/<run_name>/rope_freqs_init.pt` at step 0 and
+`rope_freqs_final.pt` at the end of fit (every `.ckpt` carries them too, as
+`model.block4.1.attn.rope.freqs`). `tools/plot_rope_freqs.py` draws them —
+one row per RoPE'd layer grouped by stage, vector PDF into `figures/` — and
+prints a per-layer table (`collapsed` fraction, `axis-aligned` fraction,
+`mean disp` from init):
+
+```bash
+python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
+    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
+```
+
+Four views, and what to read off each:
+
+| View | Healthy | Warning sign |
+|---|---|---|
+| (ω_x, ω_y) scatter, one colour per head, axial ladder `1/θ^(4k/d)` as `+` on both axes | a spread cloud — every head at its own angle, magnitudes along the ladder | a blob at the origin (frequencies collapsed: the block is drifting to position-blind); every point on an axis (reverted to axial) |
+| angle histogram, `atan2(ω_y, ω_x)` folded to [0°, 180°) | mass spread over the range | spikes at 0° and 90° = reverted to axial; one spike = every head learned the same direction |
+| log-magnitude histogram of \|ω\| | mass on or around the init ladder | mass piling up near \|ω\| = 0 = low-frequency collapse (RoPE degenerating into "no position") |
+| init → trained overlay (hollow init markers, thin segments to the trained point) | short segments in varied directions | long segments all pointing at the origin, or all rotating onto an axis |
+
+The **stage-4 panel** (the MoE'd block: `block4.1` in B1, `block4.2` in B2)
+is the one the thesis story rests on — it is where the routed FFN dropped
+PVT v2's DWConv, so RoPE is that block's positional signal. Spread there
+means the learnable frequencies kept position where MoE removed it; collapse
+there while dense-stage panels (`--rope-last-n 4` runs) stay spread means
+position is being lost exactly where MoE removed it. The `-ax` run is the
+fixed-frequency control. The tool needs only torch + matplotlib, no GPU.
 
 ---
 
@@ -184,6 +279,20 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 | Routed experts' fc2 | **zero-init** — the default here | `model.moe.upcycle_init: "routed_zero"` |
 | Optimizer state | unavailable | — |
 | Expert symmetry breaking | none | Sparse Upcycling B.9 |
+
+### What the function-preservation claim has been verified against
+
+| Check | Backend it ran on | Where |
+|---|---|---|
+| HF path: whole model, dense vs upcycled, < 1e-4 | fake Tutel (Tutel's parameter layout, every token to expert 0, no dispatch) | `tests/test_shared_expert.py::test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval` |
+| HF path: block-level, < 1e-5 | fake Tutel; native (real top-1 routing) | `test_shared_expert.py`, `test_native_moe.py::test_R2_*` |
+| ssl_init path: whole model, < 1e-4 (measured 0.0) | fake Tutel **and** native | `tests/test_ssl_init.py::test_ssl_init_upcycled_model_matches_the_dense_backbone_to_1e4` |
+| Real Tutel expert arithmetic (`FusedExpertsNetwork`): seeded expert == dense FFN, zeroed expert == 0 | real Tutel *expert module only* (no `moe_layer` dispatch/combine), CPU, one-off script | not in the suite |
+| Real Tutel `moe_layer` end to end, both paths, 224², GPU | **never run yet** | `python tools/verify_upcycling.py --variant b1 --hf` on the GPU box |
+
+The suite always uses the fake Tutel layer even when Tutel is installed, so
+a green suite says nothing about Tutel's dispatch/combine. Run the tool once
+on the GPU box (Tutel pinned to `9a70a681`) before trusting the claim there.
 
 ### Which branch starts at zero — a deliberate departure from the spec
 
@@ -269,7 +378,7 @@ A row sets only what the spec's table names for it; everything else comes from
 the recipe and your own flags, and named flags override the row. Rows print a
 `[ladder]` line naming what they set, plus a note wherever the spec left a
 choice open (marked **(choice)** below). Run names self-document
-(`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`) and are distinct across
+(`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
 every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
 enforces that, since a collision would mean two runs sharing a checkpoint
 directory and a W&B run.
@@ -334,7 +443,7 @@ Defaults are sized for a 12 GB card at 224², bf16:
 
 | Key | Value | Why |
 |---|---|---|
-| `batch_size` | 128 | micro-batch; ~0.035 GiB/image for PVT v2 B1 at 224² leaves headroom under the ~10.5 GB free after the desktop |
+| `batch_size` | 128 | micro-batch; ~0.035 GiB/image for PVT v2 B1 at 224² leaves headroom under the ~10.5 GB free after the desktop. **B2 is ~1.9× that per image** — start at 64 × 16 (below) |
 | `accumulate_grad_batches` | 8 | derived, so the effective batch stays 1024 |
 | `val_batch_multiplier` | 2 | val batch 256 — no gradients, so roughly half the memory per image |
 | `num_workers` | 8 | Windows has no `fork()`, so workers **spawn** and each re-imports the module; 4–8 is the sweet spot on 32 GB |
@@ -373,9 +482,24 @@ the same suggestion from the VRAM *actually free on your machine*, which is
 the number to trust:
 
 ```
-suggested batch: --batch-size 128 --accum 8 (= 1024 effective; estimate from 10.3 GiB free)
+suggested batch: --batch-size 128 --accum 8 (= 1024 effective for variant b1; estimate from 10.3 GiB free)
                  --grad-checkpointing "[1]" typically allows 256-512
 ```
+
+**Other sizes scale the micro-batch by their activation cost** relative to
+B1 (MACs at 224²: B0 0.53 G, B1 2.03 G, B2 3.88 G; `env.gib_per_image`
+applies the ratio, ~0.27× for B0 and ~1.9× for B2). The same rows become:
+
+| GPU | VRAM | B0 `--batch-size` × `--accum` | B2 `--batch-size` × `--accum` | Notes |
+|---|---|---|---|---|
+| RTX 5070 | 12 GB | **512 × 2** | **64 × 16** | what `--check-env --variant b0` / `b2` suggests from ~10.3 GB free |
+| RTX 5090 | 32 GB | 1024 × 1 | 256 × 4 | |
+| H100 / H200 / B200 | 80–180 GB | 1024 × 1 | 512 × 2 to 1024 × 1 | B2 at 1024 × 1 should fit on 80 GB; measure one epoch first |
+
+Effective batch stays 1024 in every row, so the recipe's LR is unchanged.
+Expect roughly ¼ (B0) and 2× (B2) of B1's wall clock per epoch; B0 will be
+data-loader-bound on anything above a 5070, so raise `--num-workers` first.
+B3–B5 follow the same rule (3.3×, 4.8×, 5.6×) but were not sized here.
 
 Three things worth knowing before picking a row:
 
@@ -425,7 +549,17 @@ ImageNet-100 subset for the ladder with IN-1k only for the final run, or
 
 ImageNet-1k as an Arrow snapshot is ~160 GB, which fits a 579 GB disk with
 room for checkpoints. **ImageNet-22k is roughly 1.3 TB and will not fit** —
-`dataset.name: "imagenet-22k"` needs external storage. Checkpoints accumulate
+`dataset.name: "imagenet-22k"` needs external storage.
+
+| Dataset | `dataset.name` | Snapshot | Free while building | Licence / access | Use |
+|---|---|---|---|---|---|
+| ImageNet-1k | `imagenet-1k` | ~160 GB | ~320 GB | ImageNet terms, gated, `HF_TOKEN` | supervised + SSL + probe |
+| ImageNet-22k | `imagenet-22k` | ~1.3 TB | ~2.6 TB | gated, `HF_TOKEN` | supervised |
+| PASS | `pass` | ~166 GB | ~333 GB (staged build; ~500 GB naive) | CC-BY 4.0, not gated | **SSL pretraining only** (`task: "ssl"`); no labels, no val split |
+
+PASS and ImageNet-1k together need ~330 GB of snapshots plus the transient
+build peak of whichever is built second — build one, delete its Arrow cache,
+then build the other. Checkpoints accumulate
 under `checkpoint_root/<run_name>/` (`save_top_k=2` plus `last`, so ~3 files
 × ~170 MB per run) and nothing deletes them automatically.
 

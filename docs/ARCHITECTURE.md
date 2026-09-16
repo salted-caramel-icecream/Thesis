@@ -1,6 +1,8 @@
 # Architecture & invariants
 
-The model is a **custom** PVT v2 B1 — not the stock implementation. Three
+The model is a **custom** PVT v2 (B1 by default; `model.variant` selects
+B0–B5, each an official size with its own checkpoint) — not the stock
+implementation. Three
 modifications distinguish it, and each carries invariants that must not be
 broken by future edits.
 
@@ -16,21 +18,23 @@ Attribute naming is PVT-official (`patch_embed{i}`, `block{i}`, `norm{i}`,
 `head`) — **the HF pretrained remap in `models/pretrained.py` depends on these
 names.** Renaming them silently breaks warm starts (they load 0 weights).
 
-## 1. GQA attention (`models/attention.py`)
+## 1. Attention (`models/attention.py`)
 
-SRA (spatial-reduction attention) exactly as PVT v2, but with separate
-`q` / fused `kv` projections and grouped-query attention. With the default
-`num_kv_heads = [1,1,1,2]` vs `num_heads = [1,2,5,8]`: stage 1 is plain MHA
-(1:1), stages 2–3 are MQA (one kv head shared across 2 and 5 query heads),
-stage 4 is 8:2 GQA.
+SRA (spatial-reduction attention) exactly as PVT v2, with separate `q` /
+fused `kv` projections, computed by `F.scaled_dot_product_attention`. The
+default is plain multi-head attention (`num_kv_heads` = `num_heads`,
+[1,2,5,8]), which is the unmasked SDPA call that dispatches to the flash
+kernel on CUDA under bf16 — nothing to install. Grouped-query attention is
+an ablation: set fewer kv heads per stage (the v9 lineage ran
+`num_kv_heads = [1,1,1,2]`: stage 1 MHA, stages 2–3 MQA, stage 4 8:2 GQA).
 
-- SDPA `enable_gqa=True` needs torch ≥ 2.5; older torch takes a
+- Under GQA, SDPA `enable_gqa=True` needs torch ≥ 2.5; older torch takes a
   `repeat_interleave` fallback (correct, slower) so CPU tests run anywhere.
 - HF checkpoints have separate k/v — the loader **fuses** them
-  (`torch.cat([k, v], dim=0) → attn.kv`). Stages whose kv-head count differs
-  from HF's (stages 2–4 with the defaults — only stage 1's kv actually loads)
-  get a shape mismatch on the fused kv and are skipped by design (counted as
-  `kv_skipped`).
+  (`torch.cat([k, v], dim=0) → attn.kv`). With the MHA default every stage's
+  kv loads. Under a GQA ablation the stages whose kv-head count differs from
+  HF's get a shape mismatch on the fused kv and are skipped by design
+  (counted as `kv_skipped`).
 
 ## 2. MoE FFN (`models/ffn.py`)
 
@@ -155,19 +159,71 @@ archived MegaBlocks attempt silently seeded nothing that way).
 
 ## 3. RoPE (`models/rope.py`)
 
-2D axial complex-multiplication RoPE (rope-vit, Heo et al. ECCV'24),
-`theta=50` tuned for the 7×7 stage-4 grid.
+2D complex-multiplication RoPE after rope-vit (Heo et al. ECCV'24; reference
+`naver-ai/rope-vit` `deit/models_v2_rope.py` @ 48d8df50), in two flavours
+selected by `model.ablation.rope_mode`:
+
+| | `mixed` (default) | `axial` |
+|---|---|---|
+| frequencies | **learnable**: one 2D vector (ω_x, ω_y) per channel per head | fixed ladder; half the channels rotate with x, the other half with y |
+| phase at (x, y) | ω_x·x + ω_y·y | ω·x or ω·y |
+| parameters | `block{S}.{B}.attn.rope.freqs`, shape `(2, heads, head_dim//2)` | none |
+| `rope_theta` | 10 — sets only the **initial** magnitude ladder | 50 — the frequencies themselves (the paper uses 100; 50 suits the 7×7 stage-4 grid) |
+| run tag | `rope-s4b1` (untagged) | `rope-s4b1-ax` |
+| attention | MHA only: `num_kv_heads == num_heads` in every RoPE'd stage | MHA or GQA |
+
+**Parameter semantics (mixed).** `freqs[0]` is ω_x, `freqs[1]` is ω_y; dim 1
+is the head, dim 2 the frequency channel (`head_dim // 2` complex pairs — the
+adjacent real dims `(2c, 2c+1)` of q and k). Init is `init_mixed_freqs`, a
+port of the reference's `init_random_2d_freqs`: magnitudes
+`1 / theta ** (4k / head_dim)` for `k = 0 … head_dim//4 − 1`, one random
+angle φ_h per head from the global torch RNG (seed it), the first
+`head_dim // 4` channels at φ_h and the second `head_dim // 4` at φ_h + π/2.
+The reference stacks all layers into one model-level
+`(2, depth, heads · head_dim//2)` parameter; here each attention module owns
+its own, so a RoPE'd block adds exactly `heads · head_dim` parameters (B1
+stage 4: 8 × 64 = 512).
+
+Invariants, both flavours unless stated:
 
 - Q is rotated on the full (H, W) grid; K on the SR-reduced (H_kv, W_kv)
   grid **expressed in full-grid units** (centered coordinate scaling
-  `(i+0.5)·s − 0.5`, exact identity at s=1) so q–k relative phases stay
-  geometrically meaningful when RoPE is placed in stages with `sr_ratio > 1`;
-  V never.
+  `(i+0.5)·s − 0.5` with `s = H/H_kv`, exact identity at s=1) so q–k relative
+  phases stay geometrically meaningful when RoPE is placed in stages with
+  `sr_ratio > 1`; V never. Mixed frequencies are per *query* head, which is
+  why K must carry the same head count — `validate_config` and `GQAttention`
+  both reject mixed + GQA with a message that names the fix.
 - `head_dim % 4 == 0` wherever RoPE is enabled (validated in config).
-- Rotation runs in fp32 and casts back — intentional under bf16 (complex
-  phase accuracy); the cache stays complex64 on-device, keyed by (H, W, device).
-- No parameters, nothing in the state_dict — RoPE caches never transfer via
-  checkpoints and never need to.
+- The mixed phase `exp(i(ω_x·x + ω_y·y))` is computed in fp32 with autocast
+  disabled (`compute_mixed_cis`), and the rotation itself runs in fp32 and
+  casts back — intentional under bf16-mixed (complex phase accuracy). The
+  axial cache stays complex64 on-device, keyed by (H, W, scale, device);
+  mixed phases are recomputed every call because the frequencies change
+  every step.
+- `*.rope.freqs` is **excluded from weight decay**: `configure_optimizers`
+  puts it in the no-decay groups with the biases and norm weights (the
+  reference lists `freqs` under `no_weight_decay`). Decaying it pulls every
+  frequency toward zero, i.e. toward position blindness.
+- **Step-0 snapshot.** `RopeFreqSnapshot` (`engine/callbacks.py`, always in
+  `build_trainer`'s callback list) captures the step-0 frequencies the first
+  time a run starts without a checkpoint, keeps them in its callback state
+  (persisted in every checkpoint), and writes `rope_freqs_init.pt` from that
+  state — never from restored weights, since Lightning restores a checkpoint
+  before `on_fit_start` — plus `rope_freqs_final.pt` after every epoch, into
+  `<checkpoint_root>/<run_name>/`, both `{param_name: fp32 CPU tensor}`.
+  `tools/plot_rope_freqs.py` overlays the two. Lightning checkpoints carry
+  the same tensors under the `model.` prefix
+  (`model.block4.1.attn.rope.freqs`), so resume restores them.
+- **Mixed with `rotate=False` init is axial.** φ_h = 0 puts the x-channels
+  on the x axis and the y-channels on the y axis, and `compute_mixed_cis`
+  then reproduces `compute_axial_cis` for the same theta on the full and on
+  the scaled grid (`tests/test_rope_mixed.py`). That is the one closed-form
+  check on the mixed path; keep it passing.
+- **Nothing about RoPE is in an HF checkpoint.** The axial cache is not a
+  parameter, and the mixed `freqs` has no source tensor, so the HF loader
+  leaves it at its init (`test_hf_loader_leaves_freqs_alone`). A warm start
+  therefore always begins with random-angle frequencies — one reason the
+  init snapshot exists.
 
 ## Norm ablation (`models/norms.py`)
 
@@ -191,7 +247,8 @@ rejects out-of-range indices before any GPU time is spent.
 
 - stage 4 + head at `lr × stage4_lr_multiplier` (default 10×) — the
   discriminative-LR scheme that replaced stage freezing in the v7 lineage.
-- no-decay = `p.ndim <= 1` (all biases and norm weights), timm rule. The v9
+- no-decay = `p.ndim <= 1` (all biases and norm weights, timm rule) plus
+  every parameter named `*.rope.freqs` (RoPE-Mixed frequencies, §3). The v9
   notebook decayed norms/biases — known deviation from ViT practice, fixed.
 
 Schedule: LinearLR warmup (`warmup_epochs`) → CosineAnnealing
@@ -211,7 +268,7 @@ reads low by construction; report `val_acc`.
 
 - v9 lineage (Tutel MoE stage 4, HF-pretrained, full FT, discriminative LR):
   **72.27%** val top-1 @ epoch 53 (ImageNet-1k, B200, batch 1024).
-- PVT v2 B1 official supervised baseline: 78.7% (300-epoch recipe) — the gap
+- PVT v2 official supervised baselines: B1 78.7%, B2 82.0% (300-epoch recipe) — the gap
   is expected at these epoch budgets; compare ablations against each other,
   not against the official number.
 - Throughput anchor (A100, batch 128): ~468 img/s ≈ 47 min/epoch on full

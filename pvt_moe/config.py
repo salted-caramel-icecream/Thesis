@@ -13,7 +13,7 @@ Typical use::
 
     cfg = merge_config(default_config(), {
         "model": {"norm_type": "rmsnorm",
-                  "ablation": {"moe_placement": [[], [], [], [1]]}},
+                  "ablation": {"moe_placement": [[], [], [], [-1]]}},
         "dataset": {"name": "imagenet-1k"},
     })
     cfg = validate_config(cfg)   # derives num_classes, run_name, placements
@@ -28,13 +28,21 @@ import json
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Class counts are DERIVED from dataset.name — never hand-set num_classes.
+#: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
+#: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
+#: refused by every supervised recipe at validate time. PASS (Asano et al.,
+#: NeurIPS Datasets & Benchmarks 2021; HF ``yukimasano/pass``): 1,439,588
+#: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
-NUM_CLASSES = {
-    "imagenet-1k": 1000,
-    "imagenet-22k": 21841,
+DATASETS = {
+    "imagenet-1k": {"num_classes": 1000, "labelled": True, "tag": "in1k"},
+    "imagenet-22k": {"num_classes": 21841, "labelled": True, "tag": "in22k"},
+    "pass": {"num_classes": 0, "labelled": False, "tag": "pass"},
 }
+#: Class counts are DERIVED from dataset.name — never hand-set num_classes.
+NUM_CLASSES = {name: spec["num_classes"] for name, spec in DATASETS.items()}
+VALID_TASKS = ("supervised", "ssl")
 
 VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
 VALID_NORMS = ("layernorm", "rmsnorm")
@@ -60,10 +68,68 @@ VALID_RECIPES = ("scratch", "pretrained")
 #:                   and what a from-scratch run uses (nothing is upcycled).
 VALID_UPCYCLE_INITS = ("routed_zero", "shared_zero", "none")
 
+#: RoPE flavour (rope-vit, Heo et al. ECCV'24). "mixed" learns one 2D
+#: frequency vector per channel per head per RoPE'd block; "axial" keeps the
+#: fixed x/y ladder. Each has its own reference theta (init spread for mixed).
+VALID_ROPE_MODES = ("mixed", "axial")
+ROPE_THETA_DEFAULT = {"mixed": 10.0,   # rope-vit RoPE-Mixed models
+                      "axial": 50.0}   # this repo's axial choice (7x7 stage-4 grid)
+
 #: Sanctioned epoch budgets for the from-scratch ablation ladder.
 #: 90 = ablation runs, 300 = final run (PVT v2's own recipe); 150 is the
 #: middle budget. Other values are allowed but are off-ladder.
 SCRATCH_EPOCH_CHOICES = (90, 150, 300)
+
+#: Official PVT v2 sizes. Every value below was read from the official
+#: implementation, not inferred:
+#:
+#:   depths / embed_dims / num_heads / mlp_ratios / sr_ratios —
+#:     github.com/whai362/PVT, branch ``v2`` @ 57e2dfaa5a46f9050d76f306a4fcd9a7c061f520,
+#:     ``classification/pvt_v2.py`` (``pvt_v2_b0`` .. ``pvt_v2_b5``). timm 1.0.29
+#:     ``timm/models/pvt_v2.py`` defines the same seven sizes identically.
+#:   drop_path / clip_grad (the values the official 300-epoch recipe trained
+#:     each size with) — same repo, ``classification/configs/pvt_v2/pvt_v2_b*.py``.
+#:   params_m / top1 — same repo, README "PVTv2 on ImageNet-1K" table.
+#:   hf_id — huggingface/transformers ``models/pvt_v2/convert_pvt_v2_to_pytorch.py``
+#:     and ``docs/source/en/model_doc/pvt_v2.md`` (the checkpoints the HF port
+#:     was converted to). ``OpenGVLab/pvt_v2_b2_linear`` (B2-Li) is not listed
+#:     because linear attention is a separate flag here (``linear_attention``).
+#:
+#: A named variant fills the ``None`` architecture fields of ``_DEFAULT["model"]``
+#: as ONE set and rejects any explicit value that disagrees (``apply_variant``),
+#: so it is impossible to build B2 depths and load B1 weights into them.
+VARIANTS = {
+    "b0": {"depths": [2, 2, 2, 2],   "embed_dims": [32, 64, 160, 256],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 3.7,  "top1": 70.5,
+           "hf_id": "OpenGVLab/pvt_v2_b0"},
+    "b1": {"depths": [2, 2, 2, 2],   "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 14.0, "top1": 78.7,
+           "hf_id": "OpenGVLab/pvt_v2_b1"},
+    "b2": {"depths": [3, 4, 6, 3],   "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.1, "clip_grad": None, "params_m": 25.4, "top1": 82.0,
+           "hf_id": "OpenGVLab/pvt_v2_b2"},
+    "b3": {"depths": [3, 4, 18, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 45.2, "top1": 83.1,
+           "hf_id": "OpenGVLab/pvt_v2_b3"},
+    "b4": {"depths": [3, 8, 27, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [8, 8, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 62.6, "top1": 83.6,
+           "hf_id": "OpenGVLab/pvt_v2_b4"},
+    "b5": {"depths": [3, 6, 40, 3],  "embed_dims": [64, 128, 320, 512],
+           "num_heads": [1, 2, 5, 8], "mlp_ratios": [4, 4, 4, 4], "sr_ratios": [8, 4, 2, 1],
+           "drop_path": 0.3, "clip_grad": 1.0,  "params_m": 82.0, "top1": 83.8,
+           "hf_id": "OpenGVLab/pvt_v2_b5"},
+}
+#: The architecture fields a variant owns, in the order they are reported.
+VARIANT_ARCH_KEYS = ("depths", "embed_dims", "num_heads", "mlp_ratios", "sr_ratios")
+#: ``"custom"`` leaves the architecture to you: fields you set are kept, fields
+#: you leave as None fall back to B1's, and ``pretrained_hf_id`` is never
+#: filled in (a custom architecture has no official checkpoint).
+VALID_VARIANTS = tuple(VARIANTS) + ("custom",)
 
 #: Batch size the recipes' peak LRs are calibrated for (PVT v2: 1e-3 @ 1024).
 #: Only the EFFECTIVE batch matters here — micro-batch is a memory choice.
@@ -138,13 +204,48 @@ RECIPES = {
 # Default configuration (reproduces the v9 training recipe)
 # ---------------------------------------------------------------------------
 
+#: JEPA pretraining defaults (``cfg["ssl"]``; pvt_moe.ssl.jepa). Living here
+#: means ``validate_config`` accepts the block and catches typos inside it.
+#: ``lr`` is the I-JEPA value for a global batch of ``lr_reference_batch``;
+#: like the supervised recipe it is NOT rescaled automatically — LitJEPA
+#: prints the resolved LR, the effective batch and what linear scaling
+#: would give, and you decide.
+SSL_DEFAULTS = {
+    "epochs": 100,
+    "lr": 1.5e-3,
+    "lr_reference_batch": 2048,
+    "warmup_epochs": 15,
+    "final_lr": 1e-6,
+    "weight_decay": 0.04,         # cosine-ramped to weight_decay_end
+    "weight_decay_end": 0.4,
+    "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
+    "ema_momentum_end": 1.0,
+    "mask_n_blocks": 4,
+    "mask_block_area": [0.10, 0.20],
+    "mask_aspect_ratio": [0.75, 1.5],
+    "predictor_dim": 384,
+    "predictor_depth": 6,
+    "predictor_heads": 6,
+    "grad_clip": 3.0,
+}
+
+
 _DEFAULT: dict = {
-    "version": "v10",
+    # Run-name prefix. "sv1" = the September 2026 edit of the architecture
+    # (variants, MHA-by-default, depth-independent placement); the earlier
+    # code arch was "v10". Bump it when the architecture changes so old and
+    # new runs never share a W&B name or checkpoint directory.
+    "version": "sv1",
     # Which recipe fills the fields left as None below (see RECIPES).
     #   "scratch"    - full from-scratch training, PVT v2 recipe
-    #   "pretrained" - warm start from OpenGVLab/pvt_v2_b1 + upcycled experts
+    #   "pretrained" - warm start from the variant's OpenGVLab/pvt_v2_b*
+    #                  checkpoint + upcycled experts
     # Setting `recipe` also sets `mode` unless you set `mode` yourself.
     "recipe": "scratch",
+    # "supervised" (train.py, LitClassifier) | "ssl" (JEPA pretraining,
+    # notebooks/03). Decides which datasets are admissible: an unlabelled
+    # corpus (PASS) is refused unless task is "ssl".
+    "task": "supervised",
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
     "experiment_group": "ablations",
@@ -153,7 +254,7 @@ _DEFAULT: dict = {
     "deterministic": False,
     # How the model weights are initialized / training is started:
     #   scratch       - random init
-    #   hf_pretrained - load OpenGVLab/pvt_v2_b1 via key remap (+ MoE expert
+    #   hf_pretrained - load OpenGVLab/pvt_v2_b<variant> via key remap (+ MoE expert
     #                   seeding from the dense FFN when use_moe)
     #   ssl_init      - load a JEPA-pretrained backbone checkpoint
     #   resume        - full Lightning resume (model+optimizer+scheduler) from
@@ -172,6 +273,12 @@ _DEFAULT: dict = {
     # first 90 epochs of a 300-epoch schedule -- not a compressed 90-epoch one.
     # Resume later with mode "resume" and a larger (or absent) stop_at_epoch.
     "stop_at_epoch": None,
+    # Cap the batches per epoch (int = count, float = fraction, None = all).
+    # For throughput / wall-clock checks (notebooks/quick_bench.ipynb), never
+    # for a real run: the cosine still spans `epochs`, so a capped epoch is a
+    # shorter epoch, not a faster schedule.
+    "limit_train_batches": None,
+    "limit_val_batches": None,
 
     # None => recipe default (scratch: 90, pretrained: 100). For from-scratch
     # ablations pick one of config.SCRATCH_EPOCH_CHOICES == (90, 150, 300);
@@ -203,12 +310,13 @@ _DEFAULT: dict = {
     "use_tensorboard": False,
 
     "dataset": {
-        "name": "imagenet-1k",            # "imagenet-1k" | "imagenet-22k"
+        "name": "imagenet-1k",            # "imagenet-1k" | "imagenet-22k" | "pass" (SSL only)
         "num_classes": None,              # DERIVED — leave None
         "img_size": 224,
         "arrow_dirs": {
             "imagenet-1k": "/workspace/ModelTraining/datasets/imagenet_arrow",
             "imagenet-22k": "/workspace/ModelTraining/datasets/imagenet22k_arrow",
+            "pass": "/workspace/ModelTraining/datasets/pass_arrow",
         },
         # DeiT-1 augmentation stack (PVT v2 inherits it), fixed across runs.
         # timm config string: magnitude 9, magnitude-std 0.5, increasing
@@ -226,16 +334,24 @@ _DEFAULT: dict = {
 
     "model": {
         "in_chans": 3,
-        # PVT v2 B1 sizing.
-        "embed_dims": [64, 128, 320, 512],
-        "num_heads": [1, 2, 5, 8],
-        # Grouped-query attention: kv heads per stage (equal to num_heads =>
-        # standard MHA). Defaults (v9 lineage): stage 1 MHA, stages 2-3 MQA
-        # (1 kv head), stage 4 8:2 GQA.
-        "num_kv_heads": [1, 1, 1, 2],
-        "mlp_ratios": [8, 8, 4, 4],
-        "depths": [2, 2, 2, 2],
-        "sr_ratios": [8, 4, 2, 1],
+        # Which official PVT v2 size to build: "b0".."b5" (VARIANTS) or
+        # "custom". A named variant fills every None architecture field below
+        # as ONE coherent set — depths, dims, heads, mlp/sr ratios AND
+        # pretrained_hf_id — and rejects an explicit value that disagrees, so
+        # B2 depths can never be paired with B1 weights. Default b1: the
+        # resolved config is byte-for-byte what it was before variants existed.
+        "variant": "b1",
+        "embed_dims": None,               # b1: [64, 128, 320, 512]
+        "num_heads": None,                # b1: [1, 2, 5, 8]
+        # kv heads per stage. None => equal to num_heads: standard multi-head
+        # attention, which takes the plain SDPA call and is eligible for the
+        # flash kernel under bf16 (attention.py). Set fewer kv heads per stage
+        # for grouped-query attention (the v9 lineage ran [1, 1, 1, 2]); that
+        # is an ablation, not the default, and not part of the variant table.
+        "num_kv_heads": None,
+        "mlp_ratios": None,               # b1: [8, 8, 4, 4]
+        "depths": None,                   # b1: [2, 2, 2, 2]
+        "sr_ratios": None,                # b1: [8, 4, 2, 1]
         "linear_attention": False,        # PVTv2-li pooling attention variant
         "qkv_bias": True,
         "drop_rate": 0.0,
@@ -270,21 +386,34 @@ _DEFAULT: dict = {
         # --- Placement ablations -------------------------------------------
         "ablation": {
             "use_moe": True,
-            # Per-stage list of block indices. [[], [], [], [0, 1]] == MoE in
-            # both blocks of stage 4 (the v9 configuration).
+            # Per-stage list of block indices. Negative indices count from the
+            # end of the stage (Python style), so -1 is "the last block"
+            # whatever the variant's depth: stage 4 has 2 blocks in B1 and 3 in
+            # B2, and a literal 1 would be the LAST block of one and the MIDDLE
+            # block of the other. [[], [], [], [0, 1]] == MoE in both blocks
+            # of stage 4 (the v9 configuration).
             # Stage 4, LAST block only — one MoE layer. Sparse Upcycling finds
             # last-consecutive-layer conversion gives the smallest initial
             # performance drop; ViMoE's representative config is L=1.
-            "moe_placement": [[], [], [], [1]],
+            "moe_placement": [[], [], [], [-1]],
             # Convenience: when not None, overrides moe_placement with
             # "all blocks of the last N stages".
             "moe_last_n_stages": None,
             "use_rope": True,
             # Matched to moe_placement by default: RoPE reinjects the position
             # the routed branch drops.
-            "rope_placement": [[], [], [], [1]],
+            "rope_placement": [[], [], [], [-1]],
             "rope_last_n_stages": None,
-            "rope_theta": 50.0,           # 50 suits the 7x7 stage-4 grid
+            # "mixed" (default): learnable per-head (ω_x, ω_y) frequencies,
+            # parameter `attn.rope.freqs` of shape (2, heads, head_dim//2) in
+            # every RoPE'd block, weight-decay excluded, snapshotted at step 0
+            # (rope_freqs_init.pt) for the drift plot (tools/plot_rope_freqs.py).
+            # "axial": fixed frequencies, no parameters (the v10 behaviour).
+            # Mixed needs num_kv_heads == num_heads in the RoPE'd stages.
+            "rope_mode": "mixed",
+            # None => ROPE_THETA_DEFAULT[rope_mode] (mixed 10.0, axial 50.0).
+            # For mixed it only sets the INITIAL magnitude ladder.
+            "rope_theta": None,
         },
 
         # --- MoE hyperparameters (previously hardcoded in the notebook) ----
@@ -332,9 +461,17 @@ _DEFAULT: dict = {
             "upcycle_init": None,
         },
 
-        "pretrained_hf_id": "OpenGVLab/pvt_v2_b1",
+        # None => the selected variant's official checkpoint (VARIANTS[..]["hf_id"],
+        # b1: OpenGVLab/pvt_v2_b1). Set it only for a checkpoint of your own;
+        # naming another variant's official id is rejected.
+        "pretrained_hf_id": None,
         # Seed MoE experts from the dense HF FFN weights (sparse upcycling).
         "seed_moe_from_dense": True,
+        # mode ssl_init: refuse a JEPA backbone whose saved architecture
+        # (variant, depths/widths, RoPE mode and placement, MoE placement)
+        # differs from this run instead of loading what fits and leaving the
+        # rest at random init. False downgrades the refusal to a warning.
+        "ssl_init_check_arch": True,
         "num_frozen_stages": 0,
     },
 
@@ -353,6 +490,9 @@ _DEFAULT: dict = {
         "warmup_start_factor": None,
         "eta_min": 1e-6,
     },
+
+    # JEPA pretraining knobs (see SSL_DEFAULTS); ignored by supervised runs.
+    "ssl": copy.deepcopy(SSL_DEFAULTS),
 
     "loss": {
         "aux_weight": 0.01,               # MoE load-balancing loss weight
@@ -379,7 +519,7 @@ def merge_config(base: dict, override: dict) -> dict:
     """Deep-merge ``override`` into a copy of ``base`` and return it.
 
     Dict values merge recursively; everything else (including lists) replaces
-    wholesale, so ``{"ablation": {"moe_placement": [[], [], [], [1]]}}``
+    wholesale, so ``{"ablation": {"moe_placement": [[], [], [], [-1]]}}``
     swaps the full placement list.
     """
     out = copy.deepcopy(base)
@@ -395,8 +535,11 @@ def resolve_placement(placement, last_n, depths):
     """Resolve a per-stage/per-block placement specification.
 
     ``placement`` is the authoritative form: a list (length = num stages) of
-    lists of block indices. ``last_n`` is a convenience that, when not None,
-    generates "all blocks of the last N stages".
+    lists of block indices. A negative index counts from the end of the stage
+    (``-1`` = last block), which is how "last block of stage 4" stays correct
+    across variants of different depth; the resolved form is always
+    non-negative. ``last_n`` is a convenience that, when not None, generates
+    "all blocks of the last N stages".
     """
     num_stages = len(depths)
     if last_n is not None:
@@ -412,13 +555,17 @@ def resolve_placement(placement, last_n, depths):
         )
     resolved = []
     for i, blocks in enumerate(placement):
-        blocks = sorted(set(int(b) for b in blocks))
+        normalized = set()
         for b in blocks:
-            if not 0 <= b < depths[i]:
+            b = int(b)
+            if not -depths[i] <= b < depths[i]:
                 raise ValueError(
-                    f"placement stage {i}: block index {b} out of range (depth {depths[i]})"
+                    f"placement stage {i + 1}: block index {b} out of range "
+                    f"(depth {depths[i]}: valid 0..{depths[i] - 1}, or "
+                    f"-1..-{depths[i]} counting from the last block)"
                 )
-        resolved.append(blocks)
+            normalized.add(b % depths[i])
+        resolved.append(sorted(normalized))
     return resolved
 
 
@@ -438,9 +585,14 @@ def _placement_tag(placement, depths) -> str:
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
-    Example: ``v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+    Example: ``sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+
+    The variant sits right after the version: two sizes in one W&B project
+    are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
+    checkpoint directory.
     """
-    ds = {"imagenet-1k": "in1k", "imagenet-22k": "in22k"}[cfg["dataset"]["name"]]
+    ds = DATASETS[cfg["dataset"]["name"]]["tag"]
+    variant = cfg["model"]["variant"]
     abl = cfg["model"]["ablation"]
     depths = cfg["model"]["depths"]
 
@@ -461,7 +613,7 @@ def build_run_tag(cfg: dict) -> str:
         # one checkpoint directory. Tagging it everywhere would put a marker on
         # every from-scratch run, which never upcycles anything.
         init_applies = (
-            cfg.get("mode") == "hf_pretrained"
+            cfg.get("mode") in ("hf_pretrained", "ssl_init")
             and moe_cfg.get("shared_expert")
             and cfg["model"].get("seed_moe_from_dense", True)
         )
@@ -486,7 +638,11 @@ def build_run_tag(cfg: dict) -> str:
 
     if abl["use_rope"]:
         rope_pl = resolve_placement(abl["rope_placement"], abl["rope_last_n_stages"], depths)
-        rope = f"rope-{_placement_tag(rope_pl, depths)}"
+        # Mixed (the default) is untagged; the fixed-frequency arm is "-ax".
+        # Two RoPE flavours in one placement are different models, so the
+        # flavour has to be in the name or they share a checkpoint directory.
+        flavour = "-ax" if abl["rope_mode"] == "axial" else ""
+        rope = f"rope-{_placement_tag(rope_pl, depths)}{flavour}"
     else:
         rope = "norope"
 
@@ -499,7 +655,7 @@ def build_run_tag(cfg: dict) -> str:
     budget = {"scratch": "scratch", "pretrained": "ft"}.get(cfg.get("recipe"), "run")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
-    return f"{cfg['version']}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
+    return f"{cfg['version']}_{variant}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
 
 
 # ---------------------------------------------------------------------------
@@ -525,11 +681,11 @@ LADDERS = {
         3: {"_desc": "MoE, no shared", "epochs": 90,
             "model": {"moe": {"num_experts": 4, "shared_expert": False},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         4: {"_desc": "MoE + shared", "epochs": 90,
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         5: {"_desc": "Final, best config", "epochs": 300,
             "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
                      "only; carry the winning architecture flags yourself."},
@@ -539,23 +695,23 @@ LADDERS = {
         7: {"_desc": "N=8, last stage", "epochs": 90,
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         8: {"_desc": "N=4, stages 3 & 4", "epochs": 90,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
                      "--rope-placement to decouple the two axes.",
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
         9: {"_desc": "N=8, stages 3 & 4", "epochs": 90,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
                      "--rope-placement to decouple the two axes.",
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
     },
     "pretrained": {
         1: {"_desc": "Pretrained PVT v2 B1, eval only", "epochs": 0,
@@ -571,12 +727,12 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": False},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         4: {"_desc": "MoE upcycled + shared", "epochs": 100,
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         5: {"_desc": "Final, best config", "epochs": 300,
             "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
                      "only; carry the winning architecture flags yourself."},
@@ -584,14 +740,14 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": False,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}},
+                                   "moe_placement": [[], [], [], [-1]]}},
             "_note": "seed_moe_from_dense=False — this row IS the upcycling "
                      "claim (replicated vs random expert init)."},
         7: {"_desc": "N=8, last stage", "epochs": 100,
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [1]]}}},
+                                   "moe_placement": [[], [], [], [-1]]}}},
         8: {"_desc": "N=4, stages 3 & 4", "epochs": 100,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
@@ -599,8 +755,8 @@ LADDERS = {
             "model": {"moe": {"num_experts": 4, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
         9: {"_desc": "N=8, stages 3 & 4", "epochs": 100,
             "_note": "RoPE moved to stages 3+4 to match the MoE placement "
                      "(this repo places RoPE where MoE is). Pass "
@@ -608,8 +764,8 @@ LADDERS = {
             "model": {"moe": {"num_experts": 8, "shared_expert": True},
                       "seed_moe_from_dense": True,
                       "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [1], [1]],
-                                   "rope_placement": [[], [], [1], [1]]}}},
+                                   "moe_placement": [[], [], [-1], [-1]],
+                                   "rope_placement": [[], [], [-1], [-1]]}}},
     },
 }
 
@@ -631,6 +787,68 @@ def ladder_overrides(recipe: str, row: int) -> tuple:
     desc = entry.pop("_desc", "")
     note = entry.pop("_note", "")
     return entry, desc, note
+
+
+def apply_variant(cfg: dict) -> list:
+    """Resolve ``model.variant`` into the architecture fields, as ONE set.
+
+    A named variant (``VARIANTS``) fills every architecture field still None
+    and REJECTS any explicit value that disagrees with it: the failure this
+    prevents is a config carrying B2 depths under variant b1 (or the other way
+    round) and then loading B1 weights into it. ``pretrained_hf_id`` follows
+    the same rule — None becomes the variant's official checkpoint, another
+    variant's official id is rejected, anything else (a checkpoint of your
+    own) is kept.
+
+    ``"custom"`` keeps whatever you set, falls back to B1's values for fields
+    left None, and never fills ``pretrained_hf_id``.
+
+    Returns the list of filled field paths. Called by ``validate_config``.
+    """
+    model = cfg["model"]
+    variant = model.get("variant")
+    if variant not in VALID_VARIANTS:
+        raise ValueError(
+            f"model.variant must be one of {VALID_VARIANTS}, got {variant!r}"
+        )
+    spec = VARIANTS["b1"] if variant == "custom" else VARIANTS[variant]
+
+    filled = []
+    for key in VARIANT_ARCH_KEYS:
+        if model.get(key) is None:
+            model[key] = list(spec[key])
+            filled.append(f"model.{key}")
+        elif variant != "custom" and list(model[key]) != list(spec[key]):
+            raise ValueError(
+                f"model.{key} {list(model[key])} disagrees with model.variant "
+                f"{variant!r} ({list(spec[key])}). A variant sets depths, dims, "
+                f"heads, ratios and the pretrained checkpoint together; pick the "
+                f"variant that has these values, or model.variant: custom to "
+                f"hand-tune the architecture (no official checkpoint then)."
+            )
+
+    if model.get("num_kv_heads") is None:          # MHA unless asked otherwise
+        model["num_kv_heads"] = list(model["num_heads"])
+        filled.append("model.num_kv_heads")
+
+    hf_id = model.get("pretrained_hf_id")
+    if variant == "custom":
+        pass                                  # never filled; yours to set
+    elif hf_id is None:
+        model["pretrained_hf_id"] = spec["hf_id"]
+        filled.append("model.pretrained_hf_id")
+    elif hf_id != spec["hf_id"]:
+        other = next((v for v, sp in VARIANTS.items() if sp["hf_id"] == hf_id), None)
+        if other is not None:
+            raise ValueError(
+                f"model.pretrained_hf_id {hf_id!r} is the official {other} "
+                f"checkpoint but model.variant is {variant!r}; its weights do "
+                f"not fit this architecture. Use --variant {other}, or leave "
+                f"pretrained_hf_id unset to get {spec['hf_id']!r}."
+            )
+        # A non-official id (your own fine-tuned upload) is accepted here;
+        # load_hf_pretrained checks its depths/dims against the model.
+    return filled
 
 
 def _fill_none(dst: dict, src: dict) -> list:
@@ -699,9 +917,17 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         )
 
     # Stochastic depth for from-scratch runs scales with the epoch budget.
+    # The derivation is anchored on B1's official 0.1 (identical for B0-B2);
+    # B3-B5 were officially trained at 0.3, which this rule does not know.
     if cfg["model"].get("drop_path_rate") is None:
         cfg["model"]["drop_path_rate"] = scratch_drop_path(cfg["epochs"])
         filled.append("model.drop_path_rate")
+        official = VARIANTS.get(cfg["model"]["variant"], {}).get("drop_path")
+        if official is not None and official != VARIANTS["b1"]["drop_path"]:
+            print(f"[config] model.drop_path_rate derived as "
+                  f"{cfg['model']['drop_path_rate']} (B1-anchored rule); the "
+                  f"official PVT v2 {cfg['model']['variant']} recipe used "
+                  f"{official}. Pass --drop-path {official} to match it.")
 
     # Warmup starts at an absolute 1e-6, not at lr * 1e-6.
     optim = cfg["optim"]
@@ -710,10 +936,15 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         filled.append("optim.warmup_start_factor")
 
     # Upcycling init: a recipe may fill it; anything still unset upcycles
-    # nothing. The no-shared-expert case is resolved in validate_config, which
-    # is where shared_expert is known to be final.
+    # nothing — EXCEPT an ssl_init warm start, which upcycles the JEPA
+    # backbone's own dense FFN exactly like the pretrained recipe does with
+    # HF weights, whichever recipe supplied the rest. A forgotten flag must
+    # not silently give a block that emits a random FFN at step 0.
+    # The no-shared-expert case is resolved in validate_config, which is
+    # where shared_expert is known to be final.
     if cfg["model"]["moe"].get("upcycle_init") is None:
-        cfg["model"]["moe"]["upcycle_init"] = "none"
+        cfg["model"]["moe"]["upcycle_init"] = (
+            "routed_zero" if cfg.get("mode") == "ssl_init" else "none")
         filled.append("model.moe.upcycle_init")
 
     if verbose and filled:
@@ -805,6 +1036,8 @@ def validate_config(cfg: dict) -> dict:
 
     - rejects unknown keys (``assert_known_keys``) — a typo must not silently
       become a new key that nothing reads
+    - resolves ``model.variant`` into depths / dims / heads / ratios /
+      pretrained_hf_id as one set, rejecting disagreements (``apply_variant``)
     - applies the recipe preset to every field left as None (``apply_recipe``)
     - checks enum fields (mode / norm_type / backend / dataset name)
     - derives dataset.num_classes from dataset.name
@@ -813,6 +1046,7 @@ def validate_config(cfg: dict) -> dict:
     - asserts JSON-serializability
     """
     assert_known_keys(cfg)
+    apply_variant(cfg)
     apply_recipe(cfg)
 
     if cfg["mode"] not in VALID_MODES:
@@ -828,9 +1062,19 @@ def validate_config(cfg: dict) -> dict:
             f"moe.backend must be one of {VALID_BACKENDS}, got {model['moe']['backend']!r}"
         )
 
+    if cfg.get("task") not in VALID_TASKS:
+        raise ValueError(f"task must be one of {VALID_TASKS}, got {cfg.get('task')!r}")
     ds = cfg["dataset"]
-    if ds["name"] not in NUM_CLASSES:
-        raise ValueError(f"dataset.name must be one of {tuple(NUM_CLASSES)}, got {ds['name']!r}")
+    if ds["name"] not in DATASETS:
+        raise ValueError(f"dataset.name must be one of {tuple(DATASETS)}, got {ds['name']!r}")
+    if not DATASETS[ds["name"]]["labelled"] and cfg["task"] != "ssl":
+        raise ValueError(
+            f"dataset {ds['name']!r} is UNLABELLED (PASS: SSL pretraining only) and "
+            f"cannot train or evaluate a classifier — task is {cfg['task']!r} "
+            f"(recipe {cfg.get('recipe')!r}, mode {cfg['mode']!r}). Use it from the "
+            "JEPA notebook (task: \"ssl\"); train.py is supervised and needs "
+            "imagenet-1k or imagenet-22k."
+        )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
     budget = cfg["epochs"]
@@ -868,6 +1112,18 @@ def validate_config(cfg: dict) -> dict:
             f"model.moe.upcycle_init must be one of {VALID_UPCYCLE_INITS}, "
             f"got {moe['upcycle_init']!r}"
         )
+    if (cfg["mode"] == "ssl_init" and moe["upcycle_init"] == "none"
+            and moe.get("shared_expert") and model["ablation"]["use_moe"]
+            and model.get("seed_moe_from_dense", True)):
+        # Explicit "none" here means the shared expert AND the routed experts
+        # both carry the backbone's FFN, i.e. the block emits ~2x the dense
+        # layer at step 0. That is never what an ssl_init run wants.
+        raise ValueError(
+            "mode ssl_init with a shared expert needs model.moe.upcycle_init "
+            "'routed_zero' (default) or 'shared_zero'; 'none' would make the "
+            "upcycled block emit twice the backbone's FFN at step 0. Leave it "
+            "unset, or pass --no-shared-expert / --no-seed-experts on purpose."
+        )
     if moe["upcycle_init"] != "none" and not moe.get("shared_expert"):
         # Both schemes need a shared expert: one branch must hold the
         # pretrained FFN while the other starts at zero. With no shared expert
@@ -886,13 +1142,34 @@ def validate_config(cfg: dict) -> dict:
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
 
-    # RoPE requires head_dim % 4 == 0 wherever it is enabled.
+    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled;
+    # mixed needs one kv head per query head in every RoPE'd stage.
+    if abl.get("rope_mode") not in VALID_ROPE_MODES:
+        raise ValueError(
+            f"model.ablation.rope_mode must be one of {VALID_ROPE_MODES}, "
+            f"got {abl.get('rope_mode')!r}")
+    if abl.get("rope_theta") is None:
+        abl["rope_theta"] = ROPE_THETA_DEFAULT[abl["rope_mode"]]
+    elif (abl["use_rope"] and abl["rope_mode"] == "mixed"
+          and abl["rope_theta"] != ROPE_THETA_DEFAULT["mixed"]):
+        # For mixed, theta only shapes the INITIAL magnitude ladder; a value
+        # tuned for the axial arm (50) is rarely what was meant.
+        print(f"[config] rope_theta {abl['rope_theta']} with rope_mode 'mixed' sets "
+              f"only the initial frequency ladder (rope-vit uses "
+              f"{ROPE_THETA_DEFAULT['mixed']}); leave it unset for the reference init.")
     for i, blocks in enumerate(abl["rope_placement"]):
         if blocks and abl["use_rope"]:
             head_dim = model["embed_dims"][i] // model["num_heads"][i]
             if head_dim % 4 != 0:
                 raise ValueError(
                     f"RoPE enabled in stage {i + 1} but head_dim={head_dim} is not divisible by 4"
+                )
+            if abl["rope_mode"] == "mixed" and model["num_kv_heads"][i] != model["num_heads"][i]:
+                raise ValueError(
+                    f"rope_mode 'mixed' in stage {i + 1} needs num_kv_heads == num_heads "
+                    f"({model['num_kv_heads'][i]} != {model['num_heads'][i]}): the learnable "
+                    f"frequencies are per query head. Use rope_mode 'axial' with GQA, or "
+                    f"drop the GQA override for that stage."
                 )
 
     # The recipe's LR is calibrated for a specific effective batch; say so

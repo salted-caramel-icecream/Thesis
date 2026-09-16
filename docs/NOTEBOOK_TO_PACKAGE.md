@@ -39,7 +39,7 @@ canonical for training semantics and borrows RMSNorm from the B200 branch.
 | `OverlapPatchEmbed` | `pvt_moe/models/pvt.py` | `img_size` arg dropped (was unused) |
 | `DWConv`, `Mlp` | `pvt_moe/models/ffn.py` | `Mlp` gains `use_dwconv`; MoE split out into `MoEMlp` |
 | `Mlp(use_moe=True)` Tutel branch | `pvt_moe/models/ffn.py::MoEMlp._build_tutel` | no `.cuda()` at construction; `+ shared_expert` |
-| `_init_t_xy`, `_compute_axial_cis`, `apply_rotary_emb`, `RotaryEmbedding2D` | `pvt_moe/models/rope.py` | adds `scale_h`/`scale_w` for SR-reduced K grids |
+| `_init_t_xy`, `_compute_axial_cis`, `apply_rotary_emb`, `RotaryEmbedding2D` | `pvt_moe/models/rope.py` | adds `scale_h`/`scale_w` for SR-reduced K grids; the notebook's fixed-frequency RoPE is now `mode="axial"` — the **default is RoPE-Mixed** (`mode="mixed"`: learnable per-head `freqs` `(2, heads, head_dim//2)`, `init_mixed_freqs` / `compute_mixed_cis` ported from rope-vit, no weight decay, snapshotted by `RopeFreqSnapshot`) |
 | `RMSNorm` / `BatchNorm1dWrapper` | `pvt_moe/models/norms.py` | fused `nn.RMSNorm`; BN wrapper dropped (dead end) |
 | `GQAttention` | `pvt_moe/models/attention.py` | SDPA `enable_gqa` fast path + fallback |
 | `Block` | `pvt_moe/models/pvt.py` | `dense_dwconv` threaded through |

@@ -14,4 +14,4 @@ model:
     shared_expert: true
   ablation:
     use_moe: true
-    moe_placement: [[], [], [], [1]]
+    moe_placement: [[], [], [], [-1]]

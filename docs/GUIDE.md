@@ -33,7 +33,7 @@ a config file.
 
 | Variable | Needed for |
 |---|---|
-| `HF_TOKEN` | `recipe: pretrained` (downloads `OpenGVLab/pvt_v2_b1`), and the ImageNet-1k dataset (gated — accept the licence on the HF page first) |
+| `HF_TOKEN` | `recipe: pretrained` (downloads the variant's `OpenGVLab/pvt_v2_b*`, B1 by default), and the ImageNet-1k dataset (gated — accept the licence on the HF page first) |
 | `WANDB_API_KEY` | W&B logging. Without it, pass `--no-wandb` |
 
 ```bash
@@ -169,6 +169,29 @@ machine, so a Windows path never lands on a Linux box and vice versa.
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
 
+### PASS (SSL pretraining only)
+
+| | |
+|---|---|
+| what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
+| licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
+| HF id | `yukimasano/pass` — single `train` split, no validation/test |
+| `arrow_dirs` key | `pass` |
+| disk | ~166 GB snapshot; **~333 GB free while building** (the staged build holds the Arrow cache and the snapshot at once; a naive build would peak near 500 GB) |
+| usable with | `task: "ssl"` only (the JEPA notebook). `train.py --dataset pass` and any supervised recipe are refused at validate time: the corpus has no labels |
+| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is the linear probe on a labelled set (`docs/JEPA_GUIDE.md` §5) |
+
+```bash
+python download_data.py --dataset pass --out /data/pass_arrow                       # Linux / macOS / WSL2
+python download_data.py --dataset pass --out D:/data/pass_arrow --hf-cache E:/hf     # Windows; cache on another drive
+```
+
+The script downloads, converts to Arrow, **deletes only PASS's raw download
+under the HF hub cache** (logged as `[cleanup] removing the raw download of
+yukimasano/pass only`), then writes the snapshot. It prints the snapshot's
+feature names when the conversion finishes; the loader itself finds the image
+column by feature type and never reads the creator, date or GPS columns.
+
 ### ImageNet-22k
 
 ~1.3 TB, and ~2.6 TB to build. Check free space against the real figure before
@@ -192,7 +215,7 @@ key nothing reads.
 
 | | `scratch` | `pretrained` |
 |---|---|---|
-| init | random | `OpenGVLab/pvt_v2_b1` + upcycled experts |
+| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts |
 | epochs | 90 (ladder: 90/150/300) | 100 |
 | peak LR | 1e-3 | 1e-4 |
 | warmup | 5 | 3 |
@@ -203,6 +226,7 @@ key nothing reads.
 
 | What | CLI | Notebook CONFIG cell |
 |---|---|---|
+| model size | `--variant b2` (b0…b5, default b1) | `VARIANT` |
 | recipe | `--recipe scratch\|pretrained` | `RECIPE` |
 | epoch budget | `--epochs 300` | `EPOCHS` |
 | LR / warmup | `--lr 5e-4 --warmup-epochs 10` | `LR`, `WARMUP_EPOCHS` |
@@ -211,16 +235,22 @@ key nothing reads.
 | MoE on/off | `--moe` / `--no-moe` | `ablation.use_moe` |
 | expert count | `--experts 8` | `moe.num_experts` |
 | shared expert | `--shared-expert` / `--no-shared-expert` | `moe.shared_expert` |
-| MoE placement | `--moe-placement "[[],[],[],[1]]"` | `ablation.moe_placement` |
+| MoE placement | `--moe-placement "[[],[],[],[-1]]"` (−1 = last block of the stage, for any variant) | `ablation.moe_placement` |
 | RoPE | `--rope` / `--no-rope` | `ablation.use_rope` |
+| RoPE flavour | `--rope-mode mixed\|axial` (mixed = learnable RoPE-Mixed, default; axial = fixed, run tag `-ax`) | `ablation.rope_mode` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
 | norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
 | MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
-| dataset | `--dataset imagenet-1k` | `dataset.name` |
+| dataset | `--dataset imagenet-1k\|imagenet-22k` (`pass` is SSL-only and refused here) | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
+
+Before the first upcycled run on a new box: `python tools/verify_upcycling.py
+--variant b1 --hf` checks, on the real MoE backend, that the upcycled model
+reproduces the dense one at step 0 (the CPU suite only proves it on the fake
+Tutel layer and the native backend).
 
 Diagnostics, no training: `--check-env` (is this machine usable),
 `--dry-run` (resolve and print the config), `--print-config` / `--save-config`.
@@ -333,7 +363,7 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`v10_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`), so logs stay
+same thing (`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
 Watch for these lines:
@@ -344,4 +374,62 @@ Watch for these lines:
 | `[config] ... -> 'none'` | a knob was dropped because its precondition was absent |
 | `[env] WARNING: micro-batch ... only N GiB free` | it will probably OOM |
 | `[milestone] epoch N: saved full state` | a resumable snapshot exists |
+| `[rope] saved N frequency tensor(s) -> .../rope_freqs_init.pt` | the step-0 RoPE-Mixed frequencies are on disk — the drift plot in §7 needs them |
 | `val_precision_macro` far below `val_acc` | expert/class collapse — check `expert_utilization` |
+
+---
+
+## 7. Diagnosing RoPE-Mixed frequencies
+
+The default RoPE (`rope_mode: mixed`) learns its 2D frequencies, so a run
+leaves two small files next to its checkpoints:
+
+```
+<checkpoint_root>/<run_name>/rope_freqs_init.pt    # step 0 — travels inside checkpoints, so a resume anywhere rewrites the TRUE init
+<checkpoint_root>/<run_name>/rope_freqs_final.pt   # refreshed every epoch (a killed run: pass last.ckpt to the tool instead)
+```
+
+Plot the trained frequencies over their init — this is the figure that says
+whether the MoE'd block kept a usable positional signal:
+
+```bash
+# Linux / WSL2 / macOS
+python tools/plot_rope_freqs.py /data/runs/checkpoints/<run_name>/rope_freqs_final.pt \
+    --init /data/runs/checkpoints/<run_name>/rope_freqs_init.pt \
+    --out figures/rope_freqs_<run_name>.pdf
+```
+```powershell
+# Windows — D: is only an example; substitute your own drive
+python tools/plot_rope_freqs.py D:/runs/checkpoints/<run_name>/rope_freqs_final.pt --init D:/runs/checkpoints/<run_name>/rope_freqs_init.pt --out figures/rope_freqs_<run_name>.pdf
+```
+
+Any Lightning checkpoint works as the first argument too (`.../last.ckpt`,
+`.../milestone-epoch090.ckpt`), so a run can be inspected mid-training.
+`--theta` (default 10) only places the reference ladder — pass the run's
+`rope_theta` if you changed it. `--selftest` plots synthetic spread /
+collapsed / axial cases, so you can see what each looks like before trusting
+the real one.
+
+Reading it:
+
+- One row per RoPE'd layer, grouped by stage (a default run has one row,
+  `block4.1` for B1, `block4.2` for B2); three panels per row: (ω_x, ω_y)
+  scatter with one colour per head, angle histogram folded to [0°, 180°),
+  log-magnitude histogram. Hollow markers and dashed outlines are the init;
+  filled markers and solid bars the trained values; thin grey segments join
+  each init point to its trained point; black `+` marks the axial ladder.
+- Healthy: a spread cloud, angles covering the range, magnitudes still on or
+  around the ladder. Collapsed: a blob at the origin and a magnitude
+  histogram piled up at the left — the block has lost position. Spikes at
+  0° / 90° mean the model reverted to axial.
+- The printed table says the same numerically: `collapsed` (fraction of
+  channels below 0.25 × the smallest ladder magnitude), `axis-aligned`
+  (fraction within ±10° of an axis) and `mean disp` (mean |trained − init|).
+- The stage-4 row is the one that matters: it is the MoE'd block, whose
+  routed FFN has no DWConv, so RoPE is its positional signal. Compare with
+  the `-ax` run (`--rope-mode axial`) as the fixed-frequency control.
+
+The tool needs only torch and matplotlib — no Tutel, no dataset, no GPU, not
+even the training environment — so copy the two `.pt` files (a few KB) to a
+laptop and run it there while the GPU keeps training. Output goes to
+`figures/` as a vector PDF in the thesis figure style.

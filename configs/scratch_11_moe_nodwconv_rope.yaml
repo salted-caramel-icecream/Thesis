@@ -17,6 +17,6 @@ model:
     moe_block_dwconv: false
   ablation:
     use_moe: true
-    moe_placement: [[], [], [], [1]]
+    moe_placement: [[], [], [], [-1]]
     use_rope: true
-    rope_placement: [[], [], [], [1]]
+    rope_placement: [[], [], [], [-1]]

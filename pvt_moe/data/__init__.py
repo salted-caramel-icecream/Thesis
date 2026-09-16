@@ -1,4 +1,4 @@
-"""ImageNet (1k / 22k) HF-Arrow data pipeline."""
+"""ImageNet (1k / 22k) and PASS (SSL only) HF-Arrow data pipeline."""
 
 from pvt_moe.data.imagenet import (  # noqa: F401
     HFImageDataset,

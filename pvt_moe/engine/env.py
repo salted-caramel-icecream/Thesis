@@ -58,6 +58,19 @@ def setup_environment(cfg: dict, interactive_secrets: bool = False) -> torch.dev
 #: capacity factor and the allocator's fragmentation.
 _APPROX_GIB_PER_IMAGE = 0.035
 
+#: Activation cost of each variant relative to B1, from the MACs of this
+#: repo's dense model at 224^2 (torch FlopCounterMode, MHA): b0 0.53 G,
+#: b1 2.03 G, b2 3.88 G, b3 6.68 G, b4 9.79 G, b5 11.35 G. Activation memory
+#: tracks the same sum over stages of depth x tokens x width, so the ratio is
+#: a fair planning multiplier — it is NOT a measurement of the larger sizes.
+_VRAM_SCALE_VS_B1 = {"b0": 0.27, "b1": 1.0, "b2": 1.9, "b3": 3.3,
+                     "b4": 4.8, "b5": 5.6, "custom": 1.0}
+
+
+def gib_per_image(variant: str = "b1") -> float:
+    """Planning estimate of peak training VRAM per image for ``variant``."""
+    return _APPROX_GIB_PER_IMAGE * _VRAM_SCALE_VS_B1.get(variant, 1.0)
+
 
 def _check_memory_budget(cfg: dict, total_gb: float) -> None:
     """Warn before a micro-batch that is unlikely to fit is attempted.
@@ -74,11 +87,13 @@ def _check_memory_budget(cfg: dict, total_gb: float) -> None:
 
     # Whatever the desktop/compositor already holds is not available to us.
     free_gb = torch.cuda.mem_get_info(0)[0] / 1024**3
-    estimate = micro * _APPROX_GIB_PER_IMAGE
+    variant = cfg.get("model", {}).get("variant", "b1")
+    per_image = gib_per_image(variant)
+    estimate = micro * per_image
     if estimate > free_gb * 0.9:
-        fits = max(16, int(free_gb * 0.9 / _APPROX_GIB_PER_IMAGE) // 16 * 16)
-        print(f"[env] WARNING: micro-batch {micro} needs roughly "
-              f"{estimate:.1f} GiB but only {free_gb:.1f} GiB is free. "
+        fits = max(16, int(free_gb * 0.9 / per_image) // 16 * 16)
+        print(f"[env] WARNING: micro-batch {micro} of variant {variant} needs "
+              f"roughly {estimate:.1f} GiB but only {free_gb:.1f} GiB is free. "
               f"Try batch_size={fits} (raise accumulate_grad_batches to keep "
               f"the same effective batch).")
     if sys.platform == "win32" and cfg.get("num_workers", 0) > 8:
