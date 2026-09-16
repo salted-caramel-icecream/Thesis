@@ -28,13 +28,21 @@ import json
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Class counts are DERIVED from dataset.name — never hand-set num_classes.
+#: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
+#: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
+#: refused by every supervised recipe at validate time. PASS (Asano et al.,
+#: NeurIPS Datasets & Benchmarks 2021; HF ``yukimasano/pass``): 1,439,588
+#: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
-NUM_CLASSES = {
-    "imagenet-1k": 1000,
-    "imagenet-22k": 21841,
+DATASETS = {
+    "imagenet-1k": {"num_classes": 1000, "labelled": True, "tag": "in1k"},
+    "imagenet-22k": {"num_classes": 21841, "labelled": True, "tag": "in22k"},
+    "pass": {"num_classes": 0, "labelled": False, "tag": "pass"},
 }
+#: Class counts are DERIVED from dataset.name — never hand-set num_classes.
+NUM_CLASSES = {name: spec["num_classes"] for name, spec in DATASETS.items()}
+VALID_TASKS = ("supervised", "ssl")
 
 VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
 VALID_NORMS = ("layernorm", "rmsnorm")
@@ -234,6 +242,10 @@ _DEFAULT: dict = {
     #                  checkpoint + upcycled experts
     # Setting `recipe` also sets `mode` unless you set `mode` yourself.
     "recipe": "scratch",
+    # "supervised" (train.py, LitClassifier) | "ssl" (JEPA pretraining,
+    # notebooks/03). Decides which datasets are admissible: an unlabelled
+    # corpus (PASS) is refused unless task is "ssl".
+    "task": "supervised",
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
     "experiment_group": "ablations",
@@ -298,12 +310,13 @@ _DEFAULT: dict = {
     "use_tensorboard": False,
 
     "dataset": {
-        "name": "imagenet-1k",            # "imagenet-1k" | "imagenet-22k"
+        "name": "imagenet-1k",            # "imagenet-1k" | "imagenet-22k" | "pass" (SSL only)
         "num_classes": None,              # DERIVED — leave None
         "img_size": 224,
         "arrow_dirs": {
             "imagenet-1k": "/workspace/ModelTraining/datasets/imagenet_arrow",
             "imagenet-22k": "/workspace/ModelTraining/datasets/imagenet22k_arrow",
+            "pass": "/workspace/ModelTraining/datasets/pass_arrow",
         },
         # DeiT-1 augmentation stack (PVT v2 inherits it), fixed across runs.
         # timm config string: magnitude 9, magnitude-std 0.5, increasing
@@ -578,7 +591,7 @@ def build_run_tag(cfg: dict) -> str:
     are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
     checkpoint directory.
     """
-    ds = {"imagenet-1k": "in1k", "imagenet-22k": "in22k"}[cfg["dataset"]["name"]]
+    ds = DATASETS[cfg["dataset"]["name"]]["tag"]
     variant = cfg["model"]["variant"]
     abl = cfg["model"]["ablation"]
     depths = cfg["model"]["depths"]
@@ -1049,9 +1062,19 @@ def validate_config(cfg: dict) -> dict:
             f"moe.backend must be one of {VALID_BACKENDS}, got {model['moe']['backend']!r}"
         )
 
+    if cfg.get("task") not in VALID_TASKS:
+        raise ValueError(f"task must be one of {VALID_TASKS}, got {cfg.get('task')!r}")
     ds = cfg["dataset"]
-    if ds["name"] not in NUM_CLASSES:
-        raise ValueError(f"dataset.name must be one of {tuple(NUM_CLASSES)}, got {ds['name']!r}")
+    if ds["name"] not in DATASETS:
+        raise ValueError(f"dataset.name must be one of {tuple(DATASETS)}, got {ds['name']!r}")
+    if not DATASETS[ds["name"]]["labelled"] and cfg["task"] != "ssl":
+        raise ValueError(
+            f"dataset {ds['name']!r} is UNLABELLED (PASS: SSL pretraining only) and "
+            f"cannot train or evaluate a classifier — task is {cfg['task']!r} "
+            f"(recipe {cfg.get('recipe')!r}, mode {cfg['mode']!r}). Use it from the "
+            "JEPA notebook (task: \"ssl\"); train.py is supervised and needs "
+            "imagenet-1k or imagenet-22k."
+        )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
     budget = cfg["epochs"]

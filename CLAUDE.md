@@ -29,6 +29,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 - `assert_known_keys` rejects unknown keys — a typo must never silently create a dead key.
 - Precedence, lowest to highest: `default_config()` < `--config file` < `--ladder N` < named flags < `--set a.b=v`.
 - `model.variant` (b0…b5) sets depths / dims / heads / ratios / HF id as one set and rejects a disagreeing explicit value; `custom` hand-tunes them.
+- Datasets: `config.DATASETS`. `pass` is unlabelled (SSL only): admissible only with `task: "ssl"`, refused by `train.py` and every supervised recipe at validate time; it has no validation split, so SSL runs with `val_loader = None`.
 - Placement lists are per stage, block indices within the stage; `-1` = the last block of the stage for any variant. `*_last_n_stages: N` expands to all blocks of the last N stages.
 - RoPE: `ablation.rope_mode` `mixed` (default: learnable per-head 2D frequencies, MHA only, no weight decay) | `axial` (fixed); `rope_theta: None` resolves per mode (10 mixed — init spread only — / 50 axial).
 

@@ -134,11 +134,27 @@ this is the collapse alarm; healthy runs sit well above 0 and drift slowly),
 | weight decay | cosine 0.04 → 0.4 | applied only to ndim>1 params |
 | EMA | cosine 0.996 → 1.0 | update after every step |
 | epochs | 100 (smoke) / 300+ (serious) | I-JEPA used 300–600 |
+| dataset | **PASS** (`dataset.name: "pass"`, `task: "ssl"`) by default; `imagenet-1k` is a one-line switch | PASS = clean provenance (no people, CC-BY 4.0); JEPA on ImageNet instead asks whether the MoE gain survives SSL on the same images the supervised arms see. PASS has only a `train` split: **no validation loader**, the monitored metric is the training `ssl_loss` |
 | aug | RandomResizedCrop(224, scale 0.3–1.0) + HFlip **only** | no RandAugment/mixup/erasing |
 | precision | bf16-mixed, grad-clip 3.0 | |
 | batch | 512–1024 per B200; grad-accumulate to ~2048 | dense (no token dropping) → costlier than I-JEPA per image |
 
 ## 5. Evaluation
+
+**PASS gives clean pretraining data, not a clean end-to-end pipeline.** Its
+authors state it is insufficient for benchmarking, and it carries no labels,
+so a PASS-pretrained backbone still has to be probed or fine-tuned on a
+labelled dataset — and that dataset's provenance re-enters there. In this
+repo the labelled data enters at exactly two points: the linear probe
+(notebook cell "Linear probe", which builds its loaders from a
+`probe_cfg` on `imagenet-1k`), and any `mode: ssl_init` fine-tune, which is
+a supervised ImageNet run. State this in the thesis: the pretraining corpus
+is clean; the reported accuracy is an ImageNet number.
+
+Citation (CC-BY 4.0, attribution required): Asano, Vedaldi, Rupprecht et
+al., "PASS: An ImageNet replacement for self-supervised pretraining without
+humans", NeurIPS Datasets and Benchmarks 2021,
+<https://www.robots.ox.ac.uk/~vgg/research/pass/>.
 
 1. **Linear probe** (`LitProbe`): freeze backbone, train one
    `Linear(512, 1000)` on mean-pooled features, ~20–90 epochs, standard

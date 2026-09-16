@@ -22,7 +22,7 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming)
                 NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
                 JEPA_GUIDE.md (SSL recipe)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py)
-download_data.py  build the ImageNet Arrow snapshot (checks licence/disk first)
+download_data.py  build the ImageNet / PASS Arrow snapshot (checks token/disk first, staged to cap disk peak)
 ```
 
 ## Setting up a GPU box from scratch
@@ -352,7 +352,7 @@ directly, and prints the equivalent command line.
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
-| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
+| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 | 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
@@ -522,6 +522,24 @@ paths in
 `config.dataset.arrow_dirs` (map-style `load_from_disk`; **never**
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.
+
+**PASS** (`--dataset pass`, SSL pretraining only): 1,439,588 unlabelled
+images, no people, CC-BY 4.0, not gated — `python download_data.py --dataset
+pass --out DIR` (~166 GB, ~333 GB free while building; the script deletes
+only PASS's raw download between the conversion and the save). It has no
+labels and no validation split, so `train.py` and every supervised recipe
+refuse it; the JEPA notebook uses it by default. Evaluation still happens on
+a labelled set (`docs/JEPA_GUIDE.md` §5).
+
+### Dataset citations
+
+- ImageNet: Deng et al., "ImageNet: A large-scale hierarchical image
+  database", CVPR 2009; Russakovsky et al., "ImageNet Large Scale Visual
+  Recognition Challenge", IJCV 2015.
+- PASS: Asano, Vedaldi, Rupprecht et al., "PASS: An ImageNet replacement for
+  self-supervised pretraining without humans", NeurIPS Datasets and
+  Benchmarks 2021. <https://www.robots.ox.ac.uk/~vgg/research/pass/> —
+  images and dataset CC-BY 4.0; attribution required.
 
 ## Warm starts (`mode`)
 

@@ -33,6 +33,7 @@ import sys
 
 from pvt_moe.config import (
     SCRATCH_EPOCH_CHOICES,
+    DATASETS,
     VALID_BACKENDS,
     VALID_MODES,
     VALID_NORMS,
@@ -172,8 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "zero nothing. Forced to none with no shared expert")
 
     g = p.add_argument_group("data & run")
-    g.add_argument("--dataset", dest="dataset_name",
-                   choices=("imagenet-1k", "imagenet-22k"))
+    g.add_argument("--dataset", dest="dataset_name", choices=tuple(DATASETS),
+                   help="imagenet-1k (default) | imagenet-22k | pass — PASS is "
+                        "unlabelled and refused here (SSL only, notebooks/03)")
     g.add_argument("--batch-size", type=int, metavar="N",
                    help="MICRO-batch: what fits in VRAM (default: 128, sized "
                         "for a 12 GB card at 224^2)")

@@ -1,4 +1,4 @@
-"""ImageNet data pipeline (HF Arrow, map-style) for 1k and 22k.
+"""Image data pipeline (HF Arrow, map-style): ImageNet 1k / 22k, and PASS for SSL.
 
 Hard-won rules from this project's history (do not regress):
 
@@ -95,41 +95,86 @@ def build_transforms(cfg: dict):
     return train_tf, val_tf
 
 
-class HFImageDataset(Dataset):
-    """Map-style wrapper over a HF Arrow split; probes the label column."""
+def _image_column(hf_split) -> str:
+    """The column holding the image, found by FEATURE TYPE, not by name —
+    the HF and TFDS builds of the same corpus name their fields differently."""
+    from datasets import Image  # lazy
 
-    def __init__(self, hf_split, transform=None):
-        self.dataset = hf_split
+    cols = [c for c, f in hf_split.features.items() if isinstance(f, Image)]
+    if len(cols) != 1:
+        raise KeyError(
+            f"expected exactly one Image column, found {cols} in {sorted(hf_split.column_names)}")
+    return cols[0]
+
+
+class HFImageDataset(Dataset):
+    """Map-style wrapper over a HF Arrow split.
+
+    ``labelled=True`` probes the label column and yields ``(image, label)``.
+    ``labelled=False`` (PASS) keeps ONLY the image column — creator name,
+    date and GPS metadata are never read — and yields ``(image, -1)`` so the
+    batch shape stays what the SSL module expects (it discards the label).
+    """
+
+    def __init__(self, hf_split, transform=None, labelled: bool = True):
         self.transform = transform
-        columns = set(hf_split.column_names)
-        for key in _LABEL_KEYS:
-            if key in columns:
-                self.label_key = key
-                break
+        self.image_key = _image_column(hf_split)
+        self.label_key = None
+        self.dropped_columns = []
+        if labelled:
+            columns = set(hf_split.column_names)
+            for key in _LABEL_KEYS:
+                if key in columns:
+                    self.label_key = key
+                    break
+            else:
+                raise KeyError(
+                    f"No label column found; columns={sorted(columns)}, tried {_LABEL_KEYS}"
+                )
+            self.dataset = hf_split
         else:
-            raise KeyError(
-                f"No label column found; columns={sorted(columns)}, tried {_LABEL_KEYS}"
-            )
+            self.dropped_columns = sorted(set(hf_split.column_names) - {self.image_key})
+            self.dataset = hf_split.select_columns([self.image_key])
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        image = item["image"]
+        image = item[self.image_key]
         if image.mode != "RGB":
             image = image.convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, item[self.label_key]
+        return image, (item[self.label_key] if self.label_key is not None else -1)
 
 
 def build_datasets(cfg: dict):
-    """Load the Arrow snapshot for ``cfg.dataset.name`` -> (train_ds, val_ds)."""
+    """Load the Arrow snapshot for ``cfg.dataset.name`` -> (train_ds, val_ds).
+
+    ``val_ds`` is None for a corpus with no validation split (PASS has only
+    ``train``): SSL then trains with no validation loader at all — the
+    monitored quantity is the training ``ssl_loss`` and the real evaluation
+    is the linear probe on a LABELLED dataset (docs/JEPA_GUIDE.md §5).
+    """
+    from pvt_moe.config import DATASETS
+
     ds_cfg = cfg["dataset"]
+    labelled = DATASETS[ds_cfg["name"]]["labelled"]
+    if not labelled and cfg.get("task") != "ssl":
+        # validate_config refuses this already; this is the last line of
+        # defence so an unlabelled corpus never reaches a classifier loader.
+        raise ValueError(f"dataset {ds_cfg['name']!r} is unlabelled: SSL (task 'ssl') only")
     arrow_dir = ds_cfg["arrow_dirs"][ds_cfg["name"]]
     # Check the path BEFORE the heavy import: a missing snapshot should say so,
     # not surface as ModuleNotFoundError on a box where `datasets` is absent.
+    if not os.path.isdir(arrow_dir) and ds_cfg["name"] == "pass":
+        raise FileNotFoundError(
+            f"No Arrow snapshot at {arrow_dir} for PASS. Build it once (no HF token, "
+            "~166 GB final, ~333 GB free while building):\n"
+            f"  python download_data.py --dataset pass --out {arrow_dir}\n"
+            "then re-run."
+        )
     if not os.path.isdir(arrow_dir):
         raise FileNotFoundError(
             f"No Arrow snapshot at {arrow_dir} for {ds_cfg['name']}.\n"
@@ -149,13 +194,22 @@ def build_datasets(cfg: dict):
     from datasets import DatasetDict  # lazy — heavy import
 
     raw = DatasetDict.load_from_disk(arrow_dir)
-    val_split = "validation" if "validation" in raw else "val"
+    val_split = next((s for s in ("validation", "val") if s in raw), None)
 
     train_tf, val_tf = build_transforms(cfg)
-    train_ds = HFImageDataset(raw["train"], transform=train_tf)
-    val_ds = HFImageDataset(raw[val_split], transform=val_tf)
-    print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} val={len(val_ds):,} "
-          f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}')")
+    train_ds = HFImageDataset(raw["train"], transform=train_tf, labelled=labelled)
+    val_ds = (HFImageDataset(raw[val_split], transform=val_tf, labelled=labelled)
+              if val_split is not None else None)
+    if labelled:
+        print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} val={len(val_ds):,} "
+              f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}')")
+    else:
+        print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} images, unlabelled | "
+              f"snapshot features: {list(raw['train'].features)} | using only "
+              f"'{train_ds.image_key}', dropped {train_ds.dropped_columns}")
+        if val_ds is None:
+            print("[data] no validation split in this corpus: SSL runs with no "
+                  "validation loader; evaluation is the linear probe on a labelled set")
     return train_ds, val_ds
 
 
@@ -173,13 +227,16 @@ def build_ssl_transform(cfg: dict):
     )
 
 
-def build_dataloaders(cfg: dict, ssl: bool = False):
+def build_dataloaders(cfg: dict, ssl: bool | None = None):
     """(train_loader, val_loader) with the project's stable loader settings.
 
-    ``ssl=True`` swaps the train transform for the JEPA recipe (labels are
-    still returned — the SSL module ignores them; the val loader keeps the
-    standard eval transform for linear probing).
+    ``ssl=True`` (default when ``cfg["task"] == "ssl"``) swaps the train
+    transform for the JEPA recipe (labels are still returned — the SSL module
+    ignores them; the val loader keeps the standard eval transform for linear
+    probing). ``val_loader`` is None when the corpus has no validation split.
     """
+    if ssl is None:
+        ssl = cfg.get("task") == "ssl"
     train_ds, val_ds = build_datasets(cfg)
     if ssl:
         train_ds.transform = build_ssl_transform(cfg)
@@ -226,6 +283,8 @@ def build_dataloaders(cfg: dict, ssl: bool = False):
         drop_last=True,
         **common,
     )
+    if val_ds is None:
+        return train_loader, None
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg["batch_size"] * cfg["val_batch_multiplier"],

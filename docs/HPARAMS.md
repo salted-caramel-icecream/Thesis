@@ -549,7 +549,17 @@ ImageNet-100 subset for the ladder with IN-1k only for the final run, or
 
 ImageNet-1k as an Arrow snapshot is ~160 GB, which fits a 579 GB disk with
 room for checkpoints. **ImageNet-22k is roughly 1.3 TB and will not fit** —
-`dataset.name: "imagenet-22k"` needs external storage. Checkpoints accumulate
+`dataset.name: "imagenet-22k"` needs external storage.
+
+| Dataset | `dataset.name` | Snapshot | Free while building | Licence / access | Use |
+|---|---|---|---|---|---|
+| ImageNet-1k | `imagenet-1k` | ~160 GB | ~320 GB | ImageNet terms, gated, `HF_TOKEN` | supervised + SSL + probe |
+| ImageNet-22k | `imagenet-22k` | ~1.3 TB | ~2.6 TB | gated, `HF_TOKEN` | supervised |
+| PASS | `pass` | ~166 GB | ~333 GB (staged build; ~500 GB naive) | CC-BY 4.0, not gated | **SSL pretraining only** (`task: "ssl"`); no labels, no val split |
+
+PASS and ImageNet-1k together need ~330 GB of snapshots plus the transient
+build peak of whichever is built second — build one, delete its Arrow cache,
+then build the other. Checkpoints accumulate
 under `checkpoint_root/<run_name>/` (`save_top_k=2` plus `last`, so ~3 files
 × ~170 MB per run) and nothing deletes them automatically.
 

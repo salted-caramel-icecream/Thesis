@@ -169,6 +169,29 @@ machine, so a Windows path never lands on a Linux box and vice versa.
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
 
+### PASS (SSL pretraining only)
+
+| | |
+|---|---|
+| what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
+| licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
+| HF id | `yukimasano/pass` — single `train` split, no validation/test |
+| `arrow_dirs` key | `pass` |
+| disk | ~166 GB snapshot; **~333 GB free while building** (the staged build holds the Arrow cache and the snapshot at once; a naive build would peak near 500 GB) |
+| usable with | `task: "ssl"` only (the JEPA notebook). `train.py --dataset pass` and any supervised recipe are refused at validate time: the corpus has no labels |
+| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is the linear probe on a labelled set (`docs/JEPA_GUIDE.md` §5) |
+
+```bash
+python download_data.py --dataset pass --out /data/pass_arrow                       # Linux / macOS / WSL2
+python download_data.py --dataset pass --out D:/data/pass_arrow --hf-cache E:/hf     # Windows; cache on another drive
+```
+
+The script downloads, converts to Arrow, **deletes only PASS's raw download
+under the HF hub cache** (logged as `[cleanup] removing the raw download of
+yukimasano/pass only`), then writes the snapshot. It prints the snapshot's
+feature names when the conversion finishes; the loader itself finds the image
+column by feature type and never reads the creator, date or GPS columns.
+
 ### ImageNet-22k
 
 ~1.3 TB, and ~2.6 TB to build. Check free space against the real figure before
@@ -221,7 +244,7 @@ key nothing reads.
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
 | MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
-| dataset | `--dataset imagenet-1k` | `dataset.name` |
+| dataset | `--dataset imagenet-1k\|imagenet-22k` (`pass` is SSL-only and refused here) | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
 Before the first upcycled run on a new box: `python tools/verify_upcycling.py
