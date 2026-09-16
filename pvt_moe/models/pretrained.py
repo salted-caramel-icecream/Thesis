@@ -231,7 +231,8 @@ def load_hf_pretrained(
         if stats["unmapped"]:
             print(f"  unmapped HF keys ({len(stats['unmapped'])}): {stats['unmapped'][:5]} ...")
         if stats["missing"]:
-            print(f"  missing model keys ({len(stats['missing'])}, expected for MoE/GQA): "
+            print(f"  missing model keys ({len(stats['missing'])}, expected for MoE experts, "
+                  f"GQA kv and RoPE-Mixed freqs, which stay at init): "
                   f"{stats['missing'][:6]} ...")
     return stats
 

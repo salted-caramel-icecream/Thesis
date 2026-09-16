@@ -214,6 +214,7 @@ key nothing reads.
 | shared expert | `--shared-expert` / `--no-shared-expert` | `moe.shared_expert` |
 | MoE placement | `--moe-placement "[[],[],[],[-1]]"` (−1 = last block of the stage, for any variant) | `ablation.moe_placement` |
 | RoPE | `--rope` / `--no-rope` | `ablation.use_rope` |
+| RoPE flavour | `--rope-mode mixed\|axial` (mixed = learnable RoPE-Mixed, default; axial = fixed, run tag `-ax`) | `ablation.rope_mode` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
 | norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
@@ -345,4 +346,62 @@ Watch for these lines:
 | `[config] ... -> 'none'` | a knob was dropped because its precondition was absent |
 | `[env] WARNING: micro-batch ... only N GiB free` | it will probably OOM |
 | `[milestone] epoch N: saved full state` | a resumable snapshot exists |
+| `[rope] saved N frequency tensor(s) -> .../rope_freqs_init.pt` | the step-0 RoPE-Mixed frequencies are on disk — the drift plot in §7 needs them |
 | `val_precision_macro` far below `val_acc` | expert/class collapse — check `expert_utilization` |
+
+---
+
+## 7. Diagnosing RoPE-Mixed frequencies
+
+The default RoPE (`rope_mode: mixed`) learns its 2D frequencies, so a run
+leaves two small files next to its checkpoints:
+
+```
+<checkpoint_root>/<run_name>/rope_freqs_init.pt    # step 0 — travels inside checkpoints, so a resume anywhere rewrites the TRUE init
+<checkpoint_root>/<run_name>/rope_freqs_final.pt   # refreshed every epoch (a killed run: pass last.ckpt to the tool instead)
+```
+
+Plot the trained frequencies over their init — this is the figure that says
+whether the MoE'd block kept a usable positional signal:
+
+```bash
+# Linux / WSL2 / macOS
+python tools/plot_rope_freqs.py /data/runs/checkpoints/<run_name>/rope_freqs_final.pt \
+    --init /data/runs/checkpoints/<run_name>/rope_freqs_init.pt \
+    --out figures/rope_freqs_<run_name>.pdf
+```
+```powershell
+# Windows — D: is only an example; substitute your own drive
+python tools/plot_rope_freqs.py D:/runs/checkpoints/<run_name>/rope_freqs_final.pt --init D:/runs/checkpoints/<run_name>/rope_freqs_init.pt --out figures/rope_freqs_<run_name>.pdf
+```
+
+Any Lightning checkpoint works as the first argument too (`.../last.ckpt`,
+`.../milestone-epoch090.ckpt`), so a run can be inspected mid-training.
+`--theta` (default 10) only places the reference ladder — pass the run's
+`rope_theta` if you changed it. `--selftest` plots synthetic spread /
+collapsed / axial cases, so you can see what each looks like before trusting
+the real one.
+
+Reading it:
+
+- One row per RoPE'd layer, grouped by stage (a default run has one row,
+  `block4.1` for B1, `block4.2` for B2); three panels per row: (ω_x, ω_y)
+  scatter with one colour per head, angle histogram folded to [0°, 180°),
+  log-magnitude histogram. Hollow markers and dashed outlines are the init;
+  filled markers and solid bars the trained values; thin grey segments join
+  each init point to its trained point; black `+` marks the axial ladder.
+- Healthy: a spread cloud, angles covering the range, magnitudes still on or
+  around the ladder. Collapsed: a blob at the origin and a magnitude
+  histogram piled up at the left — the block has lost position. Spikes at
+  0° / 90° mean the model reverted to axial.
+- The printed table says the same numerically: `collapsed` (fraction of
+  channels below 0.25 × the smallest ladder magnitude), `axis-aligned`
+  (fraction within ±10° of an axis) and `mean disp` (mean |trained − init|).
+- The stage-4 row is the one that matters: it is the MoE'd block, whose
+  routed FFN has no DWConv, so RoPE is its positional signal. Compare with
+  the `-ax` run (`--rope-mode axial`) as the fixed-frequency control.
+
+The tool needs only torch and matplotlib — no Tutel, no dataset, no GPU, not
+even the training environment — so copy the two `.pt` files (a few KB) to a
+laptop and run it there while the GPU keeps training. Output goes to
+`figures/` as a vector PDF in the thesis figure style.

@@ -60,6 +60,13 @@ VALID_RECIPES = ("scratch", "pretrained")
 #:                   and what a from-scratch run uses (nothing is upcycled).
 VALID_UPCYCLE_INITS = ("routed_zero", "shared_zero", "none")
 
+#: RoPE flavour (rope-vit, Heo et al. ECCV'24). "mixed" learns one 2D
+#: frequency vector per channel per head per RoPE'd block; "axial" keeps the
+#: fixed x/y ladder. Each has its own reference theta (init spread for mixed).
+VALID_ROPE_MODES = ("mixed", "axial")
+ROPE_THETA_DEFAULT = {"mixed": 10.0,   # rope-vit RoPE-Mixed models
+                      "axial": 50.0}   # this repo's axial choice (7x7 stage-4 grid)
+
 #: Sanctioned epoch budgets for the from-scratch ablation ladder.
 #: 90 = ablation runs, 300 = final run (PVT v2's own recipe); 150 is the
 #: middle budget. Other values are allowed but are off-ladder.
@@ -358,7 +365,16 @@ _DEFAULT: dict = {
             # the routed branch drops.
             "rope_placement": [[], [], [], [-1]],
             "rope_last_n_stages": None,
-            "rope_theta": 50.0,           # 50 suits the 7x7 stage-4 grid
+            # "mixed" (default): learnable per-head (ω_x, ω_y) frequencies,
+            # parameter `attn.rope.freqs` of shape (2, heads, head_dim//2) in
+            # every RoPE'd block, weight-decay excluded, snapshotted at step 0
+            # (rope_freqs_init.pt) for the drift plot (tools/plot_rope_freqs.py).
+            # "axial": fixed frequencies, no parameters (the v10 behaviour).
+            # Mixed needs num_kv_heads == num_heads in the RoPE'd stages.
+            "rope_mode": "mixed",
+            # None => ROPE_THETA_DEFAULT[rope_mode] (mixed 10.0, axial 50.0).
+            # For mixed it only sets the INITIAL magnitude ladder.
+            "rope_theta": None,
         },
 
         # --- MoE hyperparameters (previously hardcoded in the notebook) ----
@@ -575,7 +591,11 @@ def build_run_tag(cfg: dict) -> str:
 
     if abl["use_rope"]:
         rope_pl = resolve_placement(abl["rope_placement"], abl["rope_last_n_stages"], depths)
-        rope = f"rope-{_placement_tag(rope_pl, depths)}"
+        # Mixed (the default) is untagged; the fixed-frequency arm is "-ax".
+        # Two RoPE flavours in one placement are different models, so the
+        # flavour has to be in the name or they share a checkpoint directory.
+        flavour = "-ax" if abl["rope_mode"] == "axial" else ""
+        rope = f"rope-{_placement_tag(rope_pl, depths)}{flavour}"
     else:
         rope = "norope"
 
@@ -1048,13 +1068,34 @@ def validate_config(cfg: dict) -> dict:
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
 
-    # RoPE requires head_dim % 4 == 0 wherever it is enabled.
+    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled;
+    # mixed needs one kv head per query head in every RoPE'd stage.
+    if abl.get("rope_mode") not in VALID_ROPE_MODES:
+        raise ValueError(
+            f"model.ablation.rope_mode must be one of {VALID_ROPE_MODES}, "
+            f"got {abl.get('rope_mode')!r}")
+    if abl.get("rope_theta") is None:
+        abl["rope_theta"] = ROPE_THETA_DEFAULT[abl["rope_mode"]]
+    elif (abl["use_rope"] and abl["rope_mode"] == "mixed"
+          and abl["rope_theta"] != ROPE_THETA_DEFAULT["mixed"]):
+        # For mixed, theta only shapes the INITIAL magnitude ladder; a value
+        # tuned for the axial arm (50) is rarely what was meant.
+        print(f"[config] rope_theta {abl['rope_theta']} with rope_mode 'mixed' sets "
+              f"only the initial frequency ladder (rope-vit uses "
+              f"{ROPE_THETA_DEFAULT['mixed']}); leave it unset for the reference init.")
     for i, blocks in enumerate(abl["rope_placement"]):
         if blocks and abl["use_rope"]:
             head_dim = model["embed_dims"][i] // model["num_heads"][i]
             if head_dim % 4 != 0:
                 raise ValueError(
                     f"RoPE enabled in stage {i + 1} but head_dim={head_dim} is not divisible by 4"
+                )
+            if abl["rope_mode"] == "mixed" and model["num_kv_heads"][i] != model["num_heads"][i]:
+                raise ValueError(
+                    f"rope_mode 'mixed' in stage {i + 1} needs num_kv_heads == num_heads "
+                    f"({model['num_kv_heads'][i]} != {model['num_heads'][i]}): the learnable "
+                    f"frequencies are per query head. Use rope_mode 'axial' with GQA, or "
+                    f"drop the GQA override for that stage."
                 )
 
     # The recipe's LR is calibrated for a specific effective batch; say so

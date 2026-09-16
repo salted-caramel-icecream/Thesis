@@ -25,6 +25,7 @@ Running the whole ablation ladder is then a shell loop::
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -36,6 +37,7 @@ from pvt_moe.config import (
     VALID_MODES,
     VALID_NORMS,
     VALID_RECIPES,
+    VALID_ROPE_MODES,
     VALID_UPCYCLE_INITS,
     VALID_VARIANTS,
     default_config,
@@ -136,7 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="convenience: MoE in all blocks of the last N stages")
     g.add_argument("--rope-placement", metavar="JSON")
     g.add_argument("--rope-last-n", type=int, dest="rope_last_n_stages")
-    g.add_argument("--rope-theta", type=float)
+    g.add_argument("--rope-mode", choices=VALID_ROPE_MODES, dest="rope_mode",
+                   help="mixed (default) = learnable per-head 2D frequencies "
+                        "(rope-vit RoPE-Mixed); axial = fixed frequencies")
+    g.add_argument("--rope-theta", type=float,
+                   help="RoPE base (default: 10 for mixed, 50 for axial)")
     g.add_argument("--grad-checkpointing", metavar="JSON",
                    help='stages (1-based) to recompute in backward, e.g. "[1,2]". '
                         'Saves memory proportional to token count, so stage 1 '
@@ -281,6 +287,7 @@ _FLAG_PATHS = {
     "moe_last_n_stages": "model.ablation.moe_last_n_stages",
     "rope_last_n_stages": "model.ablation.rope_last_n_stages",
     "rope_theta": "model.ablation.rope_theta",
+    "rope_mode": "model.ablation.rope_mode",
     "num_experts": "model.moe.num_experts",
     "top_k": "model.moe.top_k",
     "capacity_factor": "model.moe.capacity_factor",
@@ -401,7 +408,8 @@ def describe(cfg: dict) -> str:
             )
     else:
         lines.append("  MoE: off (dense arm)")
-    lines.append(f"  RoPE: {abl['rope_placement'] if abl['use_rope'] else 'off'} "
+    lines.append(f"  RoPE: {abl['rope_placement'] if abl['use_rope'] else 'off'}"
+                 f"{' ' + abl['rope_mode'] + ' theta ' + str(abl['rope_theta']) if abl['use_rope'] else ''} "
                  f"| aug {cfg['dataset']['randaugment']} "
                  f"x{cfg['dataset']['repeated_aug']} repeats")
     if cfg.get("milestones") or cfg.get("stop_at_epoch"):
@@ -544,6 +552,26 @@ def check_environment(variant: str = "b1") -> int:
     return 0 if ok else 1
 
 
+def _exportable(cfg: dict) -> dict:
+    """The config as it should be written back to disk.
+
+    Values validate_config DERIVED are put back to None so a saved file
+    re-derives them when reloaded with different flags: otherwise
+    ``--config saved.json --rope-mode axial`` would keep the mixed run name
+    and the mixed theta. An explicit ``--run-name`` / ``--rope-theta`` that
+    differs from the derivation is kept.
+    """
+    from pvt_moe.config import ROPE_THETA_DEFAULT, build_run_tag
+
+    out = copy.deepcopy({k: v for k, v in cfg.items() if not k.startswith("_")})
+    if out.get("run_name") == build_run_tag(cfg):
+        out["run_name"] = None
+    abl = out["model"]["ablation"]
+    if abl.get("rope_theta") == ROPE_THETA_DEFAULT.get(abl.get("rope_mode")):
+        abl["rope_theta"] = None
+    return out
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.check_env:
@@ -571,12 +599,10 @@ def main(argv=None) -> int:
         return 2
 
     if args.print_config:
-        printable = {k: v for k, v in cfg.items() if not k.startswith("_")}
-        print(json.dumps(printable, indent=2, sort_keys=True))
+        print(json.dumps(_exportable(cfg), indent=2, sort_keys=True))
     if args.save_config:
         with open(args.save_config, "w") as fh:
-            json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
-                      fh, indent=2, sort_keys=True)
+            json.dump(_exportable(cfg), fh, indent=2, sort_keys=True)
         print(f"[config] wrote {args.save_config}")
     if args.dry_run:
         print("[dry-run] config resolved; nothing built, nothing trained.")

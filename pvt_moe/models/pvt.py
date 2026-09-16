@@ -5,7 +5,8 @@ Baselines with Pyramid Vision Transformer") extended with:
 
 - grouped-query SRA attention (``pvt_moe.models.attention.GQAttention``)
 - per-block Mixture-of-Experts FFN (``pvt_moe.models.ffn.MoEMlp``)
-- per-block 2D axial RoPE (``pvt_moe.models.rope``)
+- per-block 2D RoPE, mixed (learnable per-head frequencies, default) or
+  axial (``pvt_moe.models.rope``)
 - a LayerNorm/RMSNorm toggle (``pvt_moe.models.norms``)
 
 The overlapping patch-embedding stems are fixed at the official PVT v2
@@ -106,6 +107,7 @@ class Block(nn.Module):
         moe_cfg: dict | None = None,
         use_rope: bool = False,
         rope_theta: float = 100.0,
+        rope_mode: str = "axial",
         dense_dwconv: bool = True,
     ):
         super().__init__()
@@ -123,6 +125,7 @@ class Block(nn.Module):
             norm_layer=norm_layer,
             use_rope=use_rope,
             rope_theta=rope_theta,
+            rope_mode=rope_mode,
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -172,6 +175,7 @@ class PyramidVisionTransformerV2(nn.Module):
         rope_placement=None,
         moe_cfg: dict | None = None,
         rope_theta: float = 100.0,
+        rope_mode: str = "axial",
         act_layer=nn.GELU,
         dense_dwconv: bool = True,
         grad_checkpointing=(),
@@ -221,6 +225,7 @@ class PyramidVisionTransformerV2(nn.Module):
                         moe_cfg=moe_cfg,
                         use_rope=(j in self.rope_placement[i]),
                         rope_theta=rope_theta,
+                        rope_mode=rope_mode,
                         dense_dwconv=dense_dwconv,
                     )
                     for j in range(depths[i])
@@ -270,9 +275,15 @@ class PyramidVisionTransformerV2(nn.Module):
 
     @torch.jit.ignore
     def no_weight_decay(self) -> set:
-        """Parameter names to exclude from weight decay (norms/biases are
-        excluded by the ndim<=1 rule in the optimizer factory instead)."""
-        return set()
+        """Parameter names to exclude from weight decay, beyond the ndim<=1
+        rule (norms/biases) the optimizer factories apply themselves.
+
+        The learnable RoPE-Mixed frequencies: decaying them pulls every
+        frequency toward zero, i.e. toward position blindness (rope-vit lists
+        ``freqs`` under ``no_weight_decay`` for the same reason). Both
+        ``LitClassifier`` and ``LitJEPA`` consult this.
+        """
+        return {n for n, _ in self.named_parameters() if n.endswith("rope.freqs")}
 
     def get_classifier(self):
         return self.head
@@ -286,13 +297,18 @@ class PyramidVisionTransformerV2(nn.Module):
             self._init_weights(self.head)  # keep the trunc_normal(0.02) contract
 
     def freeze_stages(self, num_frozen_stages: int):
-        """Freeze (eval + requires_grad=False) the first N stages."""
+        """Freeze (eval + requires_grad=False) the first N stages.
+
+        RoPE-Mixed frequencies inside a frozen stage stay trainable: no
+        pretrained checkpoint carries them, so freezing would pin a random
+        positional encoding that the stage was never trained with.
+        """
         for i in range(num_frozen_stages):
             for attr in (f"patch_embed{i + 1}", f"block{i + 1}", f"norm{i + 1}"):
                 module = getattr(self, attr)
                 module.eval()
-                for p in module.parameters():
-                    p.requires_grad = False
+                for name, p in module.named_parameters():
+                    p.requires_grad = name.endswith("rope.freqs")
 
     # -- forward ---------------------------------------------------------------
 
@@ -398,6 +414,7 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         rope_placement=abl["rope_placement"] if abl["use_rope"] else None,
         moe_cfg=m["moe"],
         rope_theta=abl["rope_theta"],
+        rope_mode=abl["rope_mode"],
         dense_dwconv=m.get("dense_dwconv", True),
         grad_checkpointing=m.get("grad_checkpointing", ()),
     )

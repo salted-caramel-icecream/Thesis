@@ -226,7 +226,7 @@ Two, for different purposes:
 
 | | |
 |---|---|
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 211 tests. Prefer this. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 241 tests. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
@@ -286,6 +286,7 @@ python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% 
 python train.py --backend native                       # no-Tutel fallback
 python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
 python train.py --no-moe-dwconv --rope                 # position-encoding arm
+python train.py --rope-mode axial                      # fixed-frequency (axial) RoPE control, run tag -ax
 ```
 
 `--checkpoint-root` is the canonical name; `--checkpoint-dir` is an alias
@@ -350,7 +351,7 @@ directly, and prints the equivalent command line.
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16). GQA is available as an ablation via `model.num_kv_heads` |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
-| 4 | RoPE placement | `model.ablation.rope_placement`, `rope_theta` | 2D axial complex-mul RoPE; needs `head_dim % 4 == 0` |
+| 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
 | 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 | 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
@@ -373,14 +374,34 @@ sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
 │   │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
 │   │  │        │    └────────────────────────────── 4 experts, top-1
 │   │  │        │    │   └────────────────────────── shared expert
-│   │  │        │    │   │   └────────────────────── RoPE placement
+│   │  │        │    │   │   └────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
 │   │  │        │    │   │   │         └──────────── norm
 │   │  │        │    │   │   │         │  └───────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
-theirs), `-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
+`-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+
+## RoPE frequency diagnostics
+
+RoPE-Mixed learns its frequencies, so every run with `use_rope` writes the
+`(2, heads, head_dim//2)` tensor of each RoPE'd block twice, into
+`<checkpoint_root>/<run_name>/`: `rope_freqs_init.pt` at step 0 (kept inside every checkpoint too, so a resume on
+another machine rewrites the true init rather than the restored weights) and
+`rope_freqs_final.pt` (refreshed every epoch; a killed run's latest values are
+also in `last.ckpt`, which the plot tool accepts directly).
+
+```bash
+python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
+    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
+python tools/plot_rope_freqs.py --selftest          # synthetic spread / collapsed / axial cases
+```
+
+CPU only, torch + matplotlib, no dataset or Tutel — so it runs on a laptop
+while the GPU trains. `docs/GUIDE.md` §7 is the reading guide and
+`docs/HPARAMS.md` §2 the healthy-vs-collapsed table.
 
 ## Shared expert (`model.moe.shared_expert`)
 

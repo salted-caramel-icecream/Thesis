@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 *.egg-info/
+
+# throwaway throughput runs from notebooks/quick_bench.ipynb
+bench_runs/

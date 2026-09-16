@@ -187,12 +187,14 @@ class LitClassifier(pl.LightningModule):
                 stage4_ids.update(id(p) for p in module.parameters())
 
         groups = {"s123_decay": [], "s123_nodecay": [], "s4_decay": [], "s4_nodecay": []}
-        for p in self.model.parameters():
+        no_decay_names = self.model.no_weight_decay()   # RoPE-Mixed freqs
+        for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
             part = "s4" if id(p) in stage4_ids else "s123"
-            kind = "nodecay" if p.ndim <= 1 else "decay"  # biases + norm weights
-            groups[f"{part}_{kind}"].append(p)
+            # biases + norm weights (timm rule) plus the model's own list.
+            nodecay = p.ndim <= 1 or name in no_decay_names
+            groups[f"{part}_{'nodecay' if nodecay else 'decay'}"].append(p)
 
         param_groups = [
             {"params": groups["s123_decay"], "lr": base_lr, "weight_decay": wd,

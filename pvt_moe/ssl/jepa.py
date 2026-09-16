@@ -188,10 +188,13 @@ class LitJEPA(pl.LightningModule):
         decay, no_decay = [], []
         modules = [self.context, self.predictor]
         for module in modules:
-            for p in module.parameters():
+            # The backbone's own no-decay list (RoPE-Mixed frequencies) on
+            # top of the ndim<=1 rule — same policy as LitClassifier.
+            listed = module.no_weight_decay() if hasattr(module, "no_weight_decay") else set()
+            for name, p in module.named_parameters():
                 if not p.requires_grad:
                     continue
-                (no_decay if p.ndim <= 1 else decay).append(p)
+                (no_decay if p.ndim <= 1 or name in listed else decay).append(p)
         no_decay.append(self.input_mask_token)
 
         optimizer = torch.optim.AdamW(

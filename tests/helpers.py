@@ -30,7 +30,9 @@ def tiny_config(**overrides) -> dict:
                 # head_dims [16, 16, 12, 16] — all divisible by 4 (RoPE-safe)
                 "embed_dims": [16, 32, 48, 64],
                 "num_heads": [1, 2, 4, 4],
-                "num_kv_heads": [1, 1, 2, 2],
+                # MHA like the shipped default; pass num_kv_heads explicitly
+                # (with rope_mode "axial") in a test that wants the GQA path.
+                "num_kv_heads": [1, 2, 4, 4],
                 "mlp_ratios": [2, 2, 2, 2],
                 "depths": [1, 1, 1, 2],
                 "drop_path_rate": 0.1,

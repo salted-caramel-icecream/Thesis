@@ -26,6 +26,7 @@ your LR.
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
 | Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | `model.num_kv_heads` (None = heads) | PVT v2; GQA (`[1,1,1,2]`, v9 lineage) stays available as an ablation |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
+| RoPE | mode **mixed** (RoPE-Mixed: learnable per-head 2D frequencies, one `attn.rope.freqs` per RoPE'd block, no weight decay, MHA only); `--rope-mode axial` = fixed frequencies (run tag `-ax`). theta: **10** for mixed — sets only the init spread of the frequencies — / **50** for axial — the frequencies themselves | `ablation.rope_mode`, `ablation.rope_theta` (None = per-mode default) | rope-vit (Heo et al. ECCV'24): RoPE-Mixed models use theta 10, axial 100; 50 is this repo's axial choice for the 7×7 stage-4 grid |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
 | Epochs | **90** (ablations) / 150 / 300 (final) | `epochs` | ScMoE runs vision comparisons at 90 ep on IN-1K; PVT v2's own recipe is 300 |
 | Batch size | 1024 | `batch_size` | PVT v2 |
@@ -179,7 +180,11 @@ tokens out of order and pads to capacity, so the routed branch has no H×W to
 convolve over. A block with `shared_expert: false` therefore has no conv at
 all, and the flag resolves to false.
 
-Independent of `use_rope`, giving four arms, all distinctly named:
+Independent of `use_rope`, giving four arms, all distinctly named. The RoPE
+in these arms is **RoPE-Mixed** by default (`rope_mode: mixed`, learnable
+per-head frequencies, so the MoE'd block can tune *which* directions and
+frequencies it attends by); `--rope-mode axial` is the fixed-frequency
+control and appends `-ax` to the rope fragment:
 
 | Arm | Flags | Run name fragment |
 |---|---|---|
@@ -187,6 +192,7 @@ Independent of `use_rope`, giving four arms, all distinctly named:
 | RoPE replaces the conv | `--no-moe-dwconv --rope` | `+sh-plain_rope-s4b1` |
 | both | `--moe-dwconv --rope` | `+sh_rope-s4b1` |
 | neither | `--no-moe-dwconv --no-rope` | `+sh-plain_norope` |
+| both, fixed axial RoPE | `--moe-dwconv --rope --rope-mode axial` | `+sh_rope-s4b1-ax` |
 
 Ready-made: `configs/scratch_10..12_*.yaml`.
 
@@ -205,6 +211,40 @@ in full and reports the skip rather than dropping it silently:
 
 Any *other* source tensor without a destination is a `WARNING`, not a quiet
 drop — `tests/test_shared_expert.py` asserts both messages.
+
+### RoPE-Mixed frequency diagnostics
+
+With the default `rope_mode: mixed` every RoPE'd block trains a
+`(2, heads, head_dim//2)` frequency tensor (`[0]` = ω_x, `[1]` = ω_y).
+`RopeFreqSnapshot` saves those tensors to
+`<checkpoint_root>/<run_name>/rope_freqs_init.pt` at step 0 and
+`rope_freqs_final.pt` at the end of fit (every `.ckpt` carries them too, as
+`model.block4.1.attn.rope.freqs`). `tools/plot_rope_freqs.py` draws them —
+one row per RoPE'd layer grouped by stage, vector PDF into `figures/` — and
+prints a per-layer table (`collapsed` fraction, `axis-aligned` fraction,
+`mean disp` from init):
+
+```bash
+python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
+    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
+```
+
+Four views, and what to read off each:
+
+| View | Healthy | Warning sign |
+|---|---|---|
+| (ω_x, ω_y) scatter, one colour per head, axial ladder `1/θ^(4k/d)` as `+` on both axes | a spread cloud — every head at its own angle, magnitudes along the ladder | a blob at the origin (frequencies collapsed: the block is drifting to position-blind); every point on an axis (reverted to axial) |
+| angle histogram, `atan2(ω_y, ω_x)` folded to [0°, 180°) | mass spread over the range | spikes at 0° and 90° = reverted to axial; one spike = every head learned the same direction |
+| log-magnitude histogram of \|ω\| | mass on or around the init ladder | mass piling up near \|ω\| = 0 = low-frequency collapse (RoPE degenerating into "no position") |
+| init → trained overlay (hollow init markers, thin segments to the trained point) | short segments in varied directions | long segments all pointing at the origin, or all rotating onto an axis |
+
+The **stage-4 panel** (the MoE'd block: `block4.1` in B1, `block4.2` in B2)
+is the one the thesis story rests on — it is where the routed FFN dropped
+PVT v2's DWConv, so RoPE is that block's positional signal. Spread there
+means the learnable frequencies kept position where MoE removed it; collapse
+there while dense-stage panels (`--rope-last-n 4` runs) stay spread means
+position is being lost exactly where MoE removed it. The `-ax` run is the
+fixed-frequency control. The tool needs only torch + matplotlib, no GPU.
 
 ---
 
