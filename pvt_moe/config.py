@@ -35,11 +35,43 @@ import json
 #: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
+#: ``finetune_epochs`` is a FIXED budget per small dataset: open-ended runs on
+#: small data are the ones most likely to overrun. ``hf_id`` is None where the
+#: Hub id has not been verified from this machine — pass ``--hf-id`` to
+#: download_data.py. ``licence`` is recorded verbatim for the methods section.
 DATASETS = {
-    "imagenet-1k": {"num_classes": 1000, "labelled": True, "tag": "in1k"},
-    "imagenet-22k": {"num_classes": 21841, "labelled": True, "tag": "in22k"},
-    "pass": {"num_classes": 0, "labelled": False, "tag": "pass"},
+    "imagenet-1k": {"num_classes": 1000, "labelled": True, "tag": "in1k",
+                    "hf_id": "ILSVRC/imagenet-1k", "gated": True, "finetune_epochs": None,
+                    "licence": "ImageNet terms of access; gated on HF"},
+    "imagenet-22k": {"num_classes": 21841, "labelled": True, "tag": "in22k",
+                     "hf_id": "timm/imagenet-22k-wds", "gated": True, "finetune_epochs": None,
+                     "licence": "ImageNet terms of access; gated on HF"},
+    "pass": {"num_classes": 0, "labelled": False, "tag": "pass",
+             "hf_id": "yukimasano/pass", "gated": False, "finetune_epochs": None,
+             "licence": "CC-BY 4.0 (images and dataset)"},
+    # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
+    # Native resolutions are far below 224; dataset.img_size upsamples, so
+    # results on these partly measure interpolation (docs/GUIDE.md).
+    "cifar-10": {"num_classes": 10, "labelled": True, "tag": "c10", "hf_id": None,
+                 "gated": False, "finetune_epochs": 50, "native_size": 32,
+                 "licence": "no stated licence; derived from 80 Million Tiny Images, "
+                            "withdrawn by its authors"},
+    "cifar-100": {"num_classes": 100, "labelled": True, "tag": "c100", "hf_id": None,
+                  "gated": False, "finetune_epochs": 50, "native_size": 32,
+                  "licence": "no stated licence; derived from 80 Million Tiny Images, "
+                             "withdrawn by its authors"},
+    "flowers-102": {"num_classes": 102, "labelled": True, "tag": "flw102", "hf_id": None,
+                    "gated": False, "finetune_epochs": 100, "native_size": None,
+                    "licence": "no stated licence"},
+    "pneumoniamnist": {"num_classes": 2, "labelled": True, "tag": "pneu", "hf_id": None,
+                       "gated": False, "finetune_epochs": 30, "native_size": 28,
+                       "licence": "CC-BY 4.0 (MedMNIST v2)"},
+    "pathmnist": {"num_classes": 9, "labelled": True, "tag": "path", "hf_id": None,
+                  "gated": False, "finetune_epochs": 30, "native_size": 28,
+                  "licence": "CC-BY 4.0 (MedMNIST v2)"},
 }
+#: Datasets whose fine-tune budget is fixed by DATASETS[...]["finetune_epochs"].
+SMALL_DATASETS = tuple(n for n, s in DATASETS.items() if s.get("finetune_epochs"))
 #: Class counts are DERIVED from dataset.name — never hand-set num_classes.
 NUM_CLASSES = {name: spec["num_classes"] for name, spec in DATASETS.items()}
 VALID_TASKS = ("supervised", "ssl")
@@ -53,7 +85,15 @@ VALID_NORMS = ("layernorm", "rmsnorm")
 #: will not build; it is architecturally equivalent at top_k=1 and shares
 #: Tutel's parameter layout, so checkpoints move between the two.
 VALID_BACKENDS = ("tutel", "native", "megablocks")
-VALID_RECIPES = ("scratch", "pretrained")
+#: "ssl_finetune" is the INTERMEDIATE stage: a supervised ImageNet-1k
+#: fine-tune of an SSL-pretrained backbone. For pyramid ViTs under masked
+#: image modelling the chain is SSL -> supervised ImageNet -> downstream;
+#: going SSL -> downstream directly underperforms (SwinV2, arXiv 2111.09883
+#: §4.2, describes its own SwinV2-G recipe as self-supervised pretraining
+#: followed by a further supervised classification stage on the same data
+#: before task fine-tuning; BEiT uses the same scheme). "downstream" is the
+#: final stage on a small dataset, with a per-dataset epoch budget.
+VALID_RECIPES = ("scratch", "pretrained", "ssl_finetune", "downstream")
 
 #: How an upcycled MoE block is initialized. Both branches copy the pretrained
 #: FFN, so one of them must start at zero or the block emits ~2x the dense
@@ -167,6 +207,43 @@ RECIPES = {
         },
         # model.drop_path_rate is derived from epochs by scratch_drop_path().
     },
+    # Intermediate stage: SSL checkpoint -> supervised ImageNet-1k.
+    # Values from microsoft/SimMIM @ d3e29bc,
+    # configs/swin_base__100ep/simmim_finetune__swin_base__img224_window7__100ep.yaml
+    # (base_lr 1.25e-3 under the /512 rule, warmup 20, layer decay 0.9,
+    # drop path 0.1, RandAug (9, 0.5) + label smoothing 0.1 + mixup/cutmix).
+    "ssl_finetune": {
+        "mode": "ssl_init",
+        "epochs": 100,
+        "optim": {
+            "base_lr": 1.25e-3,
+            "lr_reference_batch": 512,
+            "lr": None,                    # DERIVED by the linear scaling rule
+            "warmup_epochs": 20,
+            "stage4_lr_multiplier": 1.0,
+            # Layer-wise decay compounding from the head down. SimMIM §4.3
+            # uses 0.9 for a 100-epoch pretrain and lowers it with model size
+            # and pretraining length (0.8 Swin-B, 0.75 Swin-L, 0.7 SwinV2-H at
+            # 800 ep); at 200 ep on a 25M model 0.9 is the conservative end.
+            "layer_decay": 0.9,
+        },
+        "model": {"drop_path_rate": 0.1},
+    },
+    # Final stage: a small labelled dataset. The epoch budget comes from
+    # DATASETS[name]["finetune_epochs"] unless set explicitly.
+    "downstream": {
+        "mode": "ssl_init",
+        "epochs": None,                    # filled from the dataset's budget
+        "optim": {
+            "base_lr": 1.25e-3,
+            "lr_reference_batch": 512,
+            "lr": None,
+            "warmup_epochs": 5,
+            "stage4_lr_multiplier": 1.0,
+            "layer_decay": 0.9,
+        },
+        "model": {"drop_path_rate": 0.1},
+    },
     "pretrained": {
         "mode": "hf_pretrained",
         "epochs": 100,                     # ViMoE fine-tunes ViT-B for 100 ep
@@ -210,14 +287,57 @@ RECIPES = {
 #: like the supervised recipe it is NOT rescaled automatically — LitJEPA
 #: prints the resolved LR, the effective batch and what linear scaling
 #: would give, and you decide.
+VALID_SSL_METHODS = ("simmim", "jepa")
+VALID_MASK_SPACES = ("token", "pixel")
+
+#: Optimiser settings per SSL method; ``apply_ssl_method`` fills any ``None``
+#: field of ``cfg["ssl"]`` from here, then resolves
+#: ``lr = base_lr * effective_batch / lr_reference_batch`` (the linear scaling
+#: rule; SimMIM's reference batch is 512, MAE/JEPA's is 2048).
+#:
+#: simmim: microsoft/SimMIM @ d3e29bc — configs/swin_base__100ep/*.yaml,
+#:   config.py defaults and main_simmim.py's scaling rule. NOT yet checked
+#:   against the published paper (the PDF has not reached this machine).
+#: jepa:   I-JEPA-style values this repo shipped before SimMIM was added.
+SSL_METHOD_DEFAULTS = {
+    "simmim": {"epochs": 200, "base_lr": 2e-4, "lr_reference_batch": 512,
+               "warmup_epochs": 10, "warmup_lr": 1e-6, "final_lr": 1e-5,
+               "weight_decay": 0.05, "betas": [0.9, 0.999], "grad_clip": 5.0},
+    "jepa": {"epochs": 100, "base_lr": 1.5e-3, "lr_reference_batch": 2048,
+             "warmup_epochs": 15, "warmup_lr": 0.0, "final_lr": 1e-6,
+             "weight_decay": 0.04, "betas": [0.9, 0.95], "grad_clip": 3.0},
+}
+
 SSL_DEFAULTS = {
-    "epochs": 100,
-    "lr": 1.5e-3,
-    "lr_reference_batch": 2048,
-    "warmup_epochs": 15,
-    "final_lr": 1e-6,
-    "weight_decay": 0.04,         # cosine-ramped to weight_decay_end
-    "weight_decay_end": 0.4,
+    "method": "simmim",           # VALID_SSL_METHODS; "jepa" kept reachable
+    # None => filled from SSL_METHOD_DEFAULTS[method]; anything set wins.
+    "epochs": None,
+    "base_lr": None,              # what the linear scaling rule starts from
+    "lr_reference_batch": None,   # simmim 512, jepa 2048
+    "lr": None,                   # DERIVED; set explicitly to bypass the rule
+    "warmup_epochs": None,
+    "warmup_lr": None,            # DERIVED from warmup_lr_base by the same rule
+    "final_lr": None,             # DERIVED likewise
+    "weight_decay": None,
+    "betas": None,
+    "grad_clip": None,
+    # --- SimMIM (masked image modelling) ---------------------------------
+    # 32-px mask patches, 60% masked, L1 on ImageNet-normalised pixels over
+    # masked pixels only; the prediction head is one 1x1 conv + PixelShuffle
+    # on the stride-32 stage-4 map (microsoft/SimMIM models/simmim.py).
+    "mask_patch_size": 32,
+    "mask_ratio": 0.6,
+    # WHERE the mask is applied. "token" is SimMIM's: replace stage-1 tokens
+    # with the shared mask token AFTER the patch embed. With PVT v2's
+    # OVERLAPPING 7x7/stride-4 embed that lets surviving tokens see a 3-px
+    # band on the bottom/right edge of each masked patch (183/1024 = 17.9% of
+    # an isolated patch, 6.9% of masked pixels at ratio 0.6; measured, see
+    # docs/SIMMIM_GUIDE.md). "pixel" masks BEFORE the embed, which removes the
+    # leak but departs from SimMIM. Swin's non-overlapping embed has no leak,
+    # so SimMIM never had to choose.
+    "mask_space": "token",
+    # --- JEPA only --------------------------------------------------------
+    "weight_decay_end": 0.4,      # cosine-ramped from weight_decay
     "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
     "ema_momentum_end": 1.0,
     "mask_n_blocks": 4,
@@ -226,7 +346,6 @@ SSL_DEFAULTS = {
     "predictor_dim": 384,
     "predictor_depth": 6,
     "predictor_heads": 6,
-    "grad_clip": 3.0,
 }
 
 
@@ -246,6 +365,11 @@ _DEFAULT: dict = {
     # notebooks/03). Decides which datasets are admissible: an unlabelled
     # corpus (PASS) is refused unless task is "ssl".
     "task": "supervised",
+    # Which sequence of stages produced this run, oldest first, e.g.
+    # ["simmim_pretrain@pass_r224", "ssl_finetune@imagenet-1k_r224"].
+    # validate_config seeds it with THIS stage; a warm start prepends the
+    # parent checkpoint's chain, and results.json records the whole thing.
+    "chain": [],
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
     "experiment_group": "ablations",
@@ -483,6 +607,18 @@ _DEFAULT: dict = {
         # None => recipe default (1.0 for both recipes; Sparse Upcycling B.9
         # found differential expert/router LRs generally hurt).
         "stage4_lr_multiplier": None,
+        # Linear scaling rule (SimMIM main_simmim.py / main_finetune.py):
+        # lr = base_lr * effective_batch / lr_reference_batch. Both None on
+        # the from-scratch and HF recipes, which state an absolute `lr`
+        # calibrated for LR_REFERENCE_BATCH and are NOT rescaled.
+        "base_lr": None,
+        "lr_reference_batch": None,
+        # Layer-wise LR decay: every block is scaled by this factor
+        # compounding from the head down (head = 1.0, stage-1 patch embed =
+        # decay ** n_layers). 1.0 = off, which is what every from-scratch and
+        # HF recipe uses. DIFFERENT mechanism from stage4_lr_multiplier,
+        # which scales one stage by one factor.
+        "layer_decay": None,
         "grad_clip": 5.0,                 # Swin V2
         "warmup_epochs": None,            # None => recipe default
         # DERIVED in validate_config from WARMUP_START_LR / lr so the warmup
@@ -582,6 +718,23 @@ def _placement_tag(placement, depths) -> str:
     return "+".join(parts) if parts else "none"
 
 
+def stage_tag(cfg: dict) -> str:
+    """One pipeline stage in words: ``"simmim_pretrain@pass_r224"``.
+
+    ``cfg["chain"]`` is the list of these, oldest first, so a result can name
+    the whole path that produced it (SSL pretrain -> intermediate supervised
+    ImageNet fine-tune -> downstream task).
+    """
+    ds = cfg["dataset"]["name"]
+    res = f"r{cfg['dataset']['img_size']}"
+    if cfg.get("task") == "ssl":
+        return f"{cfg['ssl']['method']}_pretrain@{ds}_{res}"
+    kind = {"scratch": "scratch", "pretrained": "hf_finetune",
+            "ssl_finetune": "ssl_finetune", "downstream": "downstream"}.get(
+        cfg.get("recipe"), cfg.get("mode") or "run")
+    return f"{kind}@{ds}_{res}"
+
+
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
@@ -592,6 +745,9 @@ def build_run_tag(cfg: dict) -> str:
     checkpoint directory.
     """
     ds = DATASETS[cfg["dataset"]["name"]]["tag"]
+    # Resolution is part of the identity: a 224 arm and a 256 arm are not
+    # comparable and must not share a checkpoint directory.
+    res = f"r{cfg['dataset']['img_size']}"
     variant = cfg["model"]["variant"]
     abl = cfg["model"]["ablation"]
     depths = cfg["model"]["depths"]
@@ -652,10 +808,18 @@ def build_run_tag(cfg: dict) -> str:
     norm = {"layernorm": "ln", "rmsnorm": "rms"}[cfg["model"]["norm_type"]]
     # Budget tag: the epoch count is an ablation axis of its own (90/150/300
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
-    budget = {"scratch": "scratch", "pretrained": "ft"}.get(cfg.get("recipe"), "run")
+    budget = {"scratch": "scratch", "pretrained": "ft", "ssl_finetune": "sslft",
+              "downstream": "dstr"}.get(cfg.get("recipe"), "run")
+    if cfg.get("task") == "ssl":
+        # An SSL run is identified by its method and pretraining length; the
+        # mask space changes what the encoder sees, so it is tagged too.
+        ssl = cfg["ssl"]
+        px = "-px" if ssl.get("mask_space") == "pixel" else ""
+        return (f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_"
+                f"{ssl['method']}{ssl['epochs']}{px}")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
-    return f"{cfg['version']}_{variant}_{ds}_{moe}_{rope}{dwconv}_{norm}_{budget}"
+    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}"
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +953,106 @@ def ladder_overrides(recipe: str, row: int) -> tuple:
     return entry, desc, note
 
 
+def resolve_lr(base_lr: float, effective_batch: int, reference_batch: int) -> float:
+    """The linear scaling rule shared by SimMIM and MAE-family recipes."""
+    return base_lr * effective_batch / reference_batch
+
+
+def lr_banner(cfg: dict, ssl: bool = False) -> str:
+    """One line naming the BASE lr, the batch it was scaled by, and the result.
+
+    Printed at startup by every entry point so the learning rate actually in
+    use is visible rather than implied.
+    """
+    micro = cfg["batch_size"]
+    accum = cfg.get("accumulate_grad_batches") or 1
+    eff = cfg.get("effective_batch_size") or micro * accum
+    batch = f"batch {micro} micro x {accum} accum = {eff} effective"
+    if ssl:
+        s = cfg["ssl"]
+        return (f"[ssl] method {s['method']} | base_lr {s['base_lr']:.2e} x ({eff} / "
+                f"{s['lr_reference_batch']}) -> lr {s['lr']:.2e} | {batch} | "
+                f"warmup {s['warmup_epochs']} ep from {s['warmup_lr']:.2e}, "
+                f"final {s['final_lr']:.2e} | {s['epochs']} epochs")
+    o = cfg["optim"]
+    if o.get("base_lr") is not None:
+        rule = (f"base_lr {o['base_lr']:.2e} x ({eff} / {o['lr_reference_batch']}) -> "
+                f"lr {o['lr']:.2e}")
+    else:
+        rule = f"lr {o['lr']:.2e} (absolute; calibrated for batch {LR_REFERENCE_BATCH})"
+    return f"[optim] {rule} | {batch} | layer_decay {o['layer_decay']}"
+
+
+def apply_ssl_method(cfg: dict) -> list:
+    """Fill ``cfg["ssl"]`` from the selected method and resolve its LRs.
+
+    ``ssl.method`` picks a row of ``SSL_METHOD_DEFAULTS``; every ``None``
+    field takes that row's value. ``lr``/``warmup_lr``/``final_lr`` are then
+    derived from their base values by the linear scaling rule, exactly as
+    ``main_simmim.py`` does (it scales the peak, warmup and minimum LRs
+    together). Set any of them explicitly to bypass the rule.
+    """
+    ssl = cfg["ssl"]
+    method = ssl.get("method")
+    if method not in VALID_SSL_METHODS:
+        raise ValueError(f"ssl.method must be one of {VALID_SSL_METHODS}, got {method!r}")
+    if ssl.get("mask_space") not in VALID_MASK_SPACES:
+        raise ValueError(
+            f"ssl.mask_space must be one of {VALID_MASK_SPACES}, got {ssl.get('mask_space')!r}")
+    filled = []
+    for key, value in SSL_METHOD_DEFAULTS[method].items():
+        if ssl.get(key) is None:
+            ssl[key] = copy.deepcopy(value)
+            filled.append(f"ssl.{key}")
+    eff = (cfg.get("effective_batch_size")
+           or cfg["batch_size"] * (cfg.get("accumulate_grad_batches") or 1))
+    ref = ssl["lr_reference_batch"]
+    for key, base in (("lr", ssl["base_lr"]), ("warmup_lr", ssl["warmup_lr"]),
+                      ("final_lr", ssl["final_lr"])):
+        if key == "lr" and ssl.get("lr") is not None:
+            continue
+        ssl[key] = resolve_lr(base, eff, ref)
+        filled.append(f"ssl.{key}")
+    if method == "simmim" and cfg.get("task") == "ssl":
+        img = cfg["dataset"]["img_size"]
+        mp = ssl["mask_patch_size"]
+        if img % mp != 0:
+            raise ValueError(
+                f"ssl.mask_patch_size {mp} must divide dataset.img_size {img}: SimMIM "
+                f"masks whole {mp}x{mp} patches on a {img // mp}x{img // mp} grid")
+    return filled
+
+
+def rebind_ssl_method(cfg: dict, method: str) -> None:
+    """Re-resolve ``cfg["ssl"]`` for ``method``, keeping values the user set.
+
+    An SSL module is its own method whatever the config says: a supervised
+    config carries the default (simmim) row, so ``LitJEPA`` has to rebind.
+    Values that match what the CURRENT method's resolution would produce were
+    auto-filled and are re-derived; anything else was set deliberately and is
+    kept.
+    """
+    ssl = cfg["ssl"]
+    current = ssl.get("method")
+    if current == method:
+        if ssl.get("lr") is None:
+            apply_ssl_method(cfg)
+        return
+    auto = set()
+    if current in SSL_METHOD_DEFAULTS:
+        probe = copy.deepcopy(cfg)
+        for key in list(SSL_METHOD_DEFAULTS[current]) + ["lr"]:
+            probe["ssl"][key] = None
+        apply_ssl_method(probe)
+        auto = {k for k in list(SSL_METHOD_DEFAULTS[current]) + ["lr"]
+                if ssl.get(k) == probe["ssl"].get(k)}
+    for key in list(SSL_METHOD_DEFAULTS[method]) + ["lr"]:
+        if key in auto or ssl.get(key) is None:
+            ssl[key] = None
+    ssl["method"] = method
+    apply_ssl_method(cfg)
+
+
 def apply_variant(cfg: dict) -> list:
     """Resolve ``model.variant`` into the architecture fields, as ONE set.
 
@@ -905,6 +1169,27 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         filled.append("accumulate_grad_batches")
     if eff is None:
         cfg["effective_batch_size"] = micro * cfg["accumulate_grad_batches"]
+
+    # A small dataset's fine-tune budget is fixed by the registry so an
+    # open-ended run cannot overrun on data that trains in an hour.
+    if cfg.get("epochs") is None and recipe == "downstream":
+        budget = DATASETS.get(cfg["dataset"]["name"], {}).get("finetune_epochs")
+        if budget:
+            cfg["epochs"] = budget
+            filled.append("epochs")
+
+    # Linear scaling rule: lr = base_lr * effective_batch / lr_reference_batch.
+    # Only recipes that set base_lr use it; scratch/pretrained state an
+    # absolute lr calibrated for LR_REFERENCE_BATCH and are never rescaled.
+    o = cfg["optim"]
+    if o.get("lr") is None and o.get("base_lr") is not None:
+        ref = o.get("lr_reference_batch") or LR_REFERENCE_BATCH
+        o["lr_reference_batch"] = ref
+        o["lr"] = o["base_lr"] * cfg["effective_batch_size"] / ref
+        filled.append("optim.lr")
+    if o.get("layer_decay") is None:
+        o["layer_decay"] = 1.0
+        filled.append("optim.layer_decay")
 
     # Anything still unset now has no recipe to come from.
     missing = [k for k in ("epochs", "mode") if cfg.get(k) is None]
@@ -1048,6 +1333,9 @@ def validate_config(cfg: dict) -> dict:
     assert_known_keys(cfg)
     apply_variant(cfg)
     apply_recipe(cfg)
+    # Always resolve cfg["ssl"] (it only fills that subtree) so an SSL module
+    # constructed from any config sees numbers, never None.
+    apply_ssl_method(cfg)
 
     if cfg["mode"] not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {cfg['mode']!r}")
@@ -1183,6 +1471,9 @@ def validate_config(cfg: dict) -> dict:
             f"{LR_REFERENCE_BATCH}. The linear-scaling rule would suggest "
             f"lr={suggested:.2e}. Not applied automatically — pass --lr."
         )
+
+    if not cfg.get("chain"):
+        cfg["chain"] = [stage_tag(cfg)]
 
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)

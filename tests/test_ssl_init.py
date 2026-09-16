@@ -47,7 +47,11 @@ def _run_cfg(path, **model_over):
 
 def test_ssl_block_is_validated():
     cfg = validate_config(merge_config(default_config(), {"ssl": {"lr": 1e-3}}))
-    assert cfg["ssl"]["lr"] == 1e-3 and cfg["ssl"]["lr_reference_batch"] == 2048
+    # an explicit lr bypasses the scaling rule; the reference batch follows
+    # the method (simmim 512, jepa 2048)
+    assert cfg["ssl"]["lr"] == 1e-3 and cfg["ssl"]["lr_reference_batch"] == 512
+    j = validate_config(merge_config(default_config(), {"ssl": {"method": "jepa"}}))
+    assert j["ssl"]["lr_reference_batch"] == 2048 and j["ssl"]["lr"] == 1.5e-3 * 1024 / 2048
     assert set(SSL_DEFAULTS) <= set(cfg["ssl"])
     try:
         validate_config(merge_config(default_config(), {"ssl": {"warmup_epoch": 3}}))
@@ -63,10 +67,12 @@ def test_jepa_prints_lr_and_effective_batch_and_trainer_accumulates():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         LitJEPA(cfg)
-    line = [l for l in buf.getvalue().splitlines() if l.startswith("[jepa] lr")]
+    line = [l for l in buf.getvalue().splitlines() if l.startswith("[ssl] method jepa")]
     assert line, buf.getvalue()
-    assert "4 micro x 2 accum = 8 effective" in line[0] and "NOT applied" in line[0], line[0]
-    assert f"{SSL_DEFAULTS['lr']:.2e}" in line[0]
+    # the banner names the BASE lr, the batch it was scaled by, and the result
+    assert "4 micro x 2 accum = 8 effective" in line[0], line[0]
+    assert "base_lr 1.50e-03 x (8 / 2048)" in line[0], line[0]
+    assert f"-> lr {1.5e-3 * 8 / 2048:.2e}" in line[0], line[0]
     with tempfile.TemporaryDirectory() as d:
         tr = build_ssl_trainer(tiny_config(batch_size=4, effective_batch_size=8,
                                            checkpoint_root=d, log_root=d))

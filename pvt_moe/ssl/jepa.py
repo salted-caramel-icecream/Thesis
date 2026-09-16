@@ -28,7 +28,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pvt_moe.config import SSL_DEFAULTS, merge_config, validate_config
+from pvt_moe.config import (
+    SSL_DEFAULTS,
+    lr_banner,
+    merge_config,
+    rebind_ssl_method,
+    validate_config,
+)
 from pvt_moe.models.pvt import build_model
 from pvt_moe.ssl.masking import sample_batch_masks, upsample_mask
 from pvt_moe.ssl.predictor import JEPAPredictor
@@ -55,22 +61,17 @@ class LitJEPA(pl.LightningModule):
         # Partial cfg["ssl"] overrides must fall back to DEFAULT_SSL for every
         # key they omit (user keys win, defaults backfill).
         cfg = merge_config({"ssl": DEFAULT_SSL}, cfg)
+        # This module IS the jepa method, whatever cfg["ssl"]["method"] says
+        # (a supervised config carries the simmim row); values set deliberately
+        # survive the rebind.
+        rebind_ssl_method(cfg, "jepa")
         self.cfg = cfg
         self.ssl = cfg["ssl"]
         self.save_hyperparameters({"cfg": cfg})
 
-        # The LR is used AS-IS (no automatic linear scaling, same policy as
-        # the supervised recipe). Say what that means for this batch.
-        micro = cfg["batch_size"]
-        accum = cfg.get("accumulate_grad_batches") or 1
-        eff = micro * accum
-        ref = self.ssl["lr_reference_batch"]
-        line = (f"[jepa] lr {self.ssl['lr']:.2e} (reference batch {ref}) | "
-                f"batch {micro} micro x {accum} accum = {eff} effective")
-        if eff != ref:
-            line += (f" | linear scaling would give lr {self.ssl['lr'] * eff / ref:.2e} "
-                     f"— NOT applied; set ssl.lr yourself")
-        print(line)
+        # The LR follows the linear scaling rule (config.apply_ssl_method);
+        # print the base, the batch it was scaled by, and the result.
+        print(lr_banner(cfg, ssl=True))
 
         img_size = cfg["dataset"]["img_size"]
         if img_size % 32 != 0:

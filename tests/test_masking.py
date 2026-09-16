@@ -106,7 +106,10 @@ def test_partial_ssl_config_backfills_defaults():
     cfg["ssl"] = {"epochs": 5, "lr": 3e-4}  # partial override, no final_lr etc.
     jepa = LitJEPA(cfg)
     assert jepa.ssl["epochs"] == 5 and jepa.ssl["lr"] == 3e-4  # user wins
-    assert jepa.ssl["final_lr"] == 1e-6                        # backfilled
+    # backfilled from the jepa row and scaled by the same linear rule as the
+    # peak LR (SimMIM scales peak, warmup and minimum together)
+    eff = cfg["effective_batch_size"]
+    assert jepa.ssl["final_lr"] == 1e-6 * eff / 2048
     assert jepa.ssl["predictor_dim"] == 384                    # backfilled
 
 
