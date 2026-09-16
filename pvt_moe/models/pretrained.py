@@ -452,11 +452,86 @@ def zero_routed_expert_output(moe_mlp) -> int:
 # Backbone checkpoints (SSL init, official .pth files, our own saves)
 # ---------------------------------------------------------------------------
 
+def _checkpoint_cfg(ckpt) -> dict | None:
+    """The config a checkpoint was trained with, if it carries one.
+
+    ``LitJEPA.save_backbone`` writes ``{"state_dict", "cfg"}``; a Lightning
+    checkpoint keeps it under ``hyper_parameters["cfg"]``.
+    """
+    if not isinstance(ckpt, dict):
+        return None
+    if isinstance(ckpt.get("cfg"), dict):
+        return ckpt["cfg"]
+    hp = ckpt.get("hyper_parameters")
+    if isinstance(hp, dict) and isinstance(hp.get("cfg"), dict):
+        return hp["cfg"]
+    return None
+
+
+def check_backbone_architecture(ckpt_cfg: dict | None, cfg: dict, state_keys,
+                                path: str = "<checkpoint>") -> list:
+    """Compare a checkpoint's saved architecture with the run being built.
+
+    Returns the list of mismatch descriptions (empty = compatible). Checked:
+    variant, depths / embed_dims / num_heads / mlp_ratios / sr_ratios, RoPE
+    on/off, RoPE mode and resolved placement, and MoE placement WHEN the
+    checkpoint itself has MoE weights (a dense checkpoint feeding a MoE run
+    is sparse upcycling, which is allowed). A checkpoint without a saved
+    config cannot be checked; the caller decides how loud to be.
+    """
+    from pvt_moe.config import VARIANT_ARCH_KEYS, resolve_placement
+
+    if ckpt_cfg is None:
+        return [f"{path} carries no config; architecture cannot be verified"]
+    want, have = cfg["model"], ckpt_cfg.get("model", {})
+    out = []
+    if have.get("variant") not in (None, want.get("variant")):
+        out.append(f"variant: checkpoint {have.get('variant')!r} vs run {want.get('variant')!r}")
+    for key in VARIANT_ARCH_KEYS:
+        if have.get(key) is not None and list(have[key]) != list(want[key]):
+            out.append(f"model.{key}: checkpoint {list(have[key])} vs run {list(want[key])}")
+    if out:                      # different depths: placements are not comparable
+        return out
+    depths = list(want["depths"])
+    ha, wa = have.get("ablation", {}), want["ablation"]
+
+    def _resolved(abl, kind):
+        pl_ = abl.get(f"{kind}_placement")
+        if pl_ is None:
+            return None
+        return resolve_placement(pl_, abl.get(f"{kind}_last_n_stages"), depths)
+
+    h_rope = bool(ha.get("use_rope")) if "use_rope" in ha else None
+    if h_rope is not None and h_rope != bool(wa["use_rope"]):
+        out.append(f"use_rope: checkpoint {h_rope} vs run {bool(wa['use_rope'])}")
+    elif h_rope:
+        if ha.get("rope_mode") is not None and ha["rope_mode"] != wa["rope_mode"]:
+            out.append(f"rope_mode: checkpoint {ha['rope_mode']!r} vs run {wa['rope_mode']!r}"
+                       " (mixed frequencies exist only in a mixed checkpoint)")
+        hp, wp = _resolved(ha, "rope"), _resolved(wa, "rope")
+        if hp is not None and hp != wp:
+            out.append(f"rope_placement: checkpoint {hp} vs run {wp} — blocks with RoPE in "
+                       "only one of the two get dropped or random RoPE-Mixed frequencies")
+    ckpt_has_moe = any(".mlp.moe_layer." in k or ".mlp.shared_expert." in k for k in state_keys)
+    if ckpt_has_moe:
+        hp = _resolved(ha, "moe") if ha.get("use_moe") else [[] for _ in depths]
+        wp = _resolved(wa, "moe") if wa["use_moe"] else [[] for _ in depths]
+        if hp != wp:
+            out.append(f"moe_placement: checkpoint {hp} vs run {wp}")
+        for key in ("num_experts", "shared_expert", "backend"):
+            hv = ckpt_cfg.get("model", {}).get("moe", {}).get(key)
+            if hv is not None and hv != want["moe"].get(key):
+                out.append(f"model.moe.{key}: checkpoint {hv!r} vs run {want['moe'].get(key)!r}")
+    return out
+
+
 def load_backbone_checkpoint(
     model: nn.Module,
     path: str,
     skip_head: bool = True,
     verbose: bool = True,
+    expected_cfg: dict | None = None,
+    check_arch: bool = True,
 ) -> dict:
     """Load a backbone state_dict from ``path`` into ``model``.
 
@@ -464,6 +539,11 @@ def load_backbone_checkpoint(
     wrappers, and Lightning checkpoints; strips ``model.`` / ``module.``
     prefixes. Skips ``head.*`` by default (class count may differ). Keys with
     no destination or mismatched shapes are dropped and counted.
+
+    With ``expected_cfg`` (the run's validated config) the checkpoint's saved
+    architecture is compared first (``check_backbone_architecture``): a
+    mismatch raises when ``check_arch`` is True and is printed as a loud
+    warning otherwise. A checkpoint with no saved config is always a warning.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt
@@ -482,8 +562,23 @@ def load_backbone_checkpoint(
                 k = k[len(prefix):]
         cleaned[k] = v
 
+    stats = {"loaded": 0, "skipped_head": 0, "dropped_no_target": 0, "skipped_shape": 0,
+             "arch_mismatches": []}
+    if expected_cfg is not None:
+        problems = check_backbone_architecture(_checkpoint_cfg(ckpt), expected_cfg, cleaned, path)
+        stats["arch_mismatches"] = problems
+        if problems:
+            text = "\n  - ".join(problems)
+            if check_arch and _checkpoint_cfg(ckpt) is not None:
+                raise ValueError(
+                    f"ssl_init checkpoint {path} was trained with a different architecture:"
+                    f"\n  - {text}\nMatch the run to the checkpoint (--variant / --rope-mode / "
+                    f"--rope-placement ...) or set model.ssl_init_check_arch: false to load "
+                    f"what fits and leave the rest at random init.")
+            print(f"[backbone ckpt] WARNING: {text}")
+
     model_state = model.state_dict()
-    filtered, stats = {}, {"loaded": 0, "skipped_head": 0, "dropped_no_target": 0, "skipped_shape": 0}
+    filtered = {}
     for k, v in cleaned.items():
         if skip_head and k.startswith("head."):
             stats["skipped_head"] += 1
@@ -509,4 +604,13 @@ def load_backbone_checkpoint(
         if stats["loaded"] == 0:
             print("  !! 0 weights loaded — wrong file or key prefix. First source keys: "
                   f"{list(cleaned)[:5]}")
+        rope_random = [k for k in stats["missing"] if k.endswith("rope.freqs")]
+        rope_dropped = [k for k in cleaned if k.endswith("rope.freqs") and k not in filtered]
+        if rope_random or rope_dropped:
+            print(f"  RoPE-Mixed frequencies left at RANDOM init: {rope_random or 'none'}; "
+                  f"in the checkpoint but unused: {rope_dropped or 'none'}")
+        moe_random = [k for k in stats["missing"] if ".mlp.moe_layer." in k or ".mlp.shared_expert." in k]
+        if moe_random:
+            print(f"  MoE'd blocks start at RANDOM init ({len(moe_random)} tensors): this path "
+                  "does not seed experts from the checkpoint's dense FFN.")
     return stats

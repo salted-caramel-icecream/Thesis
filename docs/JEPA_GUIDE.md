@@ -122,7 +122,7 @@ this is the collapse alarm; healthy runs sit well above 0 and drift slowly),
 | knob | value | note |
 |---|---|---|
 | optimizer | AdamW, betas (0.9, 0.95) | SSL convention (not 0.999) |
-| lr | 1.5e-3 @ global batch ≈ 2048 | scale linearly with batch |
+| lr | 1.5e-3 @ global batch 2048 (`ssl.lr_reference_batch`) | used as-is; `LitJEPA` prints the effective batch and the linearly scaled value at startup — set `ssl.lr` yourself if you want it |
 | schedule | linear warmup 15 ep → cosine to 1e-6, **per step** | |
 | weight decay | cosine 0.04 → 0.4 | applied only to ndim>1 params |
 | EMA | cosine 0.996 → 1.0 | update after every step |
@@ -136,9 +136,14 @@ this is the collapse alarm; healthy runs sit well above 0 and drift slowly),
 1. **Linear probe** (`LitProbe`): freeze backbone, train one
    `Linear(512, 1000)` on mean-pooled features, ~20–90 epochs, standard
    supervised transforms, no mixup. Report top-1/top-5.
-2. **Fine-tune handoff**: `jepa.save_backbone(path)` writes a plain
-   `{"state_dict": context.state_dict()}`. In the supervised config:
-   `mode: "ssl_init", ckpt_path: <path>, model.pretrained_hf_id: None`.
+2. **Fine-tune handoff**: `jepa.save_backbone(path)` writes
+   `{"state_dict": context.state_dict(), "cfg": <pretraining config>}`. In
+   the supervised config: `mode: "ssl_init", ckpt_path: <path>,
+   model.pretrained_hf_id: None`. The loader compares the saved config with
+   the run (variant, depths/widths, RoPE mode and placement, MoE placement
+   when the checkpoint has MoE weights) and refuses a mismatch
+   (`model.ssl_init_check_arch: false` turns that into a warning), so a
+   RoPE'd block cannot silently end up with random RoPE-Mixed frequencies.
    Key names match exactly (same classes), so the load reports ~0 drops;
    MoE experts start random (no dense teacher) — expect slower first epochs
    than HF-seeded runs.

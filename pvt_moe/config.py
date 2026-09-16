@@ -196,6 +196,32 @@ RECIPES = {
 # Default configuration (reproduces the v9 training recipe)
 # ---------------------------------------------------------------------------
 
+#: JEPA pretraining defaults (``cfg["ssl"]``; pvt_moe.ssl.jepa). Living here
+#: means ``validate_config`` accepts the block and catches typos inside it.
+#: ``lr`` is the I-JEPA value for a global batch of ``lr_reference_batch``;
+#: like the supervised recipe it is NOT rescaled automatically — LitJEPA
+#: prints the resolved LR, the effective batch and what linear scaling
+#: would give, and you decide.
+SSL_DEFAULTS = {
+    "epochs": 100,
+    "lr": 1.5e-3,
+    "lr_reference_batch": 2048,
+    "warmup_epochs": 15,
+    "final_lr": 1e-6,
+    "weight_decay": 0.04,         # cosine-ramped to weight_decay_end
+    "weight_decay_end": 0.4,
+    "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
+    "ema_momentum_end": 1.0,
+    "mask_n_blocks": 4,
+    "mask_block_area": [0.10, 0.20],
+    "mask_aspect_ratio": [0.75, 1.5],
+    "predictor_dim": 384,
+    "predictor_depth": 6,
+    "predictor_heads": 6,
+    "grad_clip": 3.0,
+}
+
+
 _DEFAULT: dict = {
     # Run-name prefix. "sv1" = the September 2026 edit of the architecture
     # (variants, MHA-by-default, depth-independent placement); the earlier
@@ -428,6 +454,11 @@ _DEFAULT: dict = {
         "pretrained_hf_id": None,
         # Seed MoE experts from the dense HF FFN weights (sparse upcycling).
         "seed_moe_from_dense": True,
+        # mode ssl_init: refuse a JEPA backbone whose saved architecture
+        # (variant, depths/widths, RoPE mode and placement, MoE placement)
+        # differs from this run instead of loading what fits and leaving the
+        # rest at random init. False downgrades the refusal to a warning.
+        "ssl_init_check_arch": True,
         "num_frozen_stages": 0,
     },
 
@@ -446,6 +477,9 @@ _DEFAULT: dict = {
         "warmup_start_factor": None,
         "eta_min": 1e-6,
     },
+
+    # JEPA pretraining knobs (see SSL_DEFAULTS); ignored by supervised runs.
+    "ssl": copy.deepcopy(SSL_DEFAULTS),
 
     "loss": {
         "aux_weight": 0.01,               # MoE load-balancing loss weight

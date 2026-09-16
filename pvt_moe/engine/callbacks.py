@@ -292,7 +292,7 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         monitor="ssl_loss",
         mode="min",
         save_top_k=1,
-        save_last=True,
+        save_last=False,          # last.ckpt: RollingCheckpoint (see its docstring)
         auto_insert_metric_name=False,
         filename="epoch{epoch:03d}-loss{ssl_loss:.4f}",
     )
@@ -302,12 +302,16 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         devices=1,
         precision=cfg["precision"] if torch.cuda.is_available() else 32,
         gradient_clip_val=cfg["ssl"]["grad_clip"],
+        # micro-batch x this = the effective batch LitJEPA prints; the EMA
+        # update is per optimizer step, so accumulation is safe here.
+        accumulate_grad_batches=cfg.get("accumulate_grad_batches") or 1,
         # "warn" (not True): True would make PL call
         # torch.use_deterministic_algorithms without warn_only, turning
         # nondeterministic-op warnings into mid-run crashes.
         deterministic=("warn" if cfg["deterministic"] else None),
         benchmark=not cfg["deterministic"],
-        callbacks=[checkpoint_cb, LearningRateMonitor(logging_interval="step")],
+        callbacks=[checkpoint_cb, RollingCheckpoint(ckpt_dir),
+                   LearningRateMonitor(logging_interval="step")],
         logger=build_loggers(cfg),
         log_every_n_steps=50,
     )
