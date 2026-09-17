@@ -8,3 +8,6 @@ bench_runs/
 
 # machine-local path configs (compose with --config; never commit machine paths)
 configs/*.local.yaml
+
+# git worktrees the Claude Code workflow harness creates for parallel agents
+.claude/worktrees/
