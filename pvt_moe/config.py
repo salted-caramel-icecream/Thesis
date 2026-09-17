@@ -936,15 +936,19 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         filled.append("optim.warmup_start_factor")
 
     # Upcycling init: a recipe may fill it; anything still unset upcycles
-    # nothing — EXCEPT an ssl_init warm start, which upcycles the JEPA
-    # backbone's own dense FFN exactly like the pretrained recipe does with
-    # HF weights, whichever recipe supplied the rest. A forgotten flag must
-    # not silently give a block that emits a random FFN at step 0.
+    # nothing — EXCEPT a warm start (mode ssl_init OR hf_pretrained), which
+    # upcycles a dense FFN (the JEPA backbone's own, or the HF checkpoint's)
+    # into the MoE'd block whichever recipe supplied the rest. Keying this on
+    # the recipe alone left "mode: hf_pretrained" under the scratch recipe at
+    # "none": shared expert seeded, routed experts replicated, nothing zeroed,
+    # so the block emitted ~2x the pretrained FFN at step 0. A forgotten flag
+    # must not silently give a block that emits a wrong FFN at step 0.
     # The no-shared-expert case is resolved in validate_config, which is
     # where shared_expert is known to be final.
     if cfg["model"]["moe"].get("upcycle_init") is None:
         cfg["model"]["moe"]["upcycle_init"] = (
-            "routed_zero" if cfg.get("mode") == "ssl_init" else "none")
+            "routed_zero" if cfg.get("mode") in ("ssl_init", "hf_pretrained")
+            else "none")
         filled.append("model.moe.upcycle_init")
 
     if verbose and filled:
@@ -1112,16 +1116,17 @@ def validate_config(cfg: dict) -> dict:
             f"model.moe.upcycle_init must be one of {VALID_UPCYCLE_INITS}, "
             f"got {moe['upcycle_init']!r}"
         )
-    if (cfg["mode"] == "ssl_init" and moe["upcycle_init"] == "none"
+    if (cfg["mode"] in ("ssl_init", "hf_pretrained") and moe["upcycle_init"] == "none"
             and moe.get("shared_expert") and model["ablation"]["use_moe"]
             and model.get("seed_moe_from_dense", True)):
         # Explicit "none" here means the shared expert AND the routed experts
-        # both carry the backbone's FFN, i.e. the block emits ~2x the dense
-        # layer at step 0. That is never what an ssl_init run wants.
+        # both carry the dense FFN (JEPA backbone or HF checkpoint), i.e. the
+        # block emits ~2x the dense layer at step 0. That is never what a
+        # warm-start run wants.
         raise ValueError(
-            "mode ssl_init with a shared expert needs model.moe.upcycle_init "
+            f"mode {cfg['mode']} with a shared expert needs model.moe.upcycle_init "
             "'routed_zero' (default) or 'shared_zero'; 'none' would make the "
-            "upcycled block emit twice the backbone's FFN at step 0. Leave it "
+            "upcycled block emit twice the pretrained FFN at step 0. Leave it "
             "unset, or pass --no-shared-expert / --no-seed-experts on purpose."
         )
     if moe["upcycle_init"] != "none" and not moe.get("shared_expert"):

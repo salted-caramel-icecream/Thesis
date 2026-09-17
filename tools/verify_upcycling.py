@@ -15,10 +15,16 @@ Two paths, both compared at 224^2 on the requested variant, in eval mode:
   hf    (``--hf``) ``OpenGVLab/pvt_v2_<variant>`` is loaded into a dense
         model and, via ``load_hf_pretrained``, into the MoE model.
 
+``--recipe`` is REQUIRED: the recipe decides what ``model.moe.upcycle_init``
+resolves to, and a config that resolves to ``"none"`` (shared expert seeded,
+routed experts replicated, nothing zeroed: the block emits ~2x the dense FFN)
+is refused before anything is compared — the number it would print measures
+a config nobody trains, not the upcycling.
+
 Usage (GPU box):
-  python tools/verify_upcycling.py --variant b1                 # ssl path, Tutel
-  python tools/verify_upcycling.py --variant b2 --hf            # + the HF path
-  python tools/verify_upcycling.py --backend native             # no Tutel
+  python tools/verify_upcycling.py --variant b1 --recipe pretrained        # ssl path, Tutel
+  python tools/verify_upcycling.py --variant b2 --recipe pretrained --hf   # + the HF path
+  python tools/verify_upcycling.py --backend native --recipe scratch       # no Tutel
 
 Exit code 1 if any path exceeds --tol. Never trains anything.
 """
@@ -49,7 +55,8 @@ def _features(model, x):
 
 
 def _cfg(args, use_moe: bool, mode: str = "scratch", ckpt_path=None):
-    return validate_config(merge_config(default_config(), {
+    cfg = validate_config(merge_config(default_config(), {
+        "recipe": args.recipe,
         "mode": mode, "ckpt_path": ckpt_path, "use_wandb": False, "use_tensorboard": False,
         "model": {"variant": args.variant,
                   "moe": {"backend": args.backend, "num_experts": args.experts,
@@ -57,6 +64,16 @@ def _cfg(args, use_moe: bool, mode: str = "scratch", ckpt_path=None):
                   "ablation": {"use_moe": use_moe, "moe_placement": [[], [], [], [-1]],
                                "use_rope": True, "rope_last_n_stages": 1}},
     }))
+    if use_moe:
+        init = cfg["model"]["moe"]["upcycle_init"]
+        print(f"[config] recipe={cfg['recipe']} mode={cfg['mode']} upcycle_init={init}")
+        assert init != "none", (
+            f"model.moe.upcycle_init resolved to 'none' (recipe={cfg['recipe']!r}, "
+            f"mode={cfg['mode']!r}): this tool refuses to compare a config that "
+            "resolved to none — nothing would be zeroed and the block would emit "
+            "~2x the dense FFN, which is not the upcycling any run trains with."
+        )
+    return cfg
 
 
 def _backend_banner(args):
@@ -103,10 +120,11 @@ def run_hf_path(args, device):
     cfg = _cfg(args, use_moe=True, mode="hf_pretrained")
     torch.manual_seed(args.seed)
     moe = build_model(cfg).to(device)
-    load_hf_pretrained(moe, cfg["model"]["pretrained_hf_id"], seed_moe_experts=True,
-                       upcycle_init=cfg["model"]["moe"]["upcycle_init"])
+    stats = load_hf_pretrained(moe, cfg["model"]["pretrained_hf_id"], seed_moe_experts=True,
+                               upcycle_init=cfg["model"]["moe"]["upcycle_init"])
     _seed_stage4_rope_identically(dense, moe)
     moe.eval()
+    assert stats["seeded_moe_blocks"] >= 1 and stats["zeroed_routed_fc2"] >= 1, stats
     return dense, moe
 
 
@@ -125,9 +143,12 @@ def compare(name, dense, moe, device, args):
     return ok
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variant", default="b1")
+    p.add_argument("--recipe", required=True, choices=("scratch", "pretrained"),
+                   help="the recipe the compared run trains with; it decides what "
+                        "model.moe.upcycle_init resolves to (a resolved 'none' is refused)")
     p.add_argument("--backend", default="tutel", choices=("tutel", "native", "megablocks"))
     p.add_argument("--experts", type=int, default=4)
     p.add_argument("--hf", action="store_true", help="also run the HF path (downloads weights)")
@@ -135,7 +156,11 @@ def main(argv=None) -> int:
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--bf16", action="store_true", help="compare under bf16 autocast (looser: use --tol 5e-2)")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device} | torch {torch.__version__}")

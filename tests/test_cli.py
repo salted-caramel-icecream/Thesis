@@ -96,9 +96,21 @@ def test_upcycle_init_can_be_swapped_on_the_command_line():
 def test_all_three_init_arms_get_distinct_run_names():
     names = {
         init: _cfg("--recipe", "pretrained", "--upcycle-init", init)["run_name"]
-        for init in ("routed_zero", "shared_zero", "none")
+        for init in ("routed_zero", "shared_zero")
     }
-    assert len(set(names.values())) == 3, names
+    assert len(set(names.values())) == 2, names
+    # "none" with a shared expert AND seeded experts is refused for BOTH
+    # warm-start modes (the block would emit ~2x the pretrained FFN); it is
+    # only reachable when seeding is switched off on purpose.
+    try:
+        _cfg("--recipe", "pretrained", "--upcycle-init", "none")
+    except ValueError as e:
+        assert "hf_pretrained" in str(e) and "twice" in str(e), str(e)
+    else:
+        raise AssertionError("--recipe pretrained --upcycle-init none must be refused")
+    c = _cfg("--recipe", "pretrained", "--upcycle-init", "none", "--no-seed-experts")
+    assert c["model"]["moe"]["upcycle_init"] == "none"
+    assert c["run_name"] not in names.values()
 
 
 def test_init_arm_is_not_tagged_on_runs_that_never_upcycle():
