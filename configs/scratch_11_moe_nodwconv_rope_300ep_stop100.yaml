@@ -1,0 +1,38 @@
+# MoE block drops its DWConv, RoPE on — 300-epoch schedule, stopped at 100
+# Same arm as scratch_11_moe_nodwconv_rope.yaml; only the budget differs.
+#
+#   python train.py --config configs/scratch_11_moe_nodwconv_rope_300ep_stop100.yaml
+#
+# `epochs` is the SCHEDULE (the cosine is built for 300) and `stop_at_epoch`
+# is where this session gets off, so the LR trajectory is identical to one
+# uninterrupted 300-epoch run. Resume with the SAME `epochs: 300` and
+# --resume-from .../milestone-epoch100.ckpt; dropping the budget to 100 on the
+# resume would build a different, compressed schedule.
+#
+# NOTE: drop_path resolves to 0.15 here, not the 0.1 of the 90-epoch row —
+# NOTE: scratch_drop_path() derives stochastic depth from the epoch budget
+# NOTE: (DeiT-3: +0.05 per 200 ep). Compare this arm only against the other
+# NOTE: 300-epoch arms.
+#
+# Milestones past 100 never fire in this session; they are pre-set so a
+# resume needs no edit.
+
+recipe: "scratch"
+epochs: 300
+stop_at_epoch: 100
+milestones: [100, 150, 200, 300]
+model:
+  moe: {num_experts: 4, shared_expert: true, moe_block_dwconv: false}
+  ablation:
+    use_moe: true
+    moe_placement:
+    - []
+    - []
+    - []
+    - [-1]
+    use_rope: true
+    rope_placement:
+    - []
+    - []
+    - []
+    - [-1]
