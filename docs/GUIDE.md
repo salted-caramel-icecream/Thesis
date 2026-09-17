@@ -178,8 +178,8 @@ re-downloading 160 GB.
 | HF id | `yukimasano/pass` — single `train` split, no validation/test |
 | `arrow_dirs` key | `pass` |
 | disk | ~166 GB snapshot; **~333 GB free while building** (the staged build holds the Arrow cache and the snapshot at once; a naive build would peak near 500 GB) |
-| usable with | `task: "ssl"` only (the JEPA notebook). `train.py --dataset pass` and any supervised recipe are refused at validate time: the corpus has no labels |
-| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is the linear probe on a labelled set (`docs/JEPA_GUIDE.md` §5) |
+| usable with | `task: "ssl"` only — `train.py --task ssl --dataset pass` or `notebooks/03_ssl_pretrain.ipynb` (SimMIM by default, `--ssl-method jepa`). Every supervised recipe refuses it at validate time: the corpus has no labels |
+| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is `evaluate.py` (k-NN, linear probe) plus the intermediate fine-tune on a labelled set (`docs/SIMMIM_GUIDE.md` §6) |
 
 ```bash
 python download_data.py --dataset pass --out /data/pass_arrow                       # Linux / macOS / WSL2
@@ -191,6 +191,48 @@ under the HF hub cache** (logged as `[cleanup] removing the raw download of
 yukimasano/pass only`), then writes the snapshot. It prints the snapshot's
 feature names when the conversion finishes; the loader itself finds the image
 column by feature type and never reads the creator, date or GPS columns.
+
+### Small downstream sets (`--recipe downstream`)
+
+Three labelled sets for the last stage of the chain, all far below 224 px
+natively. `dataset.img_size` (224 by default) **upsamples them in the
+transforms** (`RandomResizedCrop` / `Resize` on the PIL image), so accuracy
+on these partly measures interpolation of the upsampled input — say so when
+reporting them. The loader converts grayscale to RGB; the fine-tune budget is
+**fixed per dataset** in `config.DATASETS` so an open-ended run cannot overrun
+on data that trains in an hour.
+
+| name | classes | native | splits | fine-tune budget | licence |
+|---|---|---|---|---|---|
+| `fashionmnist` | 10 | 28 × 28 grayscale | train 60 000 / test 10 000; download carves a seeded 10 % validation split from train | 30 ep | MIT (Zalando SE, 2017; `github.com/zalandoresearch/fashion-mnist`) |
+| `eurosat` | 10 | 64 × 64 RGB (Sentinel-2) | 27 000 images, no official split; download carves seeded test 10 % and validation 10 % | 50 ep | MIT (Patrick Helber; `github.com/phelber/EuroSAT`); imagery ESA Copernicus open data |
+| `pathmnist` | 9 | 28 (MedMNIST v2) or **224 (MedMNIST+)** | MedMNIST's own train 89 996 / val 10 004 / test 7 180, kept as is | 30 ep | CC BY 4.0 (MedMNIST; source NCT-CRC-HE-100K, Kather et al. 2018, CC BY 4.0) |
+
+The Hub ids were not verifiable from the machine this was written on, so
+`download_data.py` takes them from `--hf-id` (the registry's `hf_id_hint` is
+the id to try; the class count is checked after download, so a wrong id
+fails before any training) — and MedMNIST ships `.npz` files, not a Hub
+repo:
+
+```bash
+python download_data.py --dataset fashionmnist --hf-id zalando-datasets/fashion_mnist --out /data/fashionmnist_arrow
+python download_data.py --dataset eurosat --hf-id blanchon/EuroSAT_RGB --out /data/eurosat_arrow
+pip install medmnist && python -c "import medmnist; medmnist.PathMNIST(split='train', download=True, size=224)"
+python download_data.py --dataset pathmnist --npz ~/.medmnist/pathmnist_224.npz --out /data/pathmnist_arrow
+```
+
+Use the **224-px MedMNIST+ file** (`pathmnist_224.npz`, ~14 GB of RAM while
+converting; `pathmnist_128.npz` needs ~4.5 GB and the loader upsamples it)
+so the run needs no interpolation at all. Every snapshot gets the same
+layout — `image` + `label` (ClassLabel with the registry's class count),
+`train` / `validation` / `test` — and a `split_info.json` naming the seeds
+of any carved split, so every arm trains and tests on the same images.
+Point a run at it with `--data-dir` and warm-start from a checkpoint:
+
+```bash
+python train.py --recipe downstream --dataset eurosat --data-dir /data/eurosat_arrow \
+    --ckpt /data/runs/<fine-tune run>/last.ckpt
+```
 
 ### ImageNet-22k
 
@@ -211,16 +253,23 @@ A **recipe** fills only fields left as `None`, so anything you set wins.
 Unknown keys are rejected with a suggestion — a typo cannot silently become a
 key nothing reads.
 
-### The two recipes
+### The four recipes (and the SSL task)
 
-| | `scratch` | `pretrained` |
-|---|---|---|
-| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts |
-| epochs | 90 (ladder: 90/150/300) | 100 |
-| peak LR | 1e-3 | 1e-4 |
-| warmup | 5 | 3 |
-| stochastic depth | 0.1 (0.15 at 300 ep) | 0.1 |
-| everything else | identical (batch, aug, MoE, weight decay, clipping) | |
+| | `scratch` | `pretrained` | `ssl_finetune` | `downstream` |
+|---|---|---|---|---|
+| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone) | `ssl_init` from `--ckpt` (any `last.ckpt`) |
+| epochs | 90 (ladder: 90/150/300) | 100 | 100 | fixed per dataset (30 / 50 / 30) |
+| peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) | same |
+| warmup | 5 | 3 | 20 | 5 |
+| layer-wise LR decay | — | — | 0.9 | 0.9 |
+| stochastic depth | 0.1 (0.15 at 300 ep) | 0.1 | 0.1 | 0.1 |
+| everything else | identical (batch, aug, MoE, weight decay, clipping) | | | |
+
+Self-supervised pretraining is not a recipe but a task: `--task ssl`
+(`ssl.method` simmim | jepa) trains the backbone alone and writes
+`<run_dir>/<method>_backbone.pt`; `docs/SIMMIM_GUIDE.md` has the recipe, the
+chain and the three pretraining paths. `[optim]` / `[ssl]` lines at startup
+name the base LR, the batch it was scaled by and the result.
 
 ### The knobs, in both front ends
 
@@ -376,6 +425,19 @@ Watch for these lines:
 | `[milestone] epoch N: saved full state` | a resumable snapshot exists |
 | `[rope] saved N frequency tensor(s) -> .../rope_freqs_init.pt` | the step-0 RoPE-Mixed frequencies are on disk — the drift plot in §7 needs them |
 | `val_precision_macro` far below `val_acc` | expert/class collapse — check `expert_utilization` |
+| `[chain] simmim_pretrain@pass_r224 -> ssl_finetune+moe@imagenet-1k_r224` | the warm start prepended its parent's stages; this is what `results.json` records as the run's provenance |
+| `[backbone ckpt] ... seeded_moe_blocks=1 ... zeroed_routed_fc2=2` | a dense checkpoint was upcycled (path 3); `already carries the MoE weights ... nothing to upcycle` = path 2, loaded as trained |
+| `[ssl] method simmim \| base_lr 2.00e-04 x (1024 / 512) -> lr 4.00e-04` / `[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03` | the linear scaling rule was applied; `lr ... (absolute; calibrated for batch 1024)` means it was not |
+| `[optimizer] layer_decay 0.9: ... lr 2.50e-03 (head ...) .. 4.16e-04 (stage-1 patch embed ...)` | layer-wise decay is on (ssl_finetune / downstream) |
+| `[mask routing] block4.1.mlp: ... (aux loss counts both)` | MoE pretraining: how masked-position and visible tokens spread over the experts |
+| `[config] ckpt_path ... carries no parent tag` | the checkpoint path is not `<root>/<run_name>/<file>`; two warm starts from different parents would share a directory — pass `--run-name` |
+
+Every run directory also holds **`results.json` and `results.md`**,
+rewritten at every epoch boundary: identity and chain, latest / best
+accuracy, measured seconds per epoch, images per second and peak VRAM,
+parameter counts and GFLOPs, expert utilisation, environment, a per-epoch
+history, and (for SSL runs) the note that probe / k-NN accuracy is expected
+to be low under masked image modelling (§8).
 
 ---
 
@@ -433,3 +495,29 @@ The tool needs only torch and matplotlib — no Tutel, no dataset, no GPU, not
 even the training environment — so copy the two `.pt` files (a few KB) to a
 laptop and run it there while the GPU keeps training. Output goes to
 `figures/` as a vector PDF in the thesis figure style.
+
+---
+
+## 8. Evaluating and comparing runs
+
+```bash
+# a finished classifier: top-1 / top-5 on its own validation split
+python evaluate.py --ckpt /data/runs/<run>/last.ckpt --data-dir /data/imagenet_arrow
+# an SSL encoder: k-NN + linear probe on ImageNet-1k (collapse detectors — expected to read low under MIM)
+python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
+    --data-dir /data/imagenet_arrow --knn --probe-epochs 20
+# the downstream test split, once, at the end
+python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset eurosat --data-dir /data/eurosat_arrow --split test
+# low-shot subsets: seeded, class-balanced, written once and shared by every arm
+python -m pvt_moe.eval.lowshot --dataset imagenet-1k --data-dir /data/imagenet_arrow \
+    --fraction 0.01 --seed 0 --out subsets/imagenet-1k_1pct_seed0.json
+python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
+    --data-dir /data/imagenet_arrow --subset-file subsets/imagenet-1k_1pct_seed0.json
+# one table over every results.json below a root (+ CSV / markdown / a vector-PDF bar chart)
+python tools/compare_runs.py /data/runs --sort best_top1 --csv table.csv --plot figures/top1_by_run.pdf
+```
+
+`evaluate.py` merges its numbers under `eval["<dataset>@<split>"]` of the
+run's `results.json` (creating one next to a bare backbone file), so
+`compare_runs.py` shows k-NN, probe and test-split columns beside the
+training numbers. `--max-batches N --no-write` is the smoke-test form.

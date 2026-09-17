@@ -595,10 +595,11 @@ def load_backbone_checkpoint(
     cleaned = {}
     for k, v in state.items():
         # "context." covers Lightning checkpoints written by LitJEPA (its
-        # encoder attribute is self.context); trailing dots keep the prefixes
-        # unambiguous. target./predictor. keys intentionally get no prefix
-        # match and drop out as no_target.
-        for prefix in ("model.", "module.", "backbone.", "context_encoder.", "context."):
+        # encoder attribute is self.context) and "encoder." those of LitSimMIM;
+        # trailing dots keep the prefixes unambiguous. target./predictor./
+        # head.0. keys intentionally get no prefix match and drop out.
+        for prefix in ("model.", "module.", "backbone.", "context_encoder.", "context.",
+                       "encoder."):
             if k.startswith(prefix):
                 k = k[len(prefix):]
         cleaned[k] = v
@@ -606,6 +607,11 @@ def load_backbone_checkpoint(
     stats = {"loaded": 0, "skipped_head": 0, "dropped_no_target": 0, "skipped_shape": 0,
              "arch_mismatches": [], "dense_mlp_for_seeding": 0, "seeded_moe_blocks": 0,
              "seeded_shared_experts": 0, "zeroed_routed_fc2": 0, "zeroed_shared_fc2": 0}
+    # Provenance of the parent run, for cfg["chain"] / results.json.
+    parent_cfg = _checkpoint_cfg(ckpt) or {}
+    stats["parent_chain"] = list(parent_cfg.get("chain") or [])
+    stats["parent_run_name"] = parent_cfg.get("run_name")
+    stats["parent_method"] = ckpt.get("method") if isinstance(ckpt, dict) else None
     moe_prefixes = moe_block_prefixes_of(model)
     dense_mlp_for_seeding = {}
     if expected_cfg is not None:
@@ -645,6 +651,14 @@ def load_backbone_checkpoint(
     stats["unexpected"] = list(unexpected)
     if seed_moe_experts and dense_mlp_for_seeding:
         upcycle_moe_blocks(model, dense_mlp_for_seeding, moe_prefixes, upcycle_init, stats)
+    elif moe_prefixes and upcycle_init != "none" and verbose:
+        # A MoE-carrying checkpoint loaded straight (pretraining path 2): the
+        # routed experts and the shared expert came from the file, so the
+        # zero-init rule had nothing to act on. Say so rather than leave the
+        # printed upcycle_init looking like it did something.
+        print(f"[backbone ckpt] checkpoint already carries the MoE weights for "
+              f"{len(moe_prefixes)} block(s): loaded as trained, upcycle_init="
+              f"{upcycle_init!r} not applied (nothing to upcycle)")
     if verbose:
         print(
             f"[backbone ckpt] loaded={stats['loaded']} head_skipped={stats['skipped_head']} "

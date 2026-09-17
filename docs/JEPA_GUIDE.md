@@ -1,9 +1,16 @@
 # JEPA for PVT v2 — design rationale and step-by-step implementation guide
 
 This document is both the **design record** for the implemented pipeline
-(`pvt_moe/ssl/` + `notebooks/03_jepa_pretrain.ipynb`) and a **recipe** precise
-enough for an engineer to rebuild it from scratch. Read it before touching the
-SSL code.
+(`pvt_moe/ssl/jepa.py` + `notebooks/03_ssl_pretrain.ipynb` with
+`ssl.method: "jepa"`, or `train.py --task ssl --ssl-method jepa`) and a
+**recipe** precise enough for an engineer to rebuild it from scratch. Read
+it before touching the JEPA code.
+
+> **JEPA is the alternative method.** The repo's default SSL method is
+> SimMIM (`docs/SIMMIM_GUIDE.md`): the chain (pretrain → intermediate
+> supervised fine-tune → downstream), the evaluation protocol, `results.json`
+> and the three-path MoE ablation are described there and apply to a JEPA
+> arm unchanged, except that JEPA pretrains a dense encoder only.
 
 ## 0. What we are building and why
 
@@ -129,7 +136,8 @@ this is the collapse alarm; healthy runs sit well above 0 and drift slowly),
 | knob | value | note |
 |---|---|---|
 | optimizer | AdamW, betas (0.9, 0.95) | SSL convention (not 0.999) |
-| lr | 1.5e-3 @ global batch 2048 (`ssl.lr_reference_batch`) | used as-is; `LitJEPA` prints the effective batch and the linearly scaled value at startup — set `ssl.lr` yourself if you want it |
+| lr | base 1.5e-3 @ global batch 2048 (`ssl.base_lr`, `ssl.lr_reference_batch`), **scaled** by `effective_batch / 2048` — 7.5e-4 at the repo's 1024 (warmup and final LR scaled by the same factor) | `LitJEPA` prints the base, the factor and the result at startup; set `ssl.lr` to bypass the rule |
+| stochastic depth | 0.0 | derived for `task: "ssl"` when `model.drop_path_rate` is unset (I-JEPA / MAE pretrain without it) |
 | schedule | linear warmup 15 ep → cosine to 1e-6, **per step** | |
 | weight decay | cosine 0.04 → 0.4 | applied only to ndim>1 params |
 | EMA | cosine 0.996 → 1.0 | update after every step |
@@ -156,9 +164,12 @@ al., "PASS: An ImageNet replacement for self-supervised pretraining without
 humans", NeurIPS Datasets and Benchmarks 2021,
 <https://www.robots.ox.ac.uk/~vgg/research/pass/>.
 
-1. **Linear probe** (`LitProbe`): freeze backbone, train one
-   `Linear(512, 1000)` on mean-pooled features, ~20–90 epochs, standard
-   supervised transforms, no mixup. Report top-1/top-5.
+1. **Linear probe** (`pvt_moe.eval.probe.LitProbe`) and **k-NN**
+   (`evaluate.py --ckpt <run>/jepa_backbone.pt --dataset imagenet-1k --knn
+   --probe-epochs 20`): freeze the backbone, one `Linear(512, 1000)` on
+   mean-pooled features, standard supervised transforms, no mixup. Report
+   top-1/top-5 — as collapse detectors; the intermediate supervised
+   fine-tune (`--recipe ssl_finetune`) is the headline number.
 2. **Fine-tune handoff**: `jepa.save_backbone(path)` writes
    `{"state_dict": context.state_dict(), "cfg": <pretraining config>}`. In
    the supervised config: `mode: "ssl_init", ckpt_path: <path>,

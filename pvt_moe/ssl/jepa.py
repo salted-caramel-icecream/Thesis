@@ -35,22 +35,14 @@ from pvt_moe.config import (
     rebind_ssl_method,
     validate_config,
 )
-from pvt_moe.models.pvt import build_model
+from pvt_moe.eval.probe import LitProbe  # noqa: F401  (moved; re-exported for callers)
+from pvt_moe.ssl.backbone import build_ssl_backbone  # noqa: F401  (shared with SimMIM)
 from pvt_moe.ssl.masking import sample_batch_masks, upsample_mask
 from pvt_moe.ssl.predictor import JEPAPredictor
 
 #: SSL defaults now live in pvt_moe.config.SSL_DEFAULTS (so validate_config
 #: accepts and typo-checks cfg["ssl"]); kept under the old name for imports.
 DEFAULT_SSL = SSL_DEFAULTS
-
-
-def build_ssl_backbone(cfg: dict) -> nn.Module:
-    """The context/target encoder: cfg's backbone with MoE OFF and no head."""
-    ssl_cfg = copy.deepcopy(cfg)
-    ssl_cfg["model"]["ablation"]["use_moe"] = False
-    ssl_cfg["model"]["ablation"]["moe_placement"] = [[] for _ in cfg["model"]["depths"]]
-    ssl_cfg["dataset"]["num_classes"] = 0  # head -> Identity
-    return build_model(ssl_cfg)
 
 
 class LitJEPA(pl.LightningModule):
@@ -79,6 +71,13 @@ class LitJEPA(pl.LightningModule):
         self.mask_grid = img_size // 32       # stage-4 grid (7 for 224)
         self.stage1_grid = img_size // 4      # stage-1 grid (56 for 224)
 
+        if cfg["model"]["ablation"]["use_moe"] and any(cfg["model"]["ablation"]["moe_placement"]):
+            # The EMA target of a routed layer is undefined here (gate noise,
+            # capacity, the aux loss). MoE pretraining — path 2 of the
+            # three-path ablation — is a SimMIM experiment; JEPA stays dense.
+            raise ValueError("LitJEPA pretrains a DENSE encoder: set model.ablation.use_moe "
+                             "False (train.py does so for --task ssl unless --moe is passed). "
+                             "MoE pretraining is supported by ssl.method 'simmim'.")
         self.context = build_ssl_backbone(cfg)
         self.target = copy.deepcopy(self.context)
         for p in self.target.parameters():
@@ -226,61 +225,40 @@ class LitJEPA(pl.LightningModule):
 
     # -- export ------------------------------------------------------------
 
+    def sanity_step(self, x: torch.Tensor) -> dict:
+        """One masked forward + loss on a batch, no gradients: the notebook's
+        pre-flight check. Returns plain floats."""
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            B = x.shape[0]
+            mask = sample_batch_masks(B, grid=self.mask_grid,
+                                      n_blocks=self.ssl["mask_n_blocks"],
+                                      block_area=tuple(self.ssl["mask_block_area"]),
+                                      aspect_ratio=tuple(self.ssl["mask_aspect_ratio"])).to(x.device)
+            stage1_mask = upsample_mask(mask, self.mask_grid, self.stage1_grid)
+            ctx, aux = self.context.forward_features(x, return_tokens=True,
+                                                     stage1_token_mask=stage1_mask,
+                                                     mask_token=self.input_mask_token)
+            tgt_raw, _ = self.target.forward_features(x, return_tokens=True)
+            tgt = F.layer_norm(tgt_raw, (tgt_raw.shape[-1],))
+            pred = self.predictor(ctx, mask)
+            loss = F.smooth_l1_loss(pred[mask], tgt[mask])
+        self.train(was_training)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"JEPA sanity step produced a non-finite loss: {loss.item()}")
+        return {"loss": loss.item(), "mask_ratio": mask.float().mean().item(),
+                "target_std": tgt_raw.std(dim=(0, 1)).mean().item(),
+                "aux": 0.0 if aux is None else float(aux)}
+
     def save_backbone(self, path: str):
-        """Save the context encoder for `mode: ssl_init` in supervised runs."""
-        torch.save({"state_dict": self.context.state_dict(), "cfg": self.cfg}, path)
+        """Save the context encoder for `mode: ssl_init` in supervised runs.
+
+        The file carries the run's config, so a warm start can check the
+        architecture and prepend this stage to its ``chain``.
+        """
+        torch.save({"state_dict": self.context.state_dict(), "cfg": self.cfg,
+                    "method": "jepa"}, path)
         print(f"[jepa] context encoder saved to {path}")
 
 
-class LitProbe(pl.LightningModule):
-    """Linear probe: frozen backbone + one linear layer on pooled features."""
-
-    def __init__(self, backbone: nn.Module, num_classes: int, lr: float = 1e-3,
-                 epochs: int = 30):
-        super().__init__()
-        self.backbone = backbone
-        self.backbone.eval()
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-        feat_dim = backbone.embed_dims[-1]
-        self.head = nn.Linear(feat_dim, num_classes)
-        self.lr = lr
-        self.epochs = epochs
-        self.loss_fn = nn.CrossEntropyLoss()
-
-        from torchmetrics.classification import MulticlassAccuracy
-
-        self.val_acc = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro")
-        self.val_acc5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro")
-
-    def forward(self, x):
-        with torch.no_grad():
-            feats, _ = self.backbone.forward_features(x)
-        return self.head(feats)
-
-    def on_train_epoch_start(self):
-        self.backbone.eval()  # keep frozen stats regardless of .train() calls
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        loss = self.loss_fn(self(x), y)
-        self.log("probe_train_loss", loss, on_epoch=True, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x)
-        self.log("probe_val_loss", self.loss_fn(logits, y), on_epoch=True)
-        self.val_acc(logits, y)
-        self.val_acc5(logits, y)
-        self.log("probe_val_acc", self.val_acc, on_epoch=True, prog_bar=True)
-        self.log("probe_val_acc_top5", self.val_acc5, on_epoch=True)
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.head.parameters(), lr=self.lr, weight_decay=0.0)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
-        }

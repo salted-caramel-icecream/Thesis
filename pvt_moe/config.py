@@ -50,25 +50,39 @@ DATASETS = {
              "hf_id": "yukimasano/pass", "gated": False, "finetune_epochs": None,
              "licence": "CC-BY 4.0 (images and dataset)"},
     # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
-    # Native resolutions are far below 224; dataset.img_size upsamples, so
-    # results on these partly measure interpolation (docs/GUIDE.md).
-    "cifar-10": {"num_classes": 10, "labelled": True, "tag": "c10", "hf_id": None,
-                 "gated": False, "finetune_epochs": 50, "native_size": 32,
-                 "licence": "no stated licence; derived from 80 Million Tiny Images, "
-                            "withdrawn by its authors"},
-    "cifar-100": {"num_classes": 100, "labelled": True, "tag": "c100", "hf_id": None,
-                  "gated": False, "finetune_epochs": 50, "native_size": 32,
-                  "licence": "no stated licence; derived from 80 Million Tiny Images, "
-                             "withdrawn by its authors"},
-    "flowers-102": {"num_classes": 102, "labelled": True, "tag": "flw102", "hf_id": None,
-                    "gated": False, "finetune_epochs": 100, "native_size": None,
-                    "licence": "no stated licence"},
-    "pneumoniamnist": {"num_classes": 2, "labelled": True, "tag": "pneu", "hf_id": None,
-                       "gated": False, "finetune_epochs": 30, "native_size": 28,
-                       "licence": "CC-BY 4.0 (MedMNIST v2)"},
+    # Native resolutions are far below 224; dataset.img_size (224) upsamples
+    # them in the train/val transforms, so results on these partly measure
+    # interpolation (docs/GUIDE.md). ``hf_id`` is None where the Hub id has
+    # not been verified from this machine — download_data.py takes --hf-id
+    # (``hf_id_hint`` is the id to try first) or, for MedMNIST, --npz.
+    # ``finetune_epochs`` is the FIXED per-dataset fine-tune budget.
+    "fashionmnist": {"num_classes": 10, "labelled": True, "tag": "fmnist", "hf_id": None,
+                     "hf_id_hint": "zalando-datasets/fashion_mnist",
+                     "gated": False, "finetune_epochs": 30, "native_size": 28,
+                     "channels": 1,          # grayscale; the loader converts to RGB
+                     "splits": "train 60,000 / test 10,000 (no validation split: "
+                               "download_data.py carves a seeded 10% of train)",
+                     "licence": "MIT (Zalando SE, 2017; github.com/zalandoresearch/"
+                                "fashion-mnist, LICENSE)"},
+    "eurosat": {"num_classes": 10, "labelled": True, "tag": "eurosat", "hf_id": None,
+                "hf_id_hint": "blanchon/EuroSAT_RGB",
+                "gated": False, "finetune_epochs": 50, "native_size": 64,
+                "channels": 3,               # the RGB release (not the 13-band MS one)
+                "splits": "27,000 images, no official split: download_data.py carves "
+                          "seeded validation (10%) and test (10%) from the whole set",
+                "licence": "MIT (Patrick Helber; github.com/phelber/EuroSAT, LICENSE); "
+                           "imagery: Sentinel-2, ESA Copernicus open data"},
     "pathmnist": {"num_classes": 9, "labelled": True, "tag": "path", "hf_id": None,
-                  "gated": False, "finetune_epochs": 30, "native_size": 28,
-                  "licence": "CC-BY 4.0 (MedMNIST v2)"},
+                  "hf_id_hint": None,        # MedMNIST ships npz files, not a Hub repo
+                  "gated": False, "finetune_epochs": 30,
+                  # MedMNIST+ (v2.2+, Yang et al. 2023) ships PathMNIST at 28, 64,
+                  # 128 and 224 px; use the 224 file (pathmnist_224.npz) so the
+                  # run needs no upsampling. The 28-px v2 file also loads.
+                  "native_size": 224, "channels": 3,
+                  "splits": "train 89,996 / validation 10,004 / test 7,180 "
+                            "(MedMNIST's own split, kept as is)",
+                  "licence": "CC BY 4.0 (MedMNIST v2 / MedMNIST+; source NCT-CRC-HE-100K, "
+                             "Kather et al. 2018, CC BY 4.0)"},
 }
 #: Datasets whose fine-tune budget is fixed by DATASETS[...]["finetune_epochs"].
 SMALL_DATASETS = tuple(n for n, s in DATASETS.items() if s.get("finetune_epochs"))
@@ -434,13 +448,18 @@ _DEFAULT: dict = {
     "use_tensorboard": False,
 
     "dataset": {
-        "name": "imagenet-1k",            # "imagenet-1k" | "imagenet-22k" | "pass" (SSL only)
+        # "imagenet-1k" | "imagenet-22k" | "pass" (SSL only) | the small
+        # downstream sets "fashionmnist" | "eurosat" | "pathmnist" (DATASETS).
+        "name": "imagenet-1k",
         "num_classes": None,              # DERIVED — leave None
         "img_size": 224,
         "arrow_dirs": {
             "imagenet-1k": "/workspace/ModelTraining/datasets/imagenet_arrow",
             "imagenet-22k": "/workspace/ModelTraining/datasets/imagenet22k_arrow",
             "pass": "/workspace/ModelTraining/datasets/pass_arrow",
+            "fashionmnist": "/workspace/ModelTraining/datasets/fashionmnist_arrow",
+            "eurosat": "/workspace/ModelTraining/datasets/eurosat_arrow",
+            "pathmnist": "/workspace/ModelTraining/datasets/pathmnist_arrow",
         },
         # DeiT-1 augmentation stack (PVT v2 inherits it), fixed across runs.
         # timm config string: magnitude 9, magnitude-std 0.5, increasing
@@ -454,6 +473,11 @@ _DEFAULT: dict = {
         "repeated_aug": 3,
         "random_erasing": 0.25,
         "crop_pct": 0.875,                # val resize = img_size / crop_pct
+        # Low-shot fine-tuning: a JSON index list written by
+        # `python -m pvt_moe.eval.lowshot` (seeded, class-balanced 1% / 10% of
+        # the train split). None = the whole train split. Never applied to
+        # the validation split.
+        "subset_file": None,
     },
 
     "model": {
@@ -719,20 +743,57 @@ def _placement_tag(placement, depths) -> str:
 
 
 def stage_tag(cfg: dict) -> str:
-    """One pipeline stage in words: ``"simmim_pretrain@pass_r224"``.
+    """One pipeline stage in words: ``"simmim_pretrain@pass_r224"``,
+    ``"ssl_finetune+moe@imagenet-1k_r224"``.
 
     ``cfg["chain"]`` is the list of these, oldest first, so a result can name
     the whole path that produced it (SSL pretrain -> intermediate supervised
-    ImageNet fine-tune -> downstream task).
+    ImageNet fine-tune -> downstream task). ``+moe`` marks a stage whose
+    backbone carried routed experts, which is what tells the three
+    pretraining paths apart in a chain (docs/SIMMIM_GUIDE.md §6).
     """
     ds = cfg["dataset"]["name"]
     res = f"r{cfg['dataset']['img_size']}"
+    abl = cfg["model"]["ablation"]
+    moe = "+moe" if abl.get("use_moe") and any(abl.get("moe_placement") or []) else ""
     if cfg.get("task") == "ssl":
-        return f"{cfg['ssl']['method']}_pretrain@{ds}_{res}"
+        return f"{cfg['ssl']['method']}_pretrain{moe}@{ds}_{res}"
     kind = {"scratch": "scratch", "pretrained": "hf_finetune",
             "ssl_finetune": "ssl_finetune", "downstream": "downstream"}.get(
         cfg.get("recipe"), cfg.get("mode") or "run")
-    return f"{kind}@{ds}_{res}"
+    return f"{kind}{moe}@{ds}_{res}"
+
+
+def parent_tag(ckpt_path: str | None) -> str | None:
+    """A short tag naming the run a warm-start checkpoint came from, read from
+    its PATH (``<root>/<parent run name>/<file>``): ``from-dense-simmim200``,
+    ``from-moe-sslft100-from-dense-simmim200``.
+
+    Two fine-tunes that differ ONLY in their parent — path 2 (MoE pretrain)
+    vs path 3 (dense pretrain, upcycled now) — would otherwise share a run
+    name and a checkpoint directory. Needs no torch and no file access, so
+    ``--dry-run`` shows it. None when the parent directory does not follow
+    this repo's naming (pass --run-name then).
+    """
+    if not ckpt_path:
+        return None
+    import os
+
+    parent = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
+    fields = parent.split("_")
+    if len(fields) < 7 or not fields[0].startswith(("sv", "v")):
+        return None
+    if fields[4] == "dense":
+        moe = "dense"
+    elif fields[4].startswith("moe-"):
+        moe = "moe"
+    else:
+        return None
+    norm_at = next((i for i in range(5, len(fields)) if fields[i] in ("ln", "rms")), None)
+    if norm_at is None or norm_at + 1 >= len(fields):
+        return None
+    budget = "-".join(fields[norm_at + 1:])
+    return f"from-{moe}-{budget}"
 
 
 def build_run_tag(cfg: dict) -> str:
@@ -819,7 +880,11 @@ def build_run_tag(cfg: dict) -> str:
                 f"{ssl['method']}{ssl['epochs']}{px}")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
-    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}"
+    # A warm start from an SSL / fine-tuned checkpoint is named after its
+    # parent too (parent_tag), so paths 2 and 3 never share a directory.
+    parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "ssl_init" else None
+    parent = f"_{parent}" if parent else ""
+    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}"
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1269,13 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
     # Stochastic depth for from-scratch runs scales with the epoch budget.
     # The derivation is anchored on B1's official 0.1 (identical for B0-B2);
     # B3-B5 were officially trained at 0.3, which this rule does not know.
+    # SSL PRETRAINING uses none: SimMIM's pretrain config sets DROP_PATH_RATE
+    # 0.0 (microsoft/SimMIM configs/swin_base__100ep/simmim_pretrain_*.yaml;
+    # 0.1 is its FINE-TUNE value, carried by the ssl_finetune recipe), and
+    # I-JEPA / MAE pretrain without stochastic depth as well.
+    if cfg["model"].get("drop_path_rate") is None and cfg.get("task") == "ssl":
+        cfg["model"]["drop_path_rate"] = 0.0
+        filled.append("model.drop_path_rate")
     if cfg["model"].get("drop_path_rate") is None:
         cfg["model"]["drop_path_rate"] = scratch_drop_path(cfg["epochs"])
         filled.append("model.drop_path_rate")
@@ -1359,9 +1431,9 @@ def validate_config(cfg: dict) -> dict:
         raise ValueError(
             f"dataset {ds['name']!r} is UNLABELLED (PASS: SSL pretraining only) and "
             f"cannot train or evaluate a classifier — task is {cfg['task']!r} "
-            f"(recipe {cfg.get('recipe')!r}, mode {cfg['mode']!r}). Use it from the "
-            "JEPA notebook (task: \"ssl\"); train.py is supervised and needs "
-            "imagenet-1k or imagenet-22k."
+            f"(recipe {cfg.get('recipe')!r}, mode {cfg['mode']!r}). Pretrain on it with "
+            "`train.py --task ssl` or notebooks/03_ssl_pretrain.ipynb (task: \"ssl\"); a "
+            "supervised run needs a labelled dataset."
         )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
@@ -1463,7 +1535,10 @@ def validate_config(cfg: dict) -> dict:
     # The recipe's LR is calibrated for a specific effective batch; say so
     # rather than silently rescaling, which would make runs incomparable.
     eff = cfg["effective_batch_size"]
-    if eff != LR_REFERENCE_BATCH and cfg["recipe"] is not None:
+    if (eff != LR_REFERENCE_BATCH and cfg["recipe"] is not None
+            and cfg["optim"].get("base_lr") is None and cfg.get("task") != "ssl"):
+        # Not for recipes that state a base_lr (the rule WAS applied, see
+        # lr_banner) nor for SSL runs (cfg["ssl"] has its own rule).
         suggested = cfg["optim"]["lr"] * eff / LR_REFERENCE_BATCH
         print(
             f"[config] effective_batch_size is {eff}, but the recipe's "
@@ -1477,6 +1552,10 @@ def validate_config(cfg: dict) -> dict:
 
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)
+        if cfg["mode"] == "ssl_init" and parent_tag(cfg.get("ckpt_path")) is None:
+            print(f"[config] ckpt_path {cfg['ckpt_path']!r} is not <root>/<run_name>/<file>, so "
+                  "the run name carries no parent tag: two warm starts from different "
+                  "parents would share a checkpoint directory — pass --run-name.")
 
     assert_json_safe(cfg)
     return cfg

@@ -13,16 +13,22 @@ PVT_Tutelmoe_v10_patched.ipynb
                 the v9 notebook patched in place — SELF-CONTAINED, no
                 dependency on pvt_moe/ (verify: python tests/verify_patched_notebook.py)
 archive/        the original v9 notebook, unmaintained, kept for provenance
-notebooks/      thin launchers — v11_train.ipynb is the current one
-                (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA are older)
+notebooks/      thin launchers — v11_train.ipynb is the current supervised
+                one; 03_ssl_pretrain.ipynb is SSL pretraining (SimMIM / JEPA);
+                01 supervised/Tutel and 02 MegaBlocks are older
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
-docs/           GUIDE.md (how to run: tokens, data, config, resuming)
+docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
-                NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
-                JEPA_GUIDE.md (SSL recipe)
-train.py        terminal entry point (thin shim over pvt_moe/cli.py)
-download_data.py  build the ImageNet / PASS Arrow snapshot (checks token/disk first, staged to cap disk peak)
+                SIMMIM_GUIDE.md (SSL: recipe, the stem leak, three pretraining
+                paths, the chain, evaluation protocol), JEPA_GUIDE.md (the
+                alternative SSL method), NOTEBOOK_TO_PACKAGE.md
+train.py        terminal entry point (thin shim over pvt_moe/cli.py);
+                --task ssl pretrains, --recipe ssl_finetune / downstream chain
+evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
+download_data.py  build the ImageNet / PASS / small-dataset Arrow snapshots
+tools/          compare_runs.py (table over results.json files), plot_rope_freqs.py,
+                verify_upcycling.py
 ```
 
 ## Setting up a GPU box from scratch
@@ -306,24 +312,28 @@ Every row gets a distinct run name (a test enforces it — colliding names would
 share a checkpoint directory and a W&B run). `--dry-run` resolves the config
 and stops; `--print-config` / `--save-config FILE` dump the resolved JSON.
 
-## Recipes: from scratch or pretrained
+## Recipes: from scratch, pretrained, or the SSL chain
 
 One key picks the whole hyperparameter set (`docs/HPARAMS.md` is the source of
 truth; `tests/test_recipes.py::test_spec_*` assert every value):
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})   # or "pretrained"
+cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "ssl_finetune" | "downstream"
 ```
 
-| | `scratch` (default) | `pretrained` |
-|---|---|---|
-| `mode` | `scratch` | `hf_pretrained` |
-| Epochs | **90** (ablations) / 150 / 300 (final) | 100 |
-| Peak LR | 1e-3 @ batch 1024 | 1e-4 |
-| Warmup epochs | 5 | 3 |
-| Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") |
-| Stage-4 LR multiplier | 1.0 | 1.0 |
-| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical |
+| | `scratch` (default) | `pretrained` | `ssl_finetune` | `downstream` |
+|---|---|---|---|---|
+| `mode` | `scratch` | `hf_pretrained` | `ssl_init` (`--ckpt <run>/simmim_backbone.pt`) | `ssl_init` (`--ckpt <run>/last.ckpt`) |
+| Epochs | **90** (ablations) / 150 / 300 (final) | 100 | 100 | fixed per dataset (fashionmnist 30, eurosat 50, pathmnist 30) |
+| Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) | same |
+| Warmup epochs | 5 | 3 | 20 | 5 |
+| Layer-wise LR decay | — | — | 0.9 | 0.9 |
+| Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") | 0.1 | 0.1 |
+| Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 | 1.0 |
+| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical | identical |
+
+SSL pretraining itself is `--task ssl` (SimMIM by default, `--ssl-method
+jepa`), not a recipe — see "Self-supervised pretraining" below.
 
 A recipe fills only fields left as `None`, so **anything you set explicitly
 wins**:
@@ -527,9 +537,18 @@ instructions instead of silently re-downloading ~160 GB.
 images, no people, CC-BY 4.0, not gated — `python download_data.py --dataset
 pass --out DIR` (~166 GB, ~333 GB free while building; the script deletes
 only PASS's raw download between the conversion and the save). It has no
-labels and no validation split, so `train.py` and every supervised recipe
-refuse it; the JEPA notebook uses it by default. Evaluation still happens on
-a labelled set (`docs/JEPA_GUIDE.md` §5).
+labels and no validation split, so every supervised recipe refuses it;
+`train.py --task ssl` and the SSL notebook use it by default. Evaluation
+still happens on a labelled set (`docs/SIMMIM_GUIDE.md` §6).
+
+**Small downstream sets** (`--recipe downstream`): `fashionmnist` (10
+classes, 28 px grayscale, MIT), `eurosat` (10 classes, 64 px RGB, MIT) and
+`pathmnist` (9 classes, MedMNIST+ 224 px, CC BY 4.0), each with a fixed
+fine-tune budget and upsampled to 224 by the transforms — so their numbers
+partly measure interpolation. `download_data.py --dataset <name> --hf-id
+<namespace/name>` (or `--npz pathmnist_224.npz`) builds a uniform snapshot
+with seeded validation / test carve-outs where the source has none;
+`docs/GUIDE.md` §2 has the ids, licences and commands.
 
 ### Dataset citations
 
@@ -540,6 +559,45 @@ a labelled set (`docs/JEPA_GUIDE.md` §5).
   self-supervised pretraining without humans", NeurIPS Datasets and
   Benchmarks 2021. <https://www.robots.ox.ac.uk/~vgg/research/pass/> —
   images and dataset CC-BY 4.0; attribution required.
+- Fashion-MNIST: Xiao, Rasul, Vollgraf, "Fashion-MNIST: a Novel Image
+  Dataset for Benchmarking Machine Learning Algorithms", arXiv 1708.07747,
+  2017 — MIT licence.
+- EuroSAT: Helber, Bischke, Dengel, Borth, "EuroSAT: A Novel Dataset and
+  Deep Learning Benchmark for Land Use and Land Cover Classification",
+  IEEE JSTARS 2019 — MIT licence (code and dataset repository); Sentinel-2
+  imagery under ESA's Copernicus open-data terms.
+- PathMNIST / MedMNIST: Yang, Shi, Wei et al., "MedMNIST v2 — A large-scale
+  lightweight benchmark for 2D and 3D biomedical image classification",
+  Scientific Data 2023 (MedMNIST+ sizes 64/128/224 in the same release) —
+  CC BY 4.0; source data Kather et al., NCT-CRC-HE-100K, 2018, CC BY 4.0.
+
+## Self-supervised pretraining (SimMIM, or JEPA)
+
+`docs/SIMMIM_GUIDE.md` is the reference. The chain for a pyramid backbone
+under masked image modelling is **pretrain → supervised ImageNet-1k
+fine-tune → downstream** (SwinV2 §4.2, BEiT), and every `results.json`
+records which chain produced its numbers:
+
+```bash
+python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200          # dense (paths 1 / 3)
+python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200 --moe    # MoE pretrain (path 2)
+python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
+    --dataset imagenet-1k --data-dir /data/imagenet_arrow                                    # intermediate stage
+python train.py --recipe downstream --dataset eurosat --data-dir /data/eurosat_arrow \
+    --ckpt /data/runs/<fine-tune run>/last.ckpt                                             # downstream
+python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
+    --data-dir /data/imagenet_arrow --knn --probe-epochs 20                                 # collapse check
+python tools/compare_runs.py /data/runs                                                     # one table
+```
+
+SimMIM's recipe (32-px patches, ratio 0.6, L1 on masked pixels, base LR
+2e-4 per 512 with the linear scaling rule, wd 0.05, betas (0.9, 0.999),
+clip 5, 224 throughout) is followed exactly where PVT v2 allows it; the one
+place it cannot be is PVT v2's **overlapping** 7×7/stride-4 stem, which lets
+visible tokens see a 3-px band of each masked patch (measured: 6.9 % of the
+masked pixels at ratio 0.6). `--mask-space pixel` removes the band and
+changes nothing else. Linear-probe / k-NN accuracy is **expected to be low**
+for a MIM encoder; the headline of an SSL arm is the fine-tuned top-1.
 
 ## Warm starts (`mode`)
 
@@ -548,7 +606,7 @@ a labelled set (`docs/JEPA_GUIDE.md` §5).
 | `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
-| `ssl_init` | load a JEPA backbone from `ckpt_path` (see notebook 03) |
+| `ssl_init` | load a SimMIM / JEPA backbone (`<run>/<method>_backbone.pt`) or any `last.ckpt` from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._sslft100_from-dense-simmim200`) |
 | `resume` | full Lightning resume from `ckpt_path` |
 
 Always read the `[HF pretrained] loaded=...` line: a remap drift once cost a

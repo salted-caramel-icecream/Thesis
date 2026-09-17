@@ -3,6 +3,9 @@
     python train.py --recipe scratch --epochs 90
     python train.py --recipe pretrained --lr 5e-5 --warmup-epochs 5
     python train.py --recipe scratch --ladder 4 --dry-run
+    python train.py --task ssl --dataset pass --data-dir /data/pass_arrow          # SimMIM pretrain
+    python train.py --recipe ssl_finetune --ckpt <run>/simmim_backbone.pt         # intermediate FT
+    python train.py --recipe downstream --dataset eurosat --ckpt <run>/last.ckpt  # downstream
 
 Every flag maps onto exactly one config key (``pvt_moe.config``), and unset
 flags stay ``None`` so the recipe supplies them — the CLI adds no defaults of
@@ -34,15 +37,20 @@ import sys
 from pvt_moe.config import (
     SCRATCH_EPOCH_CHOICES,
     DATASETS,
+    SMALL_DATASETS,
     VALID_BACKENDS,
+    VALID_MASK_SPACES,
     VALID_MODES,
     VALID_NORMS,
     VALID_RECIPES,
     VALID_ROPE_MODES,
+    VALID_SSL_METHODS,
+    VALID_TASKS,
     VALID_UPCYCLE_INITS,
     VALID_VARIANTS,
     default_config,
     ladder_overrides,
+    lr_banner,
     merge_config,
     validate_config,
 )
@@ -78,15 +86,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("recipe & budget")
+    g.add_argument("--task", choices=VALID_TASKS, default=None,
+                   help="supervised (default) | ssl = self-supervised pretraining of "
+                        "the backbone (SimMIM by default, --ssl-method jepa); the "
+                        "encoder is saved as <run_dir>/<method>_backbone.pt")
     g.add_argument("--recipe", choices=VALID_RECIPES, default="scratch",
-                   help="scratch = full from-scratch training; pretrained = "
-                        "warm start from the variant's OpenGVLab/pvt_v2_b* "
-                        "checkpoint (default: scratch)")
+                   help="scratch = full from-scratch training; pretrained = warm "
+                        "start from the variant's OpenGVLab/pvt_v2_b* checkpoint; "
+                        "ssl_finetune = the INTERMEDIATE supervised ImageNet fine-"
+                        "tune of an SSL backbone (--ckpt); downstream = a small "
+                        "labelled set (--dataset) from any checkpoint (--ckpt), "
+                        "fixed per-dataset epoch budget (default: scratch)")
     g.add_argument("--epochs", type=int,
                    help=f"epoch budget. scratch ladder: "
                         f"{'/'.join(map(str, SCRATCH_EPOCH_CHOICES))}; "
-                        f"pretrained: 100. 0 = validate only, no training")
-    g.add_argument("--lr", type=float, help="peak LR (recipe: 1e-3 / 1e-4)")
+                        f"pretrained/ssl_finetune: 100; downstream: the registry's "
+                        f"per-dataset budget; --task ssl: pretraining epochs (200). "
+                        f"0 = validate only, no training")
+    g.add_argument("--lr", type=float, help="peak LR (recipe: 1e-3 / 1e-4; absolute)")
+    g.add_argument("--base-lr", type=float,
+                   help="peak LR PER 512 images, scaled by effective_batch / "
+                        "lr_reference_batch (the ssl_finetune / downstream recipes "
+                        "set 1.25e-3); --lr overrides the result")
+    g.add_argument("--layer-decay", type=float,
+                   help="layer-wise LR decay compounding from the head down "
+                        "(ssl_finetune / downstream: 0.9; 1.0 = off)")
     g.add_argument("--warmup-epochs", type=int, help="warmup epochs (recipe: 5 / 3)")
     g.add_argument("--weight-decay", type=float)
     g.add_argument("--grad-clip", type=float)
@@ -105,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--ladder", type=int, metavar="N",
                    help="apply ablation-ladder row N for this recipe "
                         "(1-9, docs/HPARAMS.md section 4)")
+
+    g = p.add_argument_group("self-supervised pretraining (--task ssl)")
+    g.add_argument("--ssl-method", choices=VALID_SSL_METHODS, dest="ssl_method",
+                   help="simmim (default: masked image modelling, Xie et al. CVPR'22) "
+                        "| jepa (I-JEPA-style, kept reachable)")
+    g.add_argument("--mask-space", choices=VALID_MASK_SPACES, dest="mask_space",
+                   help="token (default, SimMIM's: mask token after the stage-1 embed; "
+                        "PVT v2's overlapping stem leaks a 3-px band) | pixel (also "
+                        "zero the masked pixels before the embed, no leak)")
+    g.add_argument("--mask-ratio", type=float, dest="mask_ratio", help="SimMIM: 0.6")
+    g.add_argument("--mask-patch-size", type=int, dest="mask_patch_size",
+                   help="SimMIM: 32 (must divide --img-size)")
 
     g = p.add_argument_group("architecture ablations")
     g.add_argument("--variant", choices=VALID_VARIANTS,
@@ -174,8 +210,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("data & run")
     g.add_argument("--dataset", dest="dataset_name", choices=tuple(DATASETS),
-                   help="imagenet-1k (default) | imagenet-22k | pass — PASS is "
-                        "unlabelled and refused here (SSL only, notebooks/03)")
+                   help="imagenet-1k (default) | imagenet-22k | pass (unlabelled: "
+                        f"--task ssl only) | small downstream sets "
+                        f"{' | '.join(SMALL_DATASETS)} (--recipe downstream)")
+    g.add_argument("--img-size", type=int, dest="img_size",
+                   help="input resolution (default 224; small sets are upsampled to it)")
+    g.add_argument("--subset-file", dest="subset_file", metavar="JSON",
+                   help="low-shot: train on the seeded class-balanced subset written "
+                        "by `python -m pvt_moe.eval.lowshot` (1%% / 10%%)")
     g.add_argument("--batch-size", type=int, metavar="N",
                    help="MICRO-batch: what fits in VRAM (default: 128, sized "
                         "for a 12 GB card at 224^2)")
@@ -272,8 +314,17 @@ def _nest(dotted: str, value):
 #: flag dest -> dotted config path. Only entries whose value is not None are
 #: applied, so an unset flag never shadows the recipe.
 _FLAG_PATHS = {
+    "task": "task",
     "variant": "model.variant",
     "epochs": "epochs",
+    "base_lr": "optim.base_lr",
+    "layer_decay": "optim.layer_decay",
+    "ssl_method": "ssl.method",
+    "mask_space": "ssl.mask_space",
+    "mask_ratio": "ssl.mask_ratio",
+    "mask_patch_size": "ssl.mask_patch_size",
+    "img_size": "dataset.img_size",
+    "subset_file": "dataset.subset_file",
     "stop_at_epoch": "stop_at_epoch",
     "lr": "optim.lr",
     "warmup_epochs": "optim.warmup_epochs",
@@ -372,30 +423,65 @@ def build_config(args, verbose: bool = True) -> dict:
         key, _, raw = item.partition("=")
         cfg = merge_config(cfg, _nest(key.strip(), _parse_value(raw)))
 
+    if cfg.get("task") == "ssl":
+        # --epochs means the PRETRAINING budget here; the supervised `epochs`
+        # is left to the recipe (unused by an SSL run).
+        if args.epochs is not None:
+            cfg["ssl"]["epochs"] = args.epochs
+            cfg["epochs"] = None
+        # Dense is the pretraining default (paths 1 and 3 of the three-path
+        # ablation); path 2 asks for it with --moe. Anything explicit — the
+        # flag, a config file, --set — wins.
+        explicit = (args.use_moe is not None
+                    or any(o.split("=")[0].strip() == "model.ablation.use_moe" for o in args.overrides)
+                    or (args.config and "use_moe" in load_config_file(args.config)
+                        .get("model", {}).get("ablation", {})))
+        if not explicit:
+            cfg["model"]["ablation"]["use_moe"] = False
+            if verbose:
+                print("[ssl] MoE off for pretraining (dense default; pass --moe to pretrain "
+                      "the routed layer, path 2 of docs/SIMMIM_GUIDE.md §6)")
+
     cfg = validate_config(cfg)
     # epochs == 0 is the pretrained ladder's eval-only row: build the model and
     # run validation, never fit. configure_optimizers is not called on that
     # path, so a zero budget never reaches the scheduler.
-    cfg["_eval_only"] = cfg["epochs"] == 0
+    cfg["_eval_only"] = cfg["task"] != "ssl" and cfg["epochs"] == 0
+    if cfg["task"] == "ssl" and cfg["ssl"]["epochs"] <= 0:
+        raise ValueError("--task ssl needs a positive --epochs (pretraining budget)")
     return cfg
 
 
 def describe(cfg: dict) -> str:
     o, m = cfg["optim"], cfg["model"]
     moe, abl = m["moe"], m["ablation"]
-    lines = [
-        f"run:  {cfg['run_name']}",
-        f"  pvt_v2 {m['variant']} | depths {m['depths']} | dims {m['embed_dims']}",
-        f"  {cfg['mode']} | {cfg['epochs']} ep | lr {o['lr']:.2e} "
-        f"(warmup {o['warmup_epochs']} ep from "
-        f"{o['lr'] * o['warmup_start_factor']:.1e}) | wd {o['weight_decay']} "
-        f"| clip {o['grad_clip']} | stage4 LR x{o['stage4_lr_multiplier']}",
-        f"  drop_path {m['drop_path_rate']} | norm {m['norm_type']} "
-        f"| dense_dwconv {m['dense_dwconv']} | {cfg['dataset']['name']}",
+    ssl = cfg.get("task") == "ssl"
+    lines = [f"run:  {cfg['run_name']}",
+             f"  chain: {' -> '.join(cfg.get('chain') or [])}",
+             f"  pvt_v2 {m['variant']} | depths {m['depths']} | dims {m['embed_dims']}"]
+    if ssl:
+        s = cfg["ssl"]
+        lines.append(f"  SSL {s['method']} | {s['epochs']} ep | mask {s['mask_patch_size']}px ratio "
+                     f"{s['mask_ratio']} space {s['mask_space']} | wd {s['weight_decay']} | "
+                     f"betas {s['betas']} | clip {s['grad_clip']} | {cfg['dataset']['name']} "
+                     f"@ {cfg['dataset']['img_size']}px | drop_path {m['drop_path_rate']}")
+    else:
+        lines.append(
+            f"  {cfg['mode']} | {cfg['epochs']} ep | lr {o['lr']:.2e} "
+            f"(warmup {o['warmup_epochs']} ep from "
+            f"{o['lr'] * o['warmup_start_factor']:.1e}) | wd {o['weight_decay']} "
+            f"| clip {o['grad_clip']} | stage4 LR x{o['stage4_lr_multiplier']} "
+            f"| layer_decay {o['layer_decay']}")
+        lines.append(
+            f"  drop_path {m['drop_path_rate']} | norm {m['norm_type']} "
+            f"| dense_dwconv {m['dense_dwconv']} | {cfg['dataset']['name']} "
+            f"@ {cfg['dataset']['img_size']}px"
+            + (f" | subset {cfg['dataset']['subset_file']}" if cfg["dataset"].get("subset_file") else ""))
+    lines.append(f"  {lr_banner(cfg, ssl=ssl)}")
+    lines.append(
         f"  batch: {cfg['batch_size']} micro x {cfg['accumulate_grad_batches']} "
         f"accum = {cfg['effective_batch_size']} effective "
-        f"| {cfg['num_workers']} workers | {cfg['precision']}",
-    ]
+        f"| {cfg['num_workers']} workers | {cfg['precision']}")
     if abl["use_moe"] and any(abl["moe_placement"]):
         lines.append(
             f"  MoE: {moe['num_experts']} experts top-{moe['top_k']} "
@@ -403,17 +489,18 @@ def describe(cfg: dict) -> str:
             f"| cap {moe['capacity_factor']} | noise {moe['gate_noise']} "
             f"| placement {abl['moe_placement']}"
         )
-        if cfg["mode"] == "hf_pretrained":
+        if cfg["mode"] in ("hf_pretrained", "ssl_init"):
             lines.append(
                 f"  upcycle: seed_experts {m['seed_moe_from_dense']} "
                 f"| upcycle_init {moe['upcycle_init']}"
             )
     else:
         lines.append("  MoE: off (dense arm)")
+    aug = ("crop + flip only (SSL), no repeated aug" if ssl else
+           f"{cfg['dataset']['randaugment']} x{cfg['dataset']['repeated_aug']} repeats")
     lines.append(f"  RoPE: {abl['rope_placement'] if abl['use_rope'] else 'off'}"
                  f"{' ' + abl['rope_mode'] + ' theta ' + str(abl['rope_theta']) if abl['use_rope'] else ''} "
-                 f"| aug {cfg['dataset']['randaugment']} "
-                 f"x{cfg['dataset']['repeated_aug']} repeats")
+                 f"| aug {aug}")
     if cfg.get("milestones") or cfg.get("stop_at_epoch"):
         stop = cfg.get("stop_at_epoch") or cfg["epochs"]
         lines.append(
@@ -423,6 +510,8 @@ def describe(cfg: dict) -> str:
         )
     if cfg["mode"] == "resume":
         lines.append(f"  RESUMING full state from {cfg['ckpt_path']}")
+    elif cfg["mode"] == "ssl_init":
+        lines.append(f"  warm start (ssl_init) from {cfg['ckpt_path']}")
     return "\n".join(lines)
 
 
@@ -612,9 +701,25 @@ def main(argv=None) -> int:
 
     # Heavy imports live here so --help/--dry-run work without torch/lightning.
     from pvt_moe.data import build_dataloaders
-    from pvt_moe.engine import LitClassifier, build_trainer, setup_environment
+    from pvt_moe.engine import LitClassifier, build_ssl_trainer, build_trainer, setup_environment
 
     setup_environment(cfg)
+    ckpt = cfg["ckpt_path"] if cfg["mode"] == "resume" else None
+
+    if cfg["task"] == "ssl":
+        from pvt_moe.ssl import backbone_filename, build_ssl_module
+
+        train_loader, _ = build_dataloaders(cfg, ssl=True)   # no val loop in pretraining
+        module = build_ssl_module(cfg)
+        trainer = build_ssl_trainer(cfg)
+        trainer.fit(module, train_loader, ckpt_path=ckpt)
+        path = os.path.join(cfg["checkpoint_root"], cfg["run_name"],
+                            backbone_filename(cfg["ssl"]["method"]))
+        module.save_backbone(path)
+        print(f"[done] encoder -> {path}\n       next: python train.py --recipe ssl_finetune "
+              f"--ckpt {path} --dataset imagenet-1k   (intermediate supervised stage)")
+        return 0
+
     train_loader, val_loader = build_dataloaders(cfg)
     model = LitClassifier(cfg)
     trainer = build_trainer(cfg)
@@ -623,7 +728,6 @@ def main(argv=None) -> int:
         trainer.validate(model, val_loader)
         return 0
 
-    ckpt = cfg["ckpt_path"] if cfg["mode"] == "resume" else None
     trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt)
     print(f"[done] best checkpoint: "
           f"{getattr(trainer.checkpoint_callback, 'best_model_path', 'n/a')}")
