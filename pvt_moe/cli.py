@@ -239,12 +239,15 @@ def build_parser() -> argparse.ArgumentParser:
 # gitignored and meant to be composed with an ablation arm; run alone they
 # resolve to the default arm and would share row 4's checkpoint directory, so
 # they are never counted as a shipped ablation arm.
-LOCAL_CONFIG_SUFFIX = ".local.yaml"
+#: every extension load_config_file accepts, so a machine-local file can never
+#: be a shipped arm whichever format it was written in (all three are gitignored)
+LOCAL_CONFIG_SUFFIXES = (".local.yaml", ".local.yml", ".local.json")
+LOCAL_CONFIG_SUFFIX = LOCAL_CONFIG_SUFFIXES[0]
 
 
 def is_local_config(path) -> bool:
-    """True for a machine-local ``*.local.yaml`` config (never a shipped arm)."""
-    return str(path).endswith(LOCAL_CONFIG_SUFFIX)
+    """True for a machine-local ``*.local.{yaml,yml,json}`` config (never a shipped arm)."""
+    return str(path).endswith(LOCAL_CONFIG_SUFFIXES)
 
 
 def shipped_config_files(config_dir: str = "configs") -> list:

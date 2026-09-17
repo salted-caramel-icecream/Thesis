@@ -144,7 +144,8 @@ roughly all 1000 classes; the script prints `distinct labels: K / expected
 1000` after every build and a loud `WARNING` when K falls short, which is the
 guard against a future re-shard. The free-space check scales with the
 fraction (validation counted in full; `--fraction 1.0` is exactly the full
-build and takes the unchanged `load_dataset` path), and the raw-download
+build and takes the unchanged `load_dataset` path, followed by the same
+distinct-label report), and the raw-download
 cleanup runs for every fraction — it only ever deletes this dataset's hub
 entry, and for a small fraction it is cheap.
 
@@ -202,6 +203,9 @@ files merge in order and a later file wins on any key both set:
 ```bash
 python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml
 ```
+
+This is the one documented command that needs a file you create first: from
+a clean checkout it stops with `error: --config file not found`, by design.
 
 Never run the paths file alone. It sets no architecture, so alone it resolves
 to the default arm and gets the same `run_name` as

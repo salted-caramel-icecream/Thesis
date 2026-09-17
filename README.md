@@ -297,7 +297,7 @@ python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
-python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm
+python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm (create the .local file first)
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)

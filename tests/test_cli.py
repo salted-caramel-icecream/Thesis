@@ -94,7 +94,7 @@ def test_upcycle_init_can_be_swapped_on_the_command_line():
     assert "-szi" in c["run_name"], "the init arms must not share a run name"
 
 
-def test_all_three_init_arms_get_distinct_run_names():
+def test_admissible_init_arms_get_distinct_run_names_and_explicit_none_is_refused():
     names = {
         init: _cfg("--recipe", "pretrained", "--upcycle-init", init)["run_name"]
         for init in ("routed_zero", "shared_zero")
@@ -428,8 +428,17 @@ def test_missing_config_file_is_a_clean_error():
 
 
 def test_local_configs_are_gitignored():
+    """Every extension load_config_file accepts is covered, so a machine path
+    can never be committed whichever format the local file uses."""
+    from pvt_moe.cli import is_local_config
+
     lines = [ln.strip() for ln in pathlib.Path(".gitignore").read_text().splitlines()]
-    assert "configs/*.local.yaml" in [ln for ln in lines if ln and not ln.startswith("#")]
+    active = [ln for ln in lines if ln and not ln.startswith("#")]
+    for ext in ("yaml", "yml", "json"):
+        assert f"configs/*.local.{ext}" in active, ext
+        assert is_local_config(f"configs/my_paths.local.{ext}"), ext
+    assert not is_local_config("configs/scratch_01_baseline_conv_ffn.yaml")
+    assert not is_local_config("configs/notes.local.txt")
 
 
 def test_yaml_and_json_configs_are_equivalent():

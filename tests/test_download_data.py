@@ -225,6 +225,26 @@ def test_carve_counts_must_be_positive_and_seed_needs_from_snapshot():
     assert ns.seed == 42
 
 
+def test_free_space_preflight_in_main_uses_the_scaled_requirement():
+    """main() must call required_gb with the fraction: with almost no disk it
+    exits 2 BEFORE any network access, naming the scaled figure. PASS is not
+    gated, so no token is involved either."""
+    import contextlib, io, types
+
+    real = download_data.shutil.disk_usage
+    download_data.shutil.disk_usage = lambda path: types.SimpleNamespace(free=1 * 1024**3, total=0, used=0)
+    try:
+        for fraction, expect, scaled_note in (("0.25", "~83 GB", True), ("1.0", "~333 GB", False)):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = download_data.main(["--dataset", "pass", "--out", "/tmp/_wf_pass_arrow", "--fraction", fraction])
+            assert rc == 2, (fraction, rc)
+            assert expect in err.getvalue(), (fraction, err.getvalue())
+            assert ("at --fraction" in err.getvalue()) is scaled_note, err.getvalue()
+    finally:
+        download_data.shutil.disk_usage = real
+
+
 def _documented_commands():
     cmds = []
     with open(os.path.join(REPO_ROOT, "docs", "GUIDE.md"), encoding="utf-8") as f:
