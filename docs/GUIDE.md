@@ -127,6 +127,41 @@ python download_data.py --out /data/imagenet_arrow --hf-cache /data/hf_cache    
 python download_data.py --out D:/data/imagenet_arrow --hf-cache D:/hf_cache     # Windows
 ```
 
+### A fraction, for benchmarking a new box
+
+A throughput check does not need the 160 GB snapshot. `--fraction F`
+(0 < F <= 1) downloads only the first `ceil(F * N)` train parquet shards — the
+shard list comes from the Hub API, nothing is hard-coded — and **always the
+whole validation split** (~6 GB), because a partial validation set makes any
+accuracy meaningless:
+
+```bash
+python download_data.py --out /data/imagenet_25 --fraction 0.25          # a quarter of train, all of val
+```
+
+The HF shards are shuffled, not class-ordered, so a contiguous prefix covers
+roughly all 1000 classes; the script prints `distinct labels: K / expected
+1000` after every build and a loud `WARNING` when K falls short, which is the
+guard against a future re-shard. The free-space check scales with the
+fraction (validation counted in full; `--fraction 1.0` is exactly the full
+build and takes the unchanged `load_dataset` path), and the raw-download
+cleanup runs for every fraction — it only ever deletes this dataset's hub
+entry, and for a small fraction it is cheap.
+
+Already have a full snapshot on one machine? Carve a seeded random subset out
+of it and copy that instead — no token, no network, no free-space check:
+
+```bash
+python download_data.py --from-snapshot /data/imagenet_arrow --out /data/imagenet_20k --n-train 20000 --n-val 2000
+```
+
+`--seed` defaults to 42, so two carves with the same counts are identical.
+~20k train images plus 2k validation is 2–3 GB: `tar` it, `scp` it, done in
+minutes. It prints the row counts and the same distinct-label line.
+Either subset is for **comparing GPU compute** between machines — see the
+page-cache caveat under `quick_bench.ipynb` in section 4 before reading
+anything else off it.
+
 ### Point the code at it
 
 ```bash
@@ -387,12 +422,32 @@ Edit the **CONFIG cell** and run all. The knobs that matter:
 | `LIMIT_TRAIN_BATCHES` | `None` times full epochs (45–85 min each for B1 on a 5070); `200` times 200 batches and extrapolates from the measured images/s — a throughput check in minutes |
 | `USE_MOE` | `False` for the dense baseline |
 | `BACKEND` | `"native"` if Tutel is not built |
-| `DATA_DIR` | Arrow snapshot; `None` keeps the config default |
+| `DATA_DIR` | the Arrow snapshot directory (`dataset_dict.json` inside); the cell stops with the two subset commands when it is missing |
 
 It prints per-epoch wall clock, steady-state images/s, peak VRAM and the
 projected 90/150/300-epoch days, plus the equivalent `train.py` command line.
 Checkpoints and logs go to `bench_runs/` and W&B is off, so nothing it writes
 can be mistaken for a result.
+
+**Subsets and the page cache.** A 2–3 GB subset (`--fraction` build or
+`--from-snapshot` carve, section 2) fits entirely in the OS page cache after
+one pass, so from the second epoch on the disk is never read and the
+dataloader looks faster than it can ever be on the full snapshot. That is fine
+for **comparing GPU compute across machines** — it removes the disk as a
+variable — but subset numbers must **never** be used to re-answer
+`num_workers` or to estimate real epoch times; both depend on the disk that
+the subset hides. The baseline to compare a new machine against, measured on
+an RTX 5090 with 24 cores on the **full** snapshot, batch 128, B1 dense:
+
+| measurement | img/s | note |
+|---|---|---|
+| dataloader only, 4 workers | 1,411 | |
+| dataloader only, 8 workers | 2,712 | |
+| dataloader only, 12 workers | 3,800 | |
+| dataloader only, 16 workers | 4,098 | plateau |
+| dataloader only, 20 workers | 4,030 | |
+| dataloader only, 24 workers | 3,952 | |
+| real training | 2,287 | 9.3 min/epoch, GPU-bound |
 
 It varies **one** axis at a time, though: `USE_MOE` is a single switch and the
 size is fixed per run. To time every arm instead, use the
