@@ -174,10 +174,12 @@ DATA_DIR = "/data/imagenet_arrow"           # notebook CONFIG cell — Linux / m
 # DATA_DIR = "D:/data/imagenet_arrow"       # Windows
 ```
 
-Or set it once in a config so you never pass the flag:
+Or set it once in a config so you never pass the flag. Put the paths in a
+**machine-local** file named `configs/my_paths.local.yaml`; `*.local.yaml` is
+gitignored, so a `D:` path never gets committed or lands on a Linux box:
 
 ```yaml
-# configs/my_paths.yaml  —  Linux / macOS / WSL2
+# configs/my_paths.local.yaml  —  Linux / macOS / WSL2
 dataset:
   arrow_dirs:
     imagenet-1k: "/data/imagenet_arrow"
@@ -186,7 +188,7 @@ log_root: "/data/runs/logs"
 ```
 
 ```yaml
-# configs/my_paths.yaml  —  Windows
+# configs/my_paths.local.yaml  —  Windows
 dataset:
   arrow_dirs:
     imagenet-1k: "D:/data/imagenet_arrow"
@@ -194,12 +196,20 @@ checkpoint_root: "D:/runs/checkpoints"
 log_root: "D:/runs/logs"
 ```
 
+Then **compose** it with an ablation arm — `--config` may be repeated, the
+files merge in order and a later file wins on any key both set:
+
 ```bash
-python train.py --config configs/my_paths.yaml --recipe scratch
+python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml
 ```
 
-Keep per-machine path configs **out of version control**, or as one file per
-machine, so a Windows path never lands on a Linux box and vice versa.
+Never run the paths file alone. It sets no architecture, so alone it resolves
+to the default arm and gets the same `run_name` as
+`configs/scratch_04_moe_shared.yaml` (row 4) — it would write into row 4's
+checkpoint directory. Because a `*.local.yaml` can collide with a ladder row
+like that by construction, the test suite's shipped-config sweep
+(`tests/test_cli.py`, `tests/test_variants.py`) skips `*.local.yaml`; the
+shipped `configs/*.yaml` arms are still checked for run-name collisions.
 
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
@@ -283,9 +293,12 @@ key nothing reads.
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
 Before the first upcycled run on a new box: `python tools/verify_upcycling.py
---variant b1 --hf` checks, on the real MoE backend, that the upcycled model
-reproduces the dense one at step 0 (the CPU suite only proves it on the fake
-Tutel layer and the native backend).
+--variant b1 --recipe pretrained --hf` checks, on the real MoE backend, that
+the upcycled model reproduces the dense one at step 0 (the CPU suite proves it
+on the fake Tutel layer and the native backend, through the real HF loader).
+`--recipe` is required: it decides what `model.moe.upcycle_init` resolves to,
+the tool echoes every MoE config as `[config] recipe=.. mode=.. upcycle_init=..`
+and refuses one that resolves to `none`.
 
 Diagnostics, no training: `--check-env` (is this machine usable),
 `--dry-run` (resolve and print the config), `--print-config` / `--save-config`.

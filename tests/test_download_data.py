@@ -202,6 +202,29 @@ def test_from_snapshot_is_exclusive_with_the_download_flags():
             raise AssertionError(f"--from-snapshot without {missing} must be refused")
 
 
+def test_carve_counts_must_be_positive_and_seed_needs_from_snapshot():
+    """An empty split cannot be saved (datasets divides by zero on it), and
+    --seed is a carve flag like --n-train / --n-val."""
+    parser = download_data.build_parser()
+    for bad in (["--n-train", "0", "--n-val", "1"], ["--n-train", "1", "--n-val", "0"]):
+        try:
+            parser.parse_args(["--from-snapshot", "/s", "--out", "/d", *bad])
+        except SystemExit as e:
+            assert e.code == 2, bad
+        else:
+            raise AssertionError(f"{bad} must be refused")
+    try:
+        parser.parse_args(["--out", "/d", "--seed", "3"])
+    except SystemExit as e:
+        assert e.code == 2
+    else:
+        raise AssertionError("--seed without --from-snapshot must be refused")
+    ns = parser.parse_args(["--from-snapshot", "/s", "--out", "/d", "--n-train", "1", "--n-val", "1", "--seed", "7"])
+    assert ns.seed == 7
+    ns = parser.parse_args(["--from-snapshot", "/s", "--out", "/d", "--n-train", "1", "--n-val", "1"])
+    assert ns.seed == 42
+
+
 def _documented_commands():
     cmds = []
     with open(os.path.join(REPO_ROOT, "docs", "GUIDE.md"), encoding="utf-8") as f:

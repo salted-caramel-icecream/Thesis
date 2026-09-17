@@ -400,7 +400,8 @@ sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
 theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
-`-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+`-randexp` (random expert init), `-szi` (`shared_zero` upcycling init; an explicit
+`none` with seeded experts is refused at validate time, so `-nozi` never appears).
 
 ## RoPE frequency diagnostics
 

@@ -269,10 +269,11 @@ class _Parser(argparse.ArgumentParser):
                            f"drop {', '.join(clashes)}")
             if ns.n_train is None or ns.n_val is None:
                 self.error("--from-snapshot needs both --n-train N and --n-val M")
-            if ns.n_train < 1 or ns.n_val < 0:
-                self.error("--n-train must be >= 1 and --n-val >= 0")
-        elif ns.n_train is not None or ns.n_val is not None:
-            self.error("--n-train / --n-val only apply with --from-snapshot")
+            if ns.n_train < 1 or ns.n_val < 1:
+                self.error("--n-train and --n-val must be >= 1 (an empty split cannot be saved)")
+            ns.seed = 42 if ns.seed is None else ns.seed
+        elif ns.n_train is not None or ns.n_val is not None or ns.seed is not None:
+            self.error("--n-train / --n-val / --seed only apply with --from-snapshot")
         ns.dataset = ns.dataset or "imagenet-1k"
         ns.fraction = 1.0 if ns.fraction is None else ns.fraction
         return ns
@@ -312,7 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="train images to keep (capped at the split size)")
     carve.add_argument("--n-val", type=int, metavar="M",
                        help="validation images to keep (capped at the split size)")
-    carve.add_argument("--seed", type=int, default=42, help="shuffle seed (default 42)")
+    carve.add_argument("--seed", type=int, default=None, metavar="S",
+                       help="shuffle seed (default 42)")
     return ap
 
 
@@ -414,7 +416,11 @@ def main(argv=None) -> int:
         from huggingface_hub import hf_hub_download
 
         files = HfApi().list_repo_files(repo_id, repo_type="dataset", token=token)
-        selected = select_shards(files, fraction, repo_id)
+        try:
+            selected = select_shards(files, fraction, repo_id)
+        except ValueError as e:                      # e.g. a webdataset-shaped repo
+            print(f"\nerror: {e}", file=sys.stderr)
+            return 2
         n_all_train = sum(1 for f in files if f.startswith("data/train-") and f.endswith(".parquet"))
         print(f"\n[1/3] {len(selected['train'])} of {n_all_train} train shards + "
               f"{len(selected['validation'])} validation shards (all of them) -> raw under "
