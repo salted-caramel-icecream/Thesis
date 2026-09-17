@@ -234,6 +234,29 @@ def build_parser() -> argparse.ArgumentParser:
 # Args -> config
 # ---------------------------------------------------------------------------
 
+# Machine-local path configs (``configs/<name>.local.yaml``) hold only
+# ``dataset.arrow_dirs`` / ``checkpoint_root`` / ``log_root``. They are
+# gitignored and meant to be composed with an ablation arm; run alone they
+# resolve to the default arm and would share row 4's checkpoint directory, so
+# they are never counted as a shipped ablation arm.
+LOCAL_CONFIG_SUFFIX = ".local.yaml"
+
+
+def is_local_config(path) -> bool:
+    """True for a machine-local ``*.local.yaml`` config (never a shipped arm)."""
+    return str(path).endswith(LOCAL_CONFIG_SUFFIX)
+
+
+def shipped_config_files(config_dir: str = "configs") -> list:
+    """Sorted paths of the shipped ablation arms under ``config_dir``.
+
+    Every ``*.yaml`` except the gitignored machine-local ``*.local.yaml``
+    files, which may legitimately collide with a ladder row on run_name.
+    """
+    return sorted(str(f) for f in pathlib.Path(config_dir).glob("*.yaml")
+                  if not is_local_config(f))
+
+
 def load_config_file(path: str) -> dict:
     """Load a YAML or JSON config fragment.
 
@@ -337,6 +360,9 @@ def build_config(args, verbose: bool = True) -> dict:
     if isinstance(config_files, str):
         config_files = [config_files]
     for path in config_files:
+        if not os.path.isfile(path):
+            # A typo'd path is user error: one line, not a traceback.
+            raise ValueError(f"--config file not found: {path}")
         cfg = merge_config(cfg, load_config_file(path))
 
     if args.ladder is not None:

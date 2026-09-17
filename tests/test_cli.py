@@ -332,20 +332,17 @@ def test_config_errors_exit_2_instead_of_raising():
 def test_every_shipped_config_file_resolves():
     """configs/*.yaml are the ablation arms — all must build a valid config
     and none may collide on run_name (that would share a checkpoint dir)."""
-    import pathlib
+    from pvt_moe.cli import load_config_file, shipped_config_files
 
-    from pvt_moe.cli import load_config_file
-
-    # *.local.yaml are gitignored machine-path files; alone they resolve to the
-    # default arm and may legitimately collide with a ladder row, so skip them.
-    files = sorted(f for f in pathlib.Path("configs").glob("*.yaml")
-                   if not f.name.endswith(".local.yaml"))
+    # shipped_config_files() skips the gitignored *.local.yaml machine-path
+    # files: alone they resolve to the default arm and may collide with a row.
+    files = shipped_config_files()
     assert len(files) >= 18, f"expected the full ladder, found {len(files)}"
     names = {}
     for f in files:
-        assert load_config_file(str(f)), f
-        cfg = _cfg("--config", str(f))
-        names.setdefault(cfg["run_name"], []).append(f.name)
+        assert load_config_file(f), f
+        cfg = _cfg("--config", f)
+        names.setdefault(cfg["run_name"], []).append(pathlib.Path(f).name)
     dupes = {k: v for k, v in names.items() if len(v) > 1}
     assert not dupes, f"config files collide on run_name: {dupes}"
 
@@ -383,8 +380,11 @@ def test_two_config_files_compose_in_order_and_later_wins():
 def test_local_config_files_are_excluded_from_the_shipped_sweep():
     """A gitignored configs/*.local.yaml holds only machine paths, so alone it
     resolves to the default arm and collides with scratch_04 on run_name. The
-    shipped-config sweeps must skip it instead of failing the suite."""
+    shipped-config sweeps must skip it instead of failing the suite. The
+    exclusion lives in pvt_moe.cli (is_local_config / shipped_config_files),
+    which both sweeps use, so this fails against a cli.py without it."""
     import test_variants
+    from pvt_moe.cli import is_local_config, shipped_config_files
 
     local = pathlib.Path("configs") / "_wf_tmp.local.yaml"
     assert not local.exists(), local
@@ -395,11 +395,36 @@ def test_local_config_files_are_excluded_from_the_shipped_sweep():
         # It collides with row 4 by construction ...
         assert _cfg("--config", str(local))["run_name"] == \
             _cfg("--config", "configs/scratch_04_moe_shared.yaml")["run_name"]
-        # ... and both sweeps must still pass.
+        # ... is recognised as machine-local and left out of the shipped list
+        # (which still holds every real arm) ...
+        assert is_local_config(local) and is_local_config(str(local))
+        assert not is_local_config("configs/scratch_04_moe_shared.yaml")
+        assert str(local) not in shipped_config_files()
+        assert "configs/scratch_04_moe_shared.yaml" in shipped_config_files()
+        assert shipped_config_files() == sorted(
+            str(f) for f in pathlib.Path("configs").glob("*.yaml")
+            if f.name != local.name)
+        # ... and both sweeps must still pass with it present.
         test_every_shipped_config_file_resolves()
         test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
     finally:
         local.unlink()
+
+
+def test_missing_config_file_is_a_clean_error():
+    """A typo'd --config path exits 2 with 'error: ...', not a traceback."""
+    import io
+    import contextlib
+
+    from pvt_moe.cli import main
+
+    missing = "configs/_wf_does_not_exist.yaml"
+    assert not pathlib.Path(missing).exists()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["--config", missing, "--dry-run"])
+    assert rc == 2
+    assert "error: --config file not found" in err.getvalue() and missing in err.getvalue()
 
 
 def test_local_configs_are_gitignored():

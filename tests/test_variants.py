@@ -12,14 +12,13 @@ The invariants:
 
 from __future__ import annotations
 
-import glob
 import sys
 import types
 
 import torch
 
 from helpers import install_fake_tutel_backend, tiny_config
-from pvt_moe.cli import build_config, build_parser, suggest_micro_batch
+from pvt_moe.cli import build_config, build_parser, shipped_config_files, suggest_micro_batch
 from pvt_moe.config import (
     LADDERS,
     VALID_VARIANTS,
@@ -229,10 +228,9 @@ def test_ladder_rows_land_on_the_last_block_under_b2():
 
 
 def test_shipped_yaml_configs_land_on_the_last_block_under_b2():
-    # *.local.yaml are gitignored machine-path files; alone they resolve to the
-    # default arm and may legitimately collide with a ladder row, so skip them.
-    files = sorted(f for f in glob.glob("configs/*.yaml")
-                   if not f.endswith(".local.yaml"))
+    # shipped_config_files() skips the gitignored *.local.yaml machine-path
+    # files: alone they resolve to the default arm and may collide with a row.
+    files = shipped_config_files()
     assert len(files) >= 20, files
     for f in files:
         c = _cli("--config", f, "--variant", "b2")
