@@ -369,9 +369,35 @@ for v in b0 b1 b2; do
 done
 ```
 
-For pure throughput with no W&B and no checkpoints,
-`notebooks/quick_bench.ipynb` caps the batches per epoch and extrapolates
-images/s, peak VRAM and projected 90/150/300-epoch days instead.
+### quick_bench.ipynb
+
+For pure throughput with no W&B and no checkpoints, `notebooks/quick_bench.ipynb`
+times one size on **this** machine and extrapolates the calendar:
+
+```bash
+jupyter lab notebooks/quick_bench.ipynb     # or: jupyter notebook
+```
+
+Edit the **CONFIG cell** and run all. The knobs that matter:
+
+| | |
+|---|---|
+| `VARIANT` | `"b0"` … `"b5"` — one size per run, so re-run the notebook per size |
+| `EPOCHS` | epochs to time (default 5) |
+| `LIMIT_TRAIN_BATCHES` | `None` times full epochs (45–85 min each for B1 on a 5070); `200` times 200 batches and extrapolates from the measured images/s — a throughput check in minutes |
+| `USE_MOE` | `False` for the dense baseline |
+| `BACKEND` | `"native"` if Tutel is not built |
+| `DATA_DIR` | Arrow snapshot; `None` keeps the config default |
+
+It prints per-epoch wall clock, steady-state images/s, peak VRAM and the
+projected 90/150/300-epoch days, plus the equivalent `train.py` command line.
+Checkpoints and logs go to `bench_runs/` and W&B is off, so nothing it writes
+can be mistaken for a result.
+
+It varies **one** axis at a time, though: `USE_MOE` is a single switch and the
+size is fixed per run. To time every arm instead, use the
+`configs/bench_*_5ep.yaml` sweep above, which logs each arm under its own run
+name.
 
 ---
 

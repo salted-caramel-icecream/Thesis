@@ -14,9 +14,13 @@ PVT_Tutelmoe_v10_patched.ipynb
                 dependency on pvt_moe/ (verify: python tests/verify_patched_notebook.py)
 archive/        the original v9 notebook, unmaintained, kept for provenance
 notebooks/      thin launchers — v11_train.ipynb is the current one
+                quick_bench.ipynb times a few epochs on this machine
                 (01 supervised/Tutel, 02 MegaBlocks, 03 JEPA are older)
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
+                scratch_NN_*.yaml        the 90-epoch ladder rows
+                *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
+                bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
 docs/           GUIDE.md (how to run: tokens, data, config, resuming)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
                 NOTEBOOK_TO_PACKAGE.md (where the old notebook code went)
@@ -203,16 +207,22 @@ python train.py --recipe scratch --epochs 300 \
 ```bash
 # Linux / WSL2 / macOS
 for f in configs/scratch_0*.yaml; do
+    case "$f" in *_300ep_stop100.yaml) continue ;; esac   # ladder rows only
     python train.py --config "$f" --data-dir /data/imagenet_arrow || break
 done
 ```
 ```powershell
 # Windows — D: is only an example; substitute your own drive
-foreach ($f in Get-ChildItem configs/scratch_0*.yaml) {
+foreach ($f in Get-ChildItem configs/scratch_0*.yaml |
+                Where-Object { $_.Name -notlike '*_300ep_stop100.yaml' }) {   # ladder rows only
     python train.py --config $f.FullName --data-dir D:/data/imagenet_arrow
     if ($LASTEXITCODE -ne 0) { break }
 }
 ```
+
+The guard matters: every scratch arm also ships a `_300ep_stop100` sibling
+that matches the same glob, and those are 300-epoch schedules — without the
+skip the loop would launch both budgets.
 
 Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
@@ -222,11 +232,12 @@ weeks, not days — see `docs/HPARAMS.md` §5.
 
 ## Or use a notebook
 
-Two, for different purposes:
+Three, for different purposes:
 
 | | |
 |---|---|
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 241 tests. Prefer this. |
+| `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 262 tests. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
