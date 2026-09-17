@@ -10,10 +10,11 @@ its own beyond ``--recipe``. That keeps `docs/HPARAMS.md` the single source of
 truth: if a value is not on the command line, it came from the recipe.
 
 ``--set a.b.c=value`` is the escape hatch for anything without a flag, and
-``--config file.json`` merges a saved config first. Precedence, lowest to
-highest::
+``--config file.json`` merges a saved config first; it may be repeated, and
+the files merge in order (later files win on conflicting keys). Precedence,
+lowest to highest::
 
-    default_config()  <  --config  <  --ladder  <  named flags  <  --set
+    default_config()  <  --config (in order)  <  --ladder  <  named flags  <  --set
 
 Running the whole ablation ladder is then a shell loop::
 
@@ -205,9 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
                "bit-reproducible but slower (cudnn deterministic)")
 
     g = p.add_argument_group("escape hatches & inspection")
-    g.add_argument("--config", metavar="FILE",
+    g.add_argument("--config", metavar="FILE", action="append", default=None,
                    help="YAML or JSON config merged before any flag "
-                        "(.yaml/.yml need PyYAML)")
+                        "(.yaml/.yml need PyYAML). Repeatable: files merge "
+                        "in order, later files win on conflicting keys, e.g. "
+                        "--config configs/my_paths.local.yaml "
+                        "--config configs/scratch_01_baseline_conv_ffn.yaml")
     g.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
@@ -321,13 +325,19 @@ _FLAG_PATHS = {
 def build_config(args, verbose: bool = True) -> dict:
     """Resolve parsed args into a validated config.
 
-    Precedence: default_config < --config < --ladder < flags < --set.
+    Precedence: default_config < --config (in order) < --ladder < flags < --set.
     """
     cfg = default_config()
     cfg = merge_config(cfg, {"recipe": args.recipe})
 
-    if args.config:
-        cfg = merge_config(cfg, load_config_file(args.config))
+    # --config is repeatable: every file merges in order, so a machine-local
+    # paths file composes with an ablation arm and the later file wins on any
+    # key both set. A single str is accepted for callers that bypass argparse.
+    config_files = args.config or []
+    if isinstance(config_files, str):
+        config_files = [config_files]
+    for path in config_files:
+        cfg = merge_config(cfg, load_config_file(path))
 
     if args.ladder is not None:
         overrides, desc, note = ladder_overrides(args.recipe, args.ladder)

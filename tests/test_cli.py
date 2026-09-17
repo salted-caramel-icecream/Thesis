@@ -7,6 +7,7 @@ precedence order is default < --config < --ladder < flags < --set.
 from __future__ import annotations
 
 import json
+import pathlib
 import tempfile
 
 from pvt_moe.cli import _FLAG_PATHS, build_config, build_parser, describe
@@ -335,7 +336,10 @@ def test_every_shipped_config_file_resolves():
 
     from pvt_moe.cli import load_config_file
 
-    files = sorted(pathlib.Path("configs").glob("*.yaml"))
+    # *.local.yaml are gitignored machine-path files; alone they resolve to the
+    # default arm and may legitimately collide with a ladder row, so skip them.
+    files = sorted(f for f in pathlib.Path("configs").glob("*.yaml")
+                   if not f.name.endswith(".local.yaml"))
     assert len(files) >= 18, f"expected the full ladder, found {len(files)}"
     names = {}
     for f in files:
@@ -344,6 +348,63 @@ def test_every_shipped_config_file_resolves():
         names.setdefault(cfg["run_name"], []).append(f.name)
     dupes = {k: v for k, v in names.items() if len(v) > 1}
     assert not dupes, f"config files collide on run_name: {dupes}"
+
+
+def test_two_config_files_compose_in_order_and_later_wins():
+    """--config is repeatable: a machine-local paths file composes with an
+    ablation arm, and the later file wins on any key both set."""
+    import os
+    import tempfile
+
+    import yaml
+
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.yaml")
+        b = os.path.join(d, "b.yaml")
+        pathlib.Path(a).write_text(yaml.safe_dump(
+            {"checkpoint_root": "/tmp/a_ckpt", "epochs": 7}))
+        pathlib.Path(b).write_text(yaml.safe_dump(
+            {"epochs": 11, "model": {"dense_dwconv": False}}))
+
+        c = _cfg("--config", a, "--config", b)
+        assert c["checkpoint_root"] == "/tmp/a_ckpt"      # only a sets it
+        assert c["epochs"] == 11                           # b came later
+        assert c["model"]["dense_dwconv"] is False
+
+        c = _cfg("--config", b, "--config", a)
+        assert c["epochs"] == 7                            # a came later
+        assert c["checkpoint_root"] == "/tmp/a_ckpt"
+        assert c["model"]["dense_dwconv"] is False
+
+        c = _cfg("--config", a)                            # a single file still works
+        assert c["epochs"] == 7 and c["checkpoint_root"] == "/tmp/a_ckpt"
+
+
+def test_local_config_files_are_excluded_from_the_shipped_sweep():
+    """A gitignored configs/*.local.yaml holds only machine paths, so alone it
+    resolves to the default arm and collides with scratch_04 on run_name. The
+    shipped-config sweeps must skip it instead of failing the suite."""
+    import test_variants
+
+    local = pathlib.Path("configs") / "_wf_tmp.local.yaml"
+    assert not local.exists(), local
+    local.write_text(
+        "dataset:\n  arrow_dirs:\n    imagenet-1k: /tmp/wf_arrow\n"
+        "checkpoint_root: /tmp/wf_ckpt\nlog_root: /tmp/wf_logs\n")
+    try:
+        # It collides with row 4 by construction ...
+        assert _cfg("--config", str(local))["run_name"] == \
+            _cfg("--config", "configs/scratch_04_moe_shared.yaml")["run_name"]
+        # ... and both sweeps must still pass.
+        test_every_shipped_config_file_resolves()
+        test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
+    finally:
+        local.unlink()
+
+
+def test_local_configs_are_gitignored():
+    lines = [ln.strip() for ln in pathlib.Path(".gitignore").read_text().splitlines()]
+    assert "configs/*.local.yaml" in [ln for ln in lines if ln and not ln.startswith("#")]
 
 
 def test_yaml_and_json_configs_are_equivalent():

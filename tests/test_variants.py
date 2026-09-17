@@ -229,7 +229,10 @@ def test_ladder_rows_land_on_the_last_block_under_b2():
 
 
 def test_shipped_yaml_configs_land_on_the_last_block_under_b2():
-    files = sorted(glob.glob("configs/*.yaml"))
+    # *.local.yaml are gitignored machine-path files; alone they resolve to the
+    # default arm and may legitimately collide with a ladder row, so skip them.
+    files = sorted(f for f in glob.glob("configs/*.yaml")
+                   if not f.endswith(".local.yaml"))
     assert len(files) >= 20, files
     for f in files:
         c = _cli("--config", f, "--variant", "b2")

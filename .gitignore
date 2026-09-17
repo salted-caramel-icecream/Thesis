@@ -5,3 +5,6 @@ __pycache__/
 
 # throwaway throughput runs from notebooks/quick_bench.ipynb
 bench_runs/
+
+# machine-local path configs (compose with --config; never commit machine paths)
+configs/*.local.yaml

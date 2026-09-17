@@ -280,8 +280,14 @@ recipe**, so the command line stays short and `docs/HPARAMS.md` remains the
 source of truth. Precedence, lowest to highest:
 
 ```
-default_config()  <  --config file.yaml  <  --ladder N  <  named flags  <  --set a.b=v
+default_config()  <  --config a.yaml  <  --config b.yaml  <  --ladder N  <  named flags  <  --set a.b=v
 ```
+
+`--config` may be repeated: the files merge in order and a later file wins on
+any key both set. Put machine paths (`dataset.arrow_dirs`, `checkpoint_root`,
+`log_root`) in `configs/my_paths.local.yaml` (gitignored, see `docs/GUIDE.md`)
+and compose it with an arm file — never run the paths file alone, since alone
+it is the default arm and would share row 4's checkpoint directory.
 
 ```bash
 python train.py --recipe scratch --epochs 300          # final run
@@ -291,6 +297,7 @@ python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
+python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
