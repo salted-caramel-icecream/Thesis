@@ -1,0 +1,36 @@
+# BENCH — N=4, stages 3 & 4, 5 epochs
+# Timing / smoke arm mirroring scratch_08_moe_s3s4.yaml. NOT a thesis result.
+#
+#   python train.py --config configs/bench_08_moe_s3s4_5ep.yaml                  # b1 (default)
+#   python train.py --config configs/bench_08_moe_s3s4_5ep.yaml --variant b0
+#   python train.py --config configs/bench_08_moe_s3s4_5ep.yaml --variant b2
+#
+# Five full epochs with validation and logging on, so this measures real
+# per-epoch wall clock and proves the arm builds, trains and logs before any
+# long run is launched. `--variant` is a flag, so one file covers b0/b1/b2 and
+# each size gets its own run name.
+#
+# Logged to a SEPARATE W&B project so 5-epoch smoke runs never land next to
+# thesis results. drop_path resolves to 0.1 (the <200-epoch value), the same
+# as the 90-epoch rows.
+#
+# For pure throughput without W&B or checkpoints, notebooks/quick_bench.ipynb
+# caps batches per epoch and extrapolates instead.
+
+recipe: "scratch"
+epochs: 5
+wandb_project: "pvt-moe-bench"
+model:
+  moe: {num_experts: 4, shared_expert: true}
+  ablation:
+    use_moe: true
+    moe_placement:
+    - []
+    - []
+    - [-1]
+    - [-1]
+    rope_placement:
+    - []
+    - []
+    - [-1]
+    - [-1]

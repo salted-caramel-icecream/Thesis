@@ -1,0 +1,25 @@
+# Dense, no DWConv, no RoPE — 300-epoch schedule, stopped at 100
+# Base arm (scratch ladder row 6) on the long schedule — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/scratch_06_dense_nodwconv_norope_300ep_stop100.yaml
+#
+# Same architecture as scratch_06_dense_nodwconv_norope.yaml; only the budget
+# differs. `epochs` is the SCHEDULE (the cosine is built for 300) and
+# `stop_at_epoch` is where this session gets off. Resume with the SAME
+# `epochs: 300` and --resume-from .../milestone-epoch100.ckpt.
+#
+# NOTE: neither positional mechanism, so this is the ablation floor for the
+# NOTE: position axis: rows 1, 2 and 6 differ only in dense_dwconv/use_rope.
+#
+# NOTE: drop_path resolves to 0.15 here, not the 0.1 of the 90-epoch row.
+# NOTE: Compare this arm only against the other 300-epoch arms.
+
+recipe: "scratch"
+epochs: 300
+stop_at_epoch: 100
+milestones: [100, 150, 200, 300]
+model:
+  dense_dwconv: false
+  ablation:
+    use_moe: false
+    use_rope: false

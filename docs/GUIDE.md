@@ -315,6 +315,90 @@ Two rules make this safe, both covered by `tests/test_resume.py`:
 Milestones count *completed* epochs: milestone 90 fires when the 90th epoch
 finishes, and the file is `milestone-epoch090.ckpt`.
 
+### Shipped 300-epoch arms
+
+Every scratch arm ships twice: the ladder row at its documented 90-epoch
+budget, and a `_300ep_stop100` sibling that builds the cosine for 300 and
+stops at 100.
+
+```bash
+python train.py --config configs/scratch_01_baseline_conv_ffn.yaml            # 90 ep
+python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
+```
+
+The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
+`[100, 150, 200, 300]`, so a resume needs no edit. Two consequences:
+
+- Stochastic depth is **0.15**, not the 0.1 of the 90-epoch rows
+  (`scratch_drop_path` derives it from the budget). A 300-epoch arm is
+  comparable to other 300-epoch arms, never to a 90-epoch row.
+- Run names end in `_scratch300` rather than `_scratch90`, so the two budgets
+  never share a checkpoint directory or a W&B name.
+
+Ladder row 4 has **no** `_300ep_stop100` file: row 4 is the default
+architecture, so row 4 at 300 epochs *is* row 5, byte for byte. Stop it at 100
+with the flag instead, and the resume continues the same directory:
+
+```bash
+python train.py --config configs/scratch_05_final_300ep.yaml --stop-at 100
+```
+
+### 5-epoch timing / smoke runs
+
+`configs/bench_*_5ep.yaml` mirrors each scratch arm at a 5-epoch budget with
+validation and logging on, for measuring per-epoch wall clock and proving an
+arm builds, trains and logs before a long run is launched. They log to the
+`pvt-moe-bench` W&B project, never next to thesis results.
+
+`--variant` is a flag, so one file covers every size and each size gets its
+own run name:
+
+```bash
+python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b0
+python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b1
+python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b2
+```
+
+The whole matrix, 11 arms x 3 sizes = 33 runs:
+
+```bash
+for v in b0 b1 b2; do
+  for c in configs/bench_*_5ep.yaml; do
+    python train.py --config "$c" --variant "$v"
+  done
+done
+```
+
+### quick_bench.ipynb
+
+For pure throughput with no W&B and no checkpoints, `notebooks/quick_bench.ipynb`
+times one size on **this** machine and extrapolates the calendar:
+
+```bash
+jupyter lab notebooks/quick_bench.ipynb     # or: jupyter notebook
+```
+
+Edit the **CONFIG cell** and run all. The knobs that matter:
+
+| | |
+|---|---|
+| `VARIANT` | `"b0"` … `"b5"` — one size per run, so re-run the notebook per size |
+| `EPOCHS` | epochs to time (default 5) |
+| `LIMIT_TRAIN_BATCHES` | `None` times full epochs (45–85 min each for B1 on a 5070); `200` times 200 batches and extrapolates from the measured images/s — a throughput check in minutes |
+| `USE_MOE` | `False` for the dense baseline |
+| `BACKEND` | `"native"` if Tutel is not built |
+| `DATA_DIR` | Arrow snapshot; `None` keeps the config default |
+
+It prints per-epoch wall clock, steady-state images/s, peak VRAM and the
+projected 90/150/300-epoch days, plus the equivalent `train.py` command line.
+Checkpoints and logs go to `bench_runs/` and W&B is off, so nothing it writes
+can be mistaken for a result.
+
+It varies **one** axis at a time, though: `USE_MOE` is a single switch and the
+size is fixed per run. To time every arm instead, use the
+`configs/bench_*_5ep.yaml` sweep above, which logs each arm under its own run
+name.
+
 ---
 
 ## 5. Sizing it for your GPU
