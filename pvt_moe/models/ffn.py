@@ -336,3 +336,22 @@ class MoEMlp(nn.Module):
             # H/W for its DWConv, which the flattened routed path cannot use.
             out = out + self.shared_expert(x, H, W)
         return self.drop(out), aux
+
+
+def force_tutel_gates_train(model: nn.Module) -> None:
+    """Put every Tutel gate back into train mode (LOAD-BEARING).
+
+    Tutel gate modules revert themselves to eval mode after a Lightning
+    validation pass, silently disabling ``gate_noise`` and with it the
+    exploration that keeps the experts balanced. Both training modules call
+    this from ``train()`` and ``on_train_epoch_start``; do not remove.
+    """
+    for module in model.modules():
+        if hasattr(module, "moe_layer"):
+            module.moe_layer.train()
+            for gate in getattr(module.moe_layer, "gates", []):
+                if hasattr(gate, "train"):
+                    gate.train()
+                gate.training = True
+        if hasattr(module, "gate_noise"):
+            module.training = True

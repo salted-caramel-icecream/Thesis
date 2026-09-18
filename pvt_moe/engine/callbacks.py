@@ -9,6 +9,8 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import Checkpoint, LearningRateMonitor, ModelCheckpoint
 
+from pvt_moe.engine.results import ResultsWriter
+
 
 class MilestoneCheckpoint(pl.Callback):
     """Write a permanent full-state checkpoint at given epoch counts.
@@ -254,6 +256,8 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         RopeFreqSnapshot(ckpt_dir),
         LearningRateMonitor(logging_interval="epoch"),
         PrintEpochMetrics(),
+        # results.json / results.md in the run directory, every epoch.
+        ResultsWriter(cfg, ckpt_dir),
     ]
     if cfg.get("milestones"):
         callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
@@ -284,8 +288,10 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
     )
 
 
-def build_ssl_trainer(cfg: dict) -> pl.Trainer:
-    """Trainer for JEPA pretraining: monitors ``ssl_loss`` (no val loop)."""
+def build_ssl_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
+    """Trainer for SSL pretraining (SimMIM / JEPA): monitors ``ssl_loss``, no
+    val loop. Same checkpoint files as the supervised trainer (``last.ckpt``,
+    milestones, RoPE frequency snapshots, results.json)."""
     ckpt_dir = os.path.join(cfg["checkpoint_root"], cfg["run_name"])
     checkpoint_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
@@ -296,8 +302,17 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         auto_insert_metric_name=False,
         filename="epoch{epoch:03d}-loss{ssl_loss:.4f}",
     )
+    callbacks = [checkpoint_cb, RollingCheckpoint(ckpt_dir), RopeFreqSnapshot(ckpt_dir),
+                 LearningRateMonitor(logging_interval="step"), ResultsWriter(cfg, ckpt_dir)]
+    if cfg.get("milestones"):
+        callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
+    # The schedule is built for ssl.epochs; stop_at_epoch only ends the run
+    # early, exactly as in the supervised trainer.
+    max_epochs = cfg.get("stop_at_epoch") or cfg["ssl"]["epochs"]
     return pl.Trainer(
-        max_epochs=cfg["ssl"]["epochs"],
+        max_epochs=max_epochs,
         accelerator="auto",
         devices=1,
         precision=cfg["precision"] if torch.cuda.is_available() else 32,
@@ -310,8 +325,8 @@ def build_ssl_trainer(cfg: dict) -> pl.Trainer:
         # nondeterministic-op warnings into mid-run crashes.
         deterministic=("warn" if cfg["deterministic"] else None),
         benchmark=not cfg["deterministic"],
-        callbacks=[checkpoint_cb, RollingCheckpoint(ckpt_dir),
-                   LearningRateMonitor(logging_interval="step")],
+        callbacks=callbacks,
         logger=build_loggers(cfg),
         log_every_n_steps=50,
+        **{k: cfg[k] for k in ("limit_train_batches",) if cfg.get(k) is not None},
     )

@@ -7,7 +7,8 @@ literally — if a default drifts, a test fails by name.
 Pick a path with one key:
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})     # or "pretrained"
+cfg = merge_config(default_config(), {"recipe": "scratch"})     # "pretrained" | "ssl_finetune" | "downstream"
+cfg = merge_config(default_config(), {"task": "ssl", "dataset": {"name": "pass"}})   # SimMIM pretraining (§3b)
 ```
 
 A recipe fills only fields left as `None`. **Anything you set explicitly
@@ -260,7 +261,7 @@ stay identical — `test_spec_pretrained_deltas` asserts that.
 | Warmup | 5 | 3 | ViMoE's CIFAR-100 config |
 | Stochastic depth | 0.1 (+0.05 @ 300) | 0.1 ("as pretraining") | CSWin: keeping the training-stage ratio helps fine-tuning |
 | Differential LR for router/experts | n/a | **none** | Sparse Upcycling B.9: modifying expert/router LR generally hurt |
-| Layer-wise LR decay | n/a | none | Swin V2's classification fine-tune uses none |
+| Layer-wise LR decay | n/a | none (the SSL chain's `ssl_finetune` / `downstream` recipes use 0.9 — §3b) | Swin V2's classification fine-tune uses none |
 | Weight decay | 0.05 | 0.05 | ViMoE keeps 0.05 |
 | Batch size, optimizer, schedule, aug | — | unchanged | Sparse Upcycling |
 
@@ -367,6 +368,79 @@ would zero the block's entire output. A recipe sets the value globally, so
 inheriting one it cannot use resolves rather than failing.
 
 ---
+
+## 3b. The SSL chain: pretraining (`task: "ssl"`), intermediate fine-tune, downstream
+
+Full rationale, the overlapping-stem leak, the three pretraining paths and
+the evaluation protocol: `docs/SIMMIM_GUIDE.md`. Values below are what
+`pvt_moe/config.py` encodes (`SSL_METHOD_DEFAULTS`, `RECIPES["ssl_finetune"]`,
+`RECIPES["downstream"]`, `DATASETS[...]["finetune_epochs"]`); `tests/
+test_cli_ssl.py`, `tests/test_simmim.py` and `tests/test_layer_decay.py`
+assert them.
+
+### SSL pretraining — SimMIM (default) and JEPA
+
+The **linear scaling rule** applies to every SSL LR: `lr = base_lr ×
+effective_batch / lr_reference_batch`, and the same factor scales the warmup
+and final LRs (SimMIM `main_simmim.py`). The module prints the base, the
+factor and the result at startup (`[ssl] method simmim | base_lr 2.00e-04 x
+(1024 / 512) -> lr 4.00e-04 | …`). Set `ssl.lr` explicitly to bypass it.
+
+| Parameter | SimMIM (`ssl.method: "simmim"`) | JEPA (`"jepa"`) | Config key | Basis |
+|---|---|---|---|---|
+| Epochs | **200** (100 quick / 800 paper) | 100 | `ssl.epochs` (`--epochs` under `--task ssl`) | choice for a 25M backbone; SimMIM's Swin-B config is 100, headline 800 |
+| Base LR / reference batch | 2e-4 @ **512** → 4e-4 at 1024 | 1.5e-3 @ 2048 → 7.5e-4 at 1024 | `ssl.base_lr`, `ssl.lr_reference_batch` | SimMIM yaml `BASE_LR`; I-JEPA |
+| Warmup | 10 ep from 1e-6 (scaled) | 15 ep from 0 | `ssl.warmup_epochs`, `ssl.warmup_lr` | SimMIM yaml `WARMUP_EPOCHS`, `WARMUP_LR` |
+| Final LR | 1e-5 (scaled), cosine per step | 1e-6 | `ssl.final_lr` | SimMIM yaml `MIN_LR` |
+| Optimizer | AdamW β (0.9, 0.999), wd 0.05 | AdamW β (0.9, 0.95), wd 0.04 → 0.4 cosine | `ssl.betas`, `ssl.weight_decay` | SimMIM `config.py`; I-JEPA |
+| Gradient clipping | 5.0 | 3.0 | `ssl.grad_clip` | SimMIM `CLIP_GRAD`; I-JEPA |
+| Stochastic depth | **0.0** | 0.0 | `model.drop_path_rate` (derived for `task: ssl` when unset) | SimMIM pretrain yaml `DROP_PATH_RATE 0.0` (0.1 is its fine-tune value); MAE / I-JEPA pretrain without it |
+| Mask | 32-px patches, ratio 0.6, `mask_space` token | multi-block on the 7×7 grid | `ssl.mask_patch_size`, `ssl.mask_ratio`, `ssl.mask_space` | SimMIM `MaskGenerator`; I-JEPA |
+| Head / loss | 1×1 conv + PixelShuffle(32); masked L1 / in_chans | ViT predictor; smooth-L1 on EMA features | — | SimMIM `models/simmim.py`; I-JEPA |
+| Augmentation | RRC (0.67–1) + flip | RRC (0.3–1) + flip | `data.SSL_CROP_SCALE` | SimMIM `SimMIMTransform` |
+| MoE | as configured (dense by default; `--moe` = path 2) | dense only | `model.ablation.use_moe` | `docs/SIMMIM_GUIDE.md` §4 |
+| Resolution | 224 | 224 | `dataset.img_size` | brief: 224 throughout |
+
+### Intermediate fine-tune (`recipe: "ssl_finetune"`) and downstream (`recipe: "downstream"`)
+
+SSL → **supervised ImageNet-1k** → downstream is the chain (SwinV2 §4.2 /
+A2.2, BEiT; `docs/SIMMIM_GUIDE.md` §5). Both recipes use SimMIM's 100-epoch
+fine-tune values (`simmim_finetune__swin_base__img224_window7__100ep.yaml`);
+only the optimization block differs from `scratch` / `pretrained`.
+
+| Parameter | `ssl_finetune` | `downstream` | Config key | Basis |
+|---|---|---|---|---|
+| Init | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone, or any `last.ckpt`) | `ssl_init` from `--ckpt` (usually the fine-tune's `last.ckpt`) | `mode`, `ckpt_path` | |
+| Epochs | 100 | **fixed per dataset**: fashionmnist 30, eurosat 50, pathmnist 30 | `epochs` ← `DATASETS[...]["finetune_epochs"]` | SimMIM 100-ep FT; small sets train in an hour, an open-ended budget overruns |
+| Base LR | 1.25e-3 @ 512 → 2.5e-3 at 1024 | same | `optim.base_lr`, `optim.lr_reference_batch` | SimMIM yaml `BASE_LR 1.25e-3` |
+| Warmup | 20 ep | 5 ep | `optim.warmup_epochs` | SimMIM yaml `WARMUP_EPOCHS 20`; short budgets |
+| Layer-wise LR decay | **0.9** | 0.9 | `optim.layer_decay` (`--layer-decay`; 1.0 = off) | SimMIM yaml `LAYER_DECAY 0.9` at 100-ep pretrain; reasoning below |
+| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | SimMIM finetune yaml |
+| Stage-4 LR multiplier | 1.0 | 1.0 | `optim.stage4_lr_multiplier` | as the other recipes |
+| MoE at fine-tune | path 2 loads the pretrained experts as trained; path 3 upcycles from the encoder's FFN (`routed_zero`) | same | `model.moe.upcycle_init` | `docs/HPARAMS.md` §3, `SIMMIM_GUIDE.md` §4 |
+| Everything else | unchanged (batch 1024, wd 0.05, clip 5, DeiT-1 aug) | unchanged | | |
+
+**Layer decay 0.9 at 200 epochs.** SimMIM fine-tunes with layer decay 0.9
+after its 100-epoch pretrain and, per its §4.3 ablation, tightens it for the
+800-epoch runs — 0.8 for Swin-B, 0.75 for Swin-L, 0.7 for SwinV2-H: longer
+and larger pretraining, more protection of the early layers. A 200-epoch
+pretrain of a 14–25M backbone is between the two regimes on length and below
+both on size, so the conservative end (0.9) is the consistent choice; it
+scales the stage-1 patch embed's LR by `0.9^(sum(depths)+1)` = 0.39 (B1) /
+0.17 (B2) relative to the head. `LitClassifier.layer_id_of` maps PVT v2's
+attribute names onto the BEiT/SimMIM layer ids (stage-1 embed 0; block *j*
+of stage *i* = 1 + blocks before it; later embeds and stage norms ride the
+last block before them; final norm + head on top).
+
+**Expected effect size.** SimMIM's supervised-vs-pretrained comparison, as
+quoted in the brief (the PDF was not available to re-verify): +2.1 / +2.4
+Swin-B (88M), +2.9 / +3.5 Swin-L (197M), +4.2 / +4.4 SwinV2-H (658M). At
+14–25M a gain below +2.1, or none, is the plausible and publishable outcome
+(`SIMMIM_GUIDE.md` §7).
+
+**Linear probe / k-NN are collapse detectors** for a MIM encoder, expected to
+read low; the headline of an SSL arm is the fine-tuned top-1
+(`SIMMIM_GUIDE.md` §6).
 
 ## 4. Ablation ladders
 

@@ -89,14 +89,31 @@ def test_jepa_end_to_end_cpu():
     assert all(p.grad is None for p in jepa.target.parameters())
 
 
-def test_ssl_backbone_forces_moe_off():
-    cfg = tiny_config(model={"ablation": {"use_moe": True,
-                                          "moe_placement": [[], [], [], [0, 1]]}})
-    backbone = build_ssl_backbone(cfg)  # must not require tutel
+def test_ssl_backbone_honours_use_moe():
+    """The SSL encoder is cfg's backbone with no head: dense when MoE is off,
+    routed when it is on (path 2 of the three-path ablation). JEPA itself
+    stays dense and says so."""
+    from helpers import install_fake_tutel_backend
     from pvt_moe.models.ffn import MoEMlp
 
-    assert not any(isinstance(m, MoEMlp) for m in backbone.modules())
-    assert isinstance(backbone.head, torch.nn.Identity)
+    dense = build_ssl_backbone(tiny_config())            # tiny_config: MoE off
+    assert not any(isinstance(m, MoEMlp) for m in dense.modules())
+    assert isinstance(dense.head, torch.nn.Identity)
+    undo = install_fake_tutel_backend()
+    try:
+        cfg = tiny_config(model={"ablation": {"use_moe": True,
+                                              "moe_placement": [[], [], [], [-1]]}})
+        moe = build_ssl_backbone(cfg)
+        assert sum(isinstance(m, MoEMlp) for m in moe.modules()) == 1
+        assert isinstance(moe.head, torch.nn.Identity)
+        try:
+            LitJEPA(cfg)
+        except ValueError as e:
+            assert "DENSE" in str(e) and "simmim" in str(e)
+        else:
+            raise AssertionError("LitJEPA must refuse a MoE encoder")
+    finally:
+        undo()
 
 
 def test_partial_ssl_config_backfills_defaults():
@@ -106,7 +123,10 @@ def test_partial_ssl_config_backfills_defaults():
     cfg["ssl"] = {"epochs": 5, "lr": 3e-4}  # partial override, no final_lr etc.
     jepa = LitJEPA(cfg)
     assert jepa.ssl["epochs"] == 5 and jepa.ssl["lr"] == 3e-4  # user wins
-    assert jepa.ssl["final_lr"] == 1e-6                        # backfilled
+    # backfilled from the jepa row and scaled by the same linear rule as the
+    # peak LR (SimMIM scales peak, warmup and minimum together)
+    eff = cfg["effective_batch_size"]
+    assert jepa.ssl["final_lr"] == 1e-6 * eff / 2048
     assert jepa.ssl["predictor_dim"] == 384                    # backfilled
 
 

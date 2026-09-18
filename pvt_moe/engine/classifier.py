@@ -15,6 +15,16 @@ Carries the v9 lineage's load-bearing training semantics:
 - **Discriminative LR + weight-decay hygiene**: 4 parameter groups —
   {stages 1-3, stage 4 + head} x {decay, no-decay}, where the no-decay split
   is the timm rule (``p.ndim <= 1``: biases and all norm weights).
+- **Layer-wise LR decay** (``optim.layer_decay`` < 1, the ssl_finetune /
+  downstream recipes): every block's LR is the peak scaled by
+  ``decay ** (top - layer_id)`` compounding from the head down, the scheme of
+  BEiT / SimMIM fine-tuning (``microsoft/SimMIM optimizer.py
+  get_swin_layer``, mapped onto PVT v2's attribute names in
+  ``layer_id_of``). ``1.0`` keeps the 4-group layout above byte-for-byte.
+- **Chain provenance**: a warm start prepends the parent checkpoint's
+  ``chain`` (an SSL run's stage tag) or the HF id to ``cfg["chain"]`` BEFORE
+  the hyperparameters are saved, so the checkpoint and results.json name the
+  whole path that produced the run.
 
 The mixup pipeline follows DeiT/Swin practice: timm ``Mixup`` (mixup+cutmix,
 label smoothing inside) with ``SoftTargetCrossEntropy`` for training and
@@ -26,6 +36,7 @@ against ``argmax`` of the soft targets — a proxy that reads low; use
 from __future__ import annotations
 
 import gc
+import re
 
 import pytorch_lightning as pl
 import torch
@@ -37,7 +48,8 @@ from torchmetrics.classification import (
     MulticlassRecall,
 )
 
-from pvt_moe.models.pretrained import load_backbone_checkpoint, load_hf_pretrained
+from pvt_moe.models.ffn import force_tutel_gates_train
+from pvt_moe.models.pretrained import _checkpoint_cfg, load_backbone_checkpoint, load_hf_pretrained
 from pvt_moe.models.pvt import build_model
 
 
@@ -47,12 +59,12 @@ class LitClassifier(pl.LightningModule):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-        # cfg is JSON-safe by construction (validate_config enforces it), so
-        # it can be checkpointed / logged verbatim.
-        self.save_hyperparameters({"cfg": cfg})
-
         self.model = build_model(cfg)
-        self._apply_warm_start()
+        self._apply_warm_start()          # may prepend the parent's chain
+        # cfg is JSON-safe by construction (validate_config enforces it), so
+        # it can be checkpointed / logged verbatim — saved AFTER the warm
+        # start so the stored copy carries the full provenance chain.
+        self.save_hyperparameters({"cfg": cfg})
 
         self._uses_tutel_moe = (
             cfg["model"]["ablation"]["use_moe"]
@@ -127,32 +139,51 @@ class LitClassifier(pl.LightningModule):
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"),
             )
+            self._extend_chain([f"hf_pretrained@{cfg['model']['pretrained_hf_id']}"])
         elif mode == "ssl_init":
-            load_backbone_checkpoint(
+            stats = load_backbone_checkpoint(
                 self.model, cfg["ckpt_path"], skip_head=True, expected_cfg=cfg,
                 check_arch=cfg["model"].get("ssl_init_check_arch", True),
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"))
-        # mode == "scratch": nothing; mode == "resume": Lightning restores
-        # the full state via trainer.fit(ckpt_path=...).
+            self._extend_chain(stats.get("parent_chain") or [])
+        elif mode == "resume":
+            # Lightning restores the full state in trainer.fit(ckpt_path=...);
+            # only the provenance is read here, so a resumed run keeps the
+            # chain its earlier epochs recorded.
+            try:
+                parent = _checkpoint_cfg(torch.load(cfg["ckpt_path"], map_location="cpu",
+                                                    weights_only=False)) or {}
+            except Exception as e:  # the fit itself will report a bad file
+                print(f"[chain] could not read the resume checkpoint's config: {e}")
+                parent = {}
+            saved = list(parent.get("chain") or [])
+            own = self.cfg["chain"][-1] if self.cfg.get("chain") else None
+            if saved and saved[-1] == own:
+                self.cfg["chain"] = saved          # the same stage, continued
+                print("[chain] " + " -> ".join(self.cfg["chain"]))
+            else:
+                self._extend_chain(saved)
+        # mode == "scratch": nothing to load and nothing before this stage.
 
         n_frozen = cfg["model"]["num_frozen_stages"]
         if n_frozen > 0:
             self.model.freeze_stages(n_frozen)
             print(f"[freeze] Stages 1..{n_frozen} frozen")
 
+    def _extend_chain(self, parent: list) -> None:
+        """Prepend the parent stage(s) to ``cfg["chain"]`` unless already there."""
+        chain = list(self.cfg.get("chain") or [])
+        parent = list(parent)
+        if parent and chain[: len(parent)] != parent:
+            chain = parent + chain
+        self.cfg["chain"] = chain
+        print("[chain] " + " -> ".join(chain))
+
     # -- tutel gate forcing (load-bearing) -------------------------------------
 
     def _force_tutel_gates_train(self):
-        for module in self.model.modules():
-            if hasattr(module, "moe_layer"):
-                module.moe_layer.train()
-                for gate in getattr(module.moe_layer, "gates", []):
-                    if hasattr(gate, "train"):
-                        gate.train()
-                    gate.training = True
-            if hasattr(module, "gate_noise"):
-                module.training = True
+        force_tutel_gates_train(self.model)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -177,11 +208,38 @@ class LitClassifier(pl.LightningModule):
 
     # -- optimization -----------------------------------------------------------
 
+    def layer_id_of(self, name: str) -> int:
+        """Layer id of a backbone parameter for layer-wise LR decay.
+
+        The SimMIM / BEiT scheme (``microsoft/SimMIM optimizer.py``,
+        ``get_swin_layer``) on PVT v2's names: the stage-1 patch embed is
+        layer 0; block ``j`` of stage ``i`` is ``1 + sum(depths[:i-1]) + j``;
+        a later patch embed and a stage's output norm take the id of the last
+        block BEFORE them (Swin's downsample rule); the final norm and the
+        head sit on top (``sum(depths) + 1``), where the scale is 1.
+        """
+        depths = self.model.depths
+        top = sum(depths) + 1
+        m = re.match(r"block(\d+)\.(\d+)\.", name)
+        if m:
+            stage, j = int(m.group(1)), int(m.group(2))
+            return 1 + sum(depths[: stage - 1]) + j
+        m = re.match(r"patch_embed(\d+)\.", name)
+        if m:
+            stage = int(m.group(1))
+            return 0 if stage == 1 else sum(depths[: stage - 1])
+        m = re.match(r"norm(\d+)\.", name)
+        if m:
+            stage = int(m.group(1))
+            return top if stage == self.model.num_stages else sum(depths[:stage])
+        return top                                    # head, anything else
+
     def configure_optimizers(self):
         opt_cfg = self.cfg["optim"]
         base_lr = opt_cfg["lr"]
         mult = opt_cfg["stage4_lr_multiplier"]
         wd = opt_cfg["weight_decay"]
+        layer_decay = opt_cfg.get("layer_decay") or 1.0
 
         last = self.model.num_stages
         stage4_ids = set()
@@ -190,30 +248,56 @@ class LitClassifier(pl.LightningModule):
             if module is not None:
                 stage4_ids.update(id(p) for p in module.parameters())
 
-        groups = {"s123_decay": [], "s123_nodecay": [], "s4_decay": [], "s4_nodecay": []}
         no_decay_names = self.model.no_weight_decay()   # RoPE-Mixed freqs
-        for name, p in self.model.named_parameters():
-            if not p.requires_grad:
-                continue
-            part = "s4" if id(p) in stage4_ids else "s123"
-            # biases + norm weights (timm rule) plus the model's own list.
-            nodecay = p.ndim <= 1 or name in no_decay_names
-            groups[f"{part}_{'nodecay' if nodecay else 'decay'}"].append(p)
+        if layer_decay == 1.0:
+            groups = {"s123_decay": [], "s123_nodecay": [], "s4_decay": [], "s4_nodecay": []}
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                part = "s4" if id(p) in stage4_ids else "s123"
+                # biases + norm weights (timm rule) plus the model's own list.
+                nodecay = p.ndim <= 1 or name in no_decay_names
+                groups[f"{part}_{'nodecay' if nodecay else 'decay'}"].append(p)
 
-        param_groups = [
-            {"params": groups["s123_decay"], "lr": base_lr, "weight_decay": wd,
-             "name": "stages123_decay"},
-            {"params": groups["s123_nodecay"], "lr": base_lr, "weight_decay": 0.0,
-             "name": "stages123_nodecay"},
-            {"params": groups["s4_decay"], "lr": base_lr * mult, "weight_decay": wd,
-             "name": "stage4_decay"},
-            {"params": groups["s4_nodecay"], "lr": base_lr * mult, "weight_decay": 0.0,
-             "name": "stage4_nodecay"},
-        ]
-        param_groups = [g for g in param_groups if g["params"]]
-        for g in param_groups:
-            print(f"[optimizer] {g['name']}: {len(g['params'])} tensors "
-                  f"@ lr={g['lr']:.2e} wd={g['weight_decay']}")
+            param_groups = [
+                {"params": groups["s123_decay"], "lr": base_lr, "weight_decay": wd,
+                 "name": "stages123_decay"},
+                {"params": groups["s123_nodecay"], "lr": base_lr, "weight_decay": 0.0,
+                 "name": "stages123_nodecay"},
+                {"params": groups["s4_decay"], "lr": base_lr * mult, "weight_decay": wd,
+                 "name": "stage4_decay"},
+                {"params": groups["s4_nodecay"], "lr": base_lr * mult, "weight_decay": 0.0,
+                 "name": "stage4_nodecay"},
+            ]
+            param_groups = [g for g in param_groups if g["params"]]
+            for g in param_groups:
+                print(f"[optimizer] {g['name']}: {len(g['params'])} tensors "
+                      f"@ lr={g['lr']:.2e} wd={g['weight_decay']}")
+        else:
+            top = sum(self.model.depths) + 1
+            by_key = {}
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                lid = self.layer_id_of(name)
+                part = "s4" if id(p) in stage4_ids else "s123"
+                nodecay = p.ndim <= 1 or name in no_decay_names
+                key = (lid, part, nodecay)
+                if key not in by_key:
+                    scale = layer_decay ** (top - lid)
+                    by_key[key] = {
+                        "params": [], "lr_scale": scale,
+                        "lr": base_lr * scale * (mult if part == "s4" else 1.0),
+                        "weight_decay": 0.0 if nodecay else wd,
+                        "name": f"layer{lid:02d}_{part}_{'nodecay' if nodecay else 'decay'}",
+                    }
+                by_key[key]["params"].append(p)
+            param_groups = [by_key[k] for k in sorted(by_key)]
+            lrs = [g["lr"] for g in param_groups]
+            print(f"[optimizer] layer_decay {layer_decay}: {top + 1} layer ids over "
+                  f"{sum(self.model.depths)} blocks, {len(param_groups)} groups | "
+                  f"lr {max(lrs):.2e} (head / final norm, scale 1) .. {min(lrs):.2e} "
+                  f"(stage-1 patch embed, scale {layer_decay ** top:.3f}) | wd {wd}")
 
         optimizer = torch.optim.AdamW(param_groups, betas=tuple(opt_cfg["betas"]))
 

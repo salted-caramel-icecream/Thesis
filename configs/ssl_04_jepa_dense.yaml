@@ -1,0 +1,16 @@
+# JEPA pretraining, dense encoder — the alternative SSL method
+# (docs/JEPA_GUIDE.md). Defaults from config.SSL_METHOD_DEFAULTS["jepa"]:
+# base_lr 1.5e-3 per 2048 scaled to the effective batch, warmup 15,
+# wd 0.04 -> 0.4, betas (0.9, 0.95), clip 3, EMA 0.996 -> 1.0.
+#
+#   python train.py --config configs/ssl_04_jepa_dense.yaml --data-dir /data/pass_arrow
+
+task: "ssl"
+dataset:
+  name: "pass"
+ssl:
+  method: "jepa"
+  epochs: 100
+model:
+  ablation:
+    use_moe: false

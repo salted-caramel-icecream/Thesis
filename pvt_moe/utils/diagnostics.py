@@ -13,6 +13,26 @@ import math
 import torch
 
 
+def gate_logits(moe_mlp, x_flat: torch.Tensor) -> torch.Tensor:
+    """Router logits ``(tokens, E)`` of one MoE layer on its actual input.
+
+    Tutel and the native backend keep the gate at ``moe_layer.gates[0].wg``;
+    megablocks' dMoE has ``router.layer``; the test suite's fake Tutel layer
+    carries a bare ``gate_wg`` weight.
+    """
+    layer = moe_mlp.moe_layer
+    if hasattr(layer, "gates"):
+        gate = layer.gates[0]
+        return gate.wg(x_flat.to(gate.wg.weight.dtype))
+    if hasattr(layer, "gate_wg"):
+        return x_flat.to(layer.gate_wg.dtype) @ layer.gate_wg.t()
+    # megablocks: dMoE.router is a LearnedRouter with a .layer Linear.
+    # Its weights are bf16 (never fp32) — cast the input to match.
+    router = layer.router
+    lin = getattr(router, "layer", router)
+    return lin(x_flat.to(lin.weight.dtype))
+
+
 @torch.no_grad()
 def expert_utilization(model, dataloader, num_batches: int = 50, device=None) -> dict:
     """Route ``num_batches`` of data and count tokens per expert per MoE block.
@@ -40,23 +60,13 @@ def expert_utilization(model, dataloader, num_batches: int = 50, device=None) ->
         name: torch.zeros(m.num_experts, dtype=torch.long) for name, m in moe_modules
     }
 
-    def _gate_logits(moe_mlp: MoEMlp, x_flat: torch.Tensor) -> torch.Tensor:
-        if moe_mlp.backend == "tutel":
-            gate = moe_mlp.moe_layer.gates[0]
-            return gate.wg(x_flat.to(gate.wg.weight.dtype))
-        # megablocks: dMoE.router is a LearnedRouter with a .layer Linear.
-        # Its weights are bf16 (never fp32) — cast the input to match.
-        router = moe_mlp.moe_layer.router
-        layer = getattr(router, "layer", router)
-        return layer(x_flat.to(layer.weight.dtype))
-
     hooks = []
 
     def _make_hook(name, moe_mlp):
         def hook(module, args):
             x = args[0]
             x_flat = x.reshape(-1, x.shape[-1])
-            idx = _gate_logits(moe_mlp, x_flat).argmax(dim=-1)
+            idx = gate_logits(moe_mlp, x_flat).argmax(dim=-1)
             counts[name] += torch.bincount(
                 idx.cpu(), minlength=moe_mlp.num_experts
             )

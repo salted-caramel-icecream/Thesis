@@ -1,4 +1,4 @@
-"""Image data pipeline (HF Arrow, map-style): ImageNet 1k / 22k, and PASS for SSL.
+"""Image data pipeline (HF Arrow, map-style): ImageNet 1k / 22k, PASS (SSL), small sets.
 
 Hard-won rules from this project's history (do not regress):
 
@@ -195,14 +195,40 @@ def build_datasets(cfg: dict):
 
     raw = DatasetDict.load_from_disk(arrow_dir)
     val_split = next((s for s in ("validation", "val") if s in raw), None)
+    if val_split is None and labelled and "test" in raw:
+        # A hand-built snapshot with train/test only. The per-epoch metric
+        # then IS the test split; with the fixed per-dataset epoch budget
+        # nothing is tuned on it, but the top-k checkpoint by val_acc is
+        # selected on it. download_data.py carves a seeded validation split
+        # for the small sets so this branch is never needed for them.
+        val_split = "test"
+        print(f"[data] WARNING: {ds_cfg['name']} snapshot has no validation split; using "
+              "'test' for the per-epoch metric. Rebuild with download_data.py (seeded "
+              "validation carve-out) for a clean protocol.")
 
     train_tf, val_tf = build_transforms(cfg)
     train_ds = HFImageDataset(raw["train"], transform=train_tf, labelled=labelled)
     val_ds = (HFImageDataset(raw[val_split], transform=val_tf, labelled=labelled)
               if val_split is not None else None)
     if labelled:
+        native = raw["train"][0][train_ds.image_key].size if len(train_ds) else None
         print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} val={len(val_ds):,} "
-              f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}')")
+              f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}', "
+              f"val split '{val_split}')")
+        if native is not None and max(native) < ds_cfg["img_size"]:
+            print(f"[data] native {native[0]}x{native[1]} images are UPSAMPLED to "
+                  f"{ds_cfg['img_size']}x{ds_cfg['img_size']} by the transforms: results on "
+                  "this dataset partly measure interpolation (docs/GUIDE.md).")
+        subset = ds_cfg.get("subset_file")
+        if subset:
+            from pvt_moe.eval.lowshot import load_subset
+
+            indices, meta = load_subset(subset, expect_dataset=ds_cfg["name"],
+                                        expect_len=len(train_ds))
+            train_ds = torch.utils.data.Subset(train_ds, indices)
+            print(f"[data] low-shot subset {subset}: {len(indices):,} of {meta['total']:,} train "
+                  f"images ({meta['fraction']:.1%}, seed {meta['seed']}, class-balanced); the "
+                  "validation split is untouched")
     else:
         print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} images, unlabelled | "
               f"snapshot features: {list(raw['train'].features)} | using only "
@@ -213,13 +239,21 @@ def build_datasets(cfg: dict):
     return train_ds, val_ds
 
 
+#: RandomResizedCrop scale range per SSL method. SimMIM: (0.67, 1) with the
+#: default 3/4-4/3 aspect range (microsoft/SimMIM data/data_simmim.py);
+#: JEPA: the wider (0.3, 1) this repo's I-JEPA recipe shipped with.
+SSL_CROP_SCALE = {"simmim": (0.67, 1.0), "jepa": (0.3, 1.0)}
+
+
 def build_ssl_transform(cfg: dict):
-    """JEPA pretraining transform: crop + flip ONLY (I-JEPA uses no heavy
-    augmentation — the masking objective supplies the invariance pressure)."""
+    """Pretraining transform: random resized crop + flip ONLY. Neither method
+    uses heavy augmentation — the masking objective supplies the pressure."""
     img_size = cfg["dataset"]["img_size"]
+    method = (cfg.get("ssl") or {}).get("method", "simmim")
+    scale = SSL_CROP_SCALE.get(method, SSL_CROP_SCALE["simmim"])
     return transforms.Compose(
         [
-            transforms.RandomResizedCrop(img_size, scale=(0.3, 1.0)),
+            transforms.RandomResizedCrop(img_size, scale=scale, ratio=(3.0 / 4.0, 4.0 / 3.0)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -231,19 +265,21 @@ def build_dataloaders(cfg: dict, ssl: bool | None = None):
     """(train_loader, val_loader) with the project's stable loader settings.
 
     ``ssl=True`` (default when ``cfg["task"] == "ssl"``) swaps the train
-    transform for the JEPA recipe (labels are still returned — the SSL module
-    ignores them; the val loader keeps the standard eval transform for linear
-    probing). ``val_loader`` is None when the corpus has no validation split.
+    transform for the SSL method's crop + flip recipe (labels are still
+    returned — the SSL module ignores them; the val loader keeps the standard
+    eval transform for linear probing). ``val_loader`` is None when the corpus
+    has no validation split.
     """
     if ssl is None:
         ssl = cfg.get("task") == "ssl"
     train_ds, val_ds = build_datasets(cfg)
     if ssl:
-        train_ds.transform = build_ssl_transform(cfg)
+        base = train_ds.dataset if isinstance(train_ds, torch.utils.data.Subset) else train_ds
+        base.transform = build_ssl_transform(cfg)
 
     # Repeated augmentation: a sampler, not a transform. Disabled for SSL —
-    # JEPA's objective already supplies the invariance pressure and seeing the
-    # same image 3x per batch would weaken the target signal.
+    # neither SimMIM nor JEPA uses it; the masking objective supplies the
+    # pressure and seeing the same image 3x per batch would weaken the signal.
     repeats = 1 if ssl else int(cfg["dataset"].get("repeated_aug", 1) or 1)
     train_sampler = None
     if repeats > 1:
