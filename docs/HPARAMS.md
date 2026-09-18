@@ -112,11 +112,10 @@ Three rules the code enforces:
 - **Placement is depth-independent.** The default `[[],[],[],[-1]]` is the
   last block of stage 4 whatever the depth (block 1 in B1, block 2 in B2);
   see §2.
-- **Stochastic depth is still derived by the B1-anchored rule above** (B1 and
-  B2 were both officially trained at 0.1, so the derivation is identical for
-  the two sizes this thesis uses). B3–B5 were trained at 0.3; the derivation
-  does not know that yet and prints the discrepancy — pass `--drop-path 0.3`
-  for those sizes until the rule is made variant-aware.
+- **Stochastic depth comes from the variant** (`config.variant_drop_path`):
+  0.1 for B0–B2, 0.3 for B3–B5, at any epoch budget. It used to be derived
+  from the budget, which gave B3–B5 0.1 and needed an explicit
+  `--drop-path 0.3`; see the reversal note in §1.
 
 B2-Linear is not a variant: linear (pooling) attention is `model.linear_attention`.
 
@@ -276,7 +275,7 @@ stay identical — `test_spec_pretrained_deltas` asserts that.
 | Epochs | 90 / 150 / 300 | 100 | ViMoE fine-tunes ViT-B for 100 ep |
 | Peak LR | 1e-3 | 1e-4 | ViMoE ViT-S 1e-4; Swin V2 fine-tune 4e-5 |
 | Warmup | 5 | 3 | ViMoE's CIFAR-100 config |
-| Stochastic depth | 0.1 (+0.05 @ 300) | 0.1 ("as pretraining") | CSWin: keeping the training-stage ratio helps fine-tuning |
+| Stochastic depth | the variant's official rate, any budget (B0–B2 0.1, B3–B5 0.3) | 0.1 ("as pretraining") | scratch: `pvt_v2_b*.py` (§1). pretrained: CSWin — keeping the training-stage ratio helps fine-tuning |
 | Differential LR for router/experts | n/a | **none** | Sparse Upcycling B.9: modifying expert/router LR generally hurt |
 | Layer-wise LR decay | n/a | none (the SSL chain's `ssl_finetune` / `downstream` recipes use 0.9 — §3b) | Swin V2's classification fine-tune uses none |
 | Weight decay | 0.05 | 0.05 | ViMoE keeps 0.05 |
@@ -432,7 +431,7 @@ only the optimization block differs from `scratch` / `pretrained`.
 | Base LR | 1.25e-3 @ 512 → 2.5e-3 at 1024 | same | `optim.base_lr`, `optim.lr_reference_batch` | SimMIM yaml `BASE_LR 1.25e-3` |
 | Warmup | 20 ep | 5 ep | `optim.warmup_epochs` | SimMIM yaml `WARMUP_EPOCHS 20`; short budgets |
 | Layer-wise LR decay | **0.9** | 0.9 | `optim.layer_decay` (`--layer-decay`; 1.0 = off) | SimMIM yaml `LAYER_DECAY 0.9` at 100-ep pretrain; reasoning below |
-| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | SimMIM finetune yaml |
+| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | `ssl_finetune`: SimMIM finetune yaml. `downstream`: **inherited from `ssl_finetune`** — the same fine-tuning regime one stage later, no separate source |
 | Stage-4 LR multiplier | 1.0 | 1.0 | `optim.stage4_lr_multiplier` | as the other recipes |
 | MoE at fine-tune | path 2 loads the pretrained experts as trained; path 3 upcycles from the encoder's FFN (`routed_zero`) | same | `model.moe.upcycle_init` | `docs/HPARAMS.md` §3, `SIMMIM_GUIDE.md` §4 |
 | Everything else | unchanged (batch 1024, wd 0.05, clip 5, DeiT-1 aug) | unchanged | | |
