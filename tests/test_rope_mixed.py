@@ -34,7 +34,7 @@ from pvt_moe.config import LADDERS, default_config, merge_config, validate_confi
 from pvt_moe.engine.callbacks import RopeFreqSnapshot, build_trainer
 from pvt_moe.engine.classifier import LitClassifier
 from pvt_moe.models import build_model
-from pvt_moe.models.attention import GQAttention
+from pvt_moe.models.attention import SRAttention
 from pvt_moe.models.rope import (
     RotaryEmbedding2D,
     _init_t_xy,
@@ -112,7 +112,7 @@ def test_freqs_parameter_shape_layout_and_init():
     assert isinstance(rope.freqs, torch.nn.Parameter) and rope.freqs.requires_grad
     # Inside an attention module the name is "rope.freqs" (what the optimizer
     # rule, the snapshot callback and the drift plot key on).
-    attn = GQAttention(dim=64, num_heads=heads, num_kv_heads=heads, use_rope=True,
+    attn = SRAttention(dim=64, num_heads=heads, use_rope=True,
                        rope_theta=theta, rope_mode="mixed")
     assert [n for n, _ in attn.named_parameters() if "rope" in n] == ["rope.freqs"]
 
@@ -257,42 +257,50 @@ def test_gradient_reaches_freqs_through_the_attention_block():
     assert n_mixed - n_axial == sum(p.numel() for p in freqs.values())
 
 
-# --- 6. mixed requires MHA in RoPE'd stages ----------------------------------
+# --- 6. attention is multi-head only (GQA removed) ---------------------------
 
-def test_mixed_requires_mha():
-    gqa = [1, 1, 2, 2]
-    try:
-        tiny_config(model={"num_kv_heads": gqa, "ablation": MIXED_S3_S4})
-    except ValueError as e:
-        assert "num_kv_heads" in str(e) and "mixed" in str(e), e
-    else:
-        raise AssertionError("mixed RoPE with num_kv_heads != num_heads must be rejected")
+def test_attention_is_multi_head_only():
+    """One kv head per query head, everywhere, with no knob to change it.
 
-    # The guard is per RoPE'd stage: GQA in a stage without RoPE is fine.
-    ok = tiny_config(model={"num_kv_heads": [1, 1, 4, 4],
-                            "ablation": {**MIXED_S3_S4, "rope_placement": [[], [], [], [0, 1]]}})
-    assert ok["model"]["num_kv_heads"] == [1, 1, 4, 4]
-    build_model(ok)(torch.randn(1, 3, 64, 64))
+    Grouped-query attention was an ablation this thesis does not run; mixed
+    RoPE learns one frequency set per QUERY head, so it required MHA anyway.
+    The key is gone — but an old checkpoint's config still carries it, and
+    ``evaluate.py`` feeds that config straight back into ``validate_config``.
+    """
+    cfg = tiny_config(model={"ablation": MIXED_S3_S4})
+    assert "num_kv_heads" not in cfg["model"]
 
-    # Axial keeps GQA (this is the enable_gqa / repeat_interleave SDPA path).
-    cfg = tiny_config(model={"num_kv_heads": gqa,
-                             "ablation": {**MIXED_S3_S4, "rope_mode": "axial"}})
     model = build_model(cfg)
     attn = model.block4[1].attn
-    assert attn.num_kv_heads == 2 and attn.num_heads == 4 and attn.use_rope
+    assert attn.num_heads == 4 and attn.use_rope and not hasattr(attn, "num_kv_heads")
+    # The fused kv projection carries a full head set: 2 * dim out features.
+    assert attn.kv.out_features == 2 * attn.dim
     logits, _ = model(torch.randn(2, 3, 64, 64))
     assert logits.shape == (2, cfg["dataset"]["num_classes"]) and torch.isfinite(logits).all()
 
-    # And the attention module itself refuses the combination at construction.
+    # An old MHA config (the shipped default and every arm) still resolves:
+    # the key is dropped, nothing else changes.
+    old = tiny_config(model={"ablation": MIXED_S3_S4})
+    old["model"]["num_kv_heads"] = list(old["model"]["num_heads"])
+    assert validate_config(old)["model"] == cfg["model"]
+
+    # A genuine GQA config is refused rather than silently run as MHA.
+    gqa = tiny_config(model={"ablation": MIXED_S3_S4})
+    gqa["model"]["num_kv_heads"] = [1, 1, 2, 2]
     try:
-        GQAttention(dim=16, num_heads=4, num_kv_heads=2, use_rope=True, rope_mode="mixed")
+        validate_config(gqa)
     except ValueError as e:
-        assert "num_kv_heads" in str(e), e
+        assert "num_kv_heads" in str(e) and "multi-head" in str(e), e
     else:
-        raise AssertionError("GQAttention(mixed, kv_heads != heads) must raise")
-    # ... while axial + GQA and mixed + MHA both build.
-    GQAttention(dim=16, num_heads=4, num_kv_heads=2, use_rope=True, rope_mode="axial")
-    GQAttention(dim=16, num_heads=4, num_kv_heads=4, use_rope=True, rope_mode="mixed")
+        raise AssertionError("a num_kv_heads != num_heads config must be refused")
+
+    # The attention module takes no kv-head argument at all.
+    try:
+        SRAttention(dim=16, num_heads=4, num_kv_heads=2)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("SRAttention must not accept num_kv_heads")
 
 
 # --- 7. config defaults, theta, run tag, CLI, ladders -------------------------
@@ -597,7 +605,7 @@ def test_coordinate_cache_and_shared_key_phases_do_not_change_outputs():
     assert not torch.allclose(torch.view_as_real(a), torch.view_as_real(c))
     # attention: sr_ratio 1 (shared phases) vs sr_ratio 2 (separate k grid)
     for sr in (1, 2):
-        attn = GQAttention(16, num_heads=4, num_kv_heads=4, sr_ratio=sr, use_rope=True,
+        attn = SRAttention(16, num_heads=4, sr_ratio=sr, use_rope=True,
                            rope_theta=10.0, rope_mode="mixed").eval()
         x = torch.randn(1, 64, 16)
         with torch.no_grad():

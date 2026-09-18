@@ -16,7 +16,7 @@ from pvt_moe.config import (
     build_run_tag,
     default_config,
     merge_config,
-    scratch_drop_path,
+    variant_drop_path,
     validate_config,
 )
 from pvt_moe.models.ffn import Mlp
@@ -170,13 +170,24 @@ def test_scratch_epoch_ladder_is_90_150_300():
         assert _cfg(recipe="scratch", epochs=epochs)["epochs"] == epochs
 
 
-def test_drop_path_follows_epoch_budget():
-    """DeiT-3: +0.05 every 200 epochs. Spec anchors: 90 -> 0.1, 300 -> 0.15."""
-    assert scratch_drop_path(90) == 0.1
-    assert scratch_drop_path(150) == 0.1
-    assert scratch_drop_path(300) == 0.15
-    for epochs, expected in ((90, 0.1), (150, 0.1), (300, 0.15)):
-        assert _cfg(recipe="scratch", epochs=epochs)["model"]["drop_path_rate"] == expected
+def test_drop_path_is_the_variants_official_rate_at_every_budget():
+    """PVT v2 sets drop path per SIZE, not per schedule length: 0.1 for
+    b0/b1/b2, 0.3 for b3/b4/b5 (classification/configs/pvt_v2/pvt_v2_b*.py).
+    This REPLACED an epoch-based rule (DeiT-3, +0.05 per 200 ep: 300 -> 0.15)
+    so a run is comparable to the published top-1 for its size —
+    docs/HPARAMS.md section 1 records the reversal.
+    """
+    for v in ("b0", "b1", "b2"):
+        assert variant_drop_path(v) == 0.1, v
+    for v in ("b3", "b4", "b5"):
+        assert variant_drop_path(v) == 0.3, v
+    assert variant_drop_path("custom") == 0.1          # B1's, like its architecture
+
+    # The budget no longer moves it: 90, 150 and 300 all give the same rate.
+    for epochs in (90, 150, 300):
+        for v, expected in (("b1", 0.1), ("b2", 0.1), ("b3", 0.3)):
+            c = _cfg(recipe="scratch", epochs=epochs, model={"variant": v})
+            assert c["model"]["drop_path_rate"] == expected, (v, epochs)
 
 
 def test_explicit_drop_path_beats_the_derivation():

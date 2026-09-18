@@ -4,7 +4,7 @@ from pvt_moe.models.norms import RMSNorm, build_norm_layers, rmsnorm_backend  # 
 from pvt_moe.models.rope import (  # noqa: F401
     RotaryEmbedding2D, apply_rotary_emb, compute_axial_cis, compute_mixed_cis, init_mixed_freqs,
 )
-from pvt_moe.models.attention import GQAttention  # noqa: F401
+from pvt_moe.models.attention import SRAttention  # noqa: F401
 from pvt_moe.models.ffn import DWConv, Mlp, MoEMlp  # noqa: F401
 from pvt_moe.models.pvt import Block, DropPath, OverlapPatchEmbed, PyramidVisionTransformerV2, build_model  # noqa: F401
 from pvt_moe.models.pretrained import (  # noqa: F401

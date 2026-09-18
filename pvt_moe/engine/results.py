@@ -103,6 +103,11 @@ def run_identity(cfg: dict) -> dict:
         "effective_batch_size": cfg.get("effective_batch_size"),
         "precision": cfg.get("precision"),
         "norm": m["norm_type"], "dense_dwconv": m.get("dense_dwconv", True),
+        # Stochastic depth leaves NO trace in the checkpoint (DropPath holds no
+        # parameters and no buffers) and none in the run name, so this record
+        # is the only place a resume can check it against — see
+        # assert_resume_identity.
+        "drop_path_rate": m["drop_path_rate"],
         "rope": ({"mode": abl["rope_mode"], "placement": abl["rope_placement"],
                   "theta": abl["rope_theta"]} if abl["use_rope"] else None),
         "moe": ({"placement": abl["moe_placement"], "num_experts": moe["num_experts"],
@@ -319,6 +324,57 @@ def read_results(dirpath: str) -> dict | None:
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+#: Resolved fields that change training but leave NO trace in the checkpoint,
+#: so a resume can silently continue a run under different settings. Each is
+#: compared against the identity block results.json recorded for the run being
+#: resumed. ``drop_path_rate`` is the case that motivated the check: DropPath
+#: has no parameters and no buffers, the state-dict keys are identical at any
+#: rate, and the rate is not in the run name either, so nothing else notices.
+RESUME_IDENTITY_FIELDS = ("drop_path_rate",)
+
+
+def resume_identity_mismatches(cfg: dict, ckpt_path: str) -> list:
+    """Compare this run against the results.json beside ``ckpt_path``.
+
+    Returns a list of human-readable mismatches; empty means consistent, or
+    that there is nothing to compare against (a run from before results.json
+    existed, or a checkpoint moved out of its run directory — a resume is
+    still allowed then, it just cannot be verified).
+    """
+    rec = read_results(os.path.dirname(os.path.abspath(ckpt_path))) or {}
+    ident = rec.get("identity") or {}
+    out = []
+    for key in RESUME_IDENTITY_FIELDS:
+        have, want = ident.get(key), cfg["model"].get(key)
+        if have is None or want is None or have == want:
+            continue
+        out.append(f"model.{key}: the run being resumed trained at {have}, "
+                   f"this command resolves {want}")
+    return out
+
+
+def assert_resume_identity(cfg: dict) -> list:
+    """Raise if a resume would silently change one of those fields.
+
+    Called by ``build_trainer`` / ``build_ssl_trainer`` (so the CLI and the
+    notebooks are both covered) before any compute. Same shape as the
+    ``ssl_init`` architecture guard: it names the fix and can be switched off
+    with ``model.resume_check_identity: false`` when the change is deliberate.
+    """
+    if cfg.get("mode") != "resume" or not cfg.get("ckpt_path"):
+        return []
+    problems = resume_identity_mismatches(cfg, cfg["ckpt_path"])
+    if problems and cfg["model"].get("resume_check_identity", True):
+        text = "\n  - ".join(problems)
+        raise ValueError(
+            f"resuming {cfg['ckpt_path']} would change settings the checkpoint cannot "
+            f"carry:\n  - {text}\nHalf the run would train at each value. Pass the "
+            f"recorded value explicitly (e.g. --drop-path <recorded>), or set "
+            f"model.resume_check_identity: false if the change is deliberate."
+        )
+    return problems
 
 
 def write_results(dirpath: str, rec: dict) -> str:

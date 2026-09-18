@@ -9,6 +9,7 @@ says it is.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
@@ -18,6 +19,7 @@ import torch
 from helpers import install_fake_tutel_backend, tiny_config
 from pvt_moe.engine.callbacks import MilestoneCheckpoint, build_trainer
 from pvt_moe.engine.classifier import LitClassifier
+from pvt_moe.engine.results import assert_resume_identity
 
 
 class _RecordLR(pl.Callback):
@@ -223,3 +225,61 @@ def test_stop_at_beyond_the_budget_is_rejected():
         assert "stop_at_epoch" in str(e)
         return
     raise AssertionError("stop_at_epoch > epochs must raise")
+
+
+def test_resume_refuses_a_silent_drop_path_change():
+    """A drop_path change leaves NO trace anywhere a resume would notice:
+    DropPath has no parameters or buffers (identical state-dict keys), the
+    rate is not in the run name, and the checkpoint does not carry the config
+    the trainer is built from. results.json records it, so a resume is
+    compared against that; half a run at each rate is not a run.
+    """
+    from pvt_moe.engine.results import JSON_NAME, run_identity
+
+    # Same state dict at either rate: nothing else can catch this.
+    undo = install_fake_tutel_backend()
+    try:
+        keys = {}
+        for rate in (0.1, 0.15):
+            c = tiny_config(model={"drop_path_rate": rate})
+            keys[rate] = sorted(LitClassifier(c).state_dict())
+    finally:
+        undo()
+    assert keys[0.1] == keys[0.15]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        trained = _cfg(tmp, model={"drop_path_rate": 0.15})
+        run_dir = os.path.join(tmp, trained["run_name"])
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, JSON_NAME), "w") as fh:
+            json.dump({"schema": 1, "identity": run_identity(trained)}, fh)
+        assert run_identity(trained)["drop_path_rate"] == 0.15      # in the identity block
+        ckpt = os.path.join(run_dir, "milestone-epoch002.ckpt")
+        open(ckpt, "w").close()
+
+        def resuming(**over):
+            return _cfg(tmp, mode="resume", ckpt_path=ckpt, **over)
+
+        # Resuming it at a different rate is refused, by build_trainer itself
+        # (so the notebooks, which never touch the CLI, are covered too).
+        undo = install_fake_tutel_backend()
+        try:
+            build_trainer(resuming(model={"drop_path_rate": 0.1}))
+        except ValueError as e:
+            assert "drop_path_rate" in str(e) and "0.15" in str(e), e
+        else:
+            raise AssertionError("a resume that changes drop_path must be refused")
+        finally:
+            undo()
+
+        # The recorded value resumes; the documented override loads anyway.
+        assert assert_resume_identity(resuming(model={"drop_path_rate": 0.15})) == []
+        loud = resuming(model={"drop_path_rate": 0.1, "resume_check_identity": False})
+        assert assert_resume_identity(loud), "reports the mismatch without raising"
+
+        # A fresh run is never checked, and neither is a checkpoint with no
+        # results.json beside it (runs from before it existed still resume).
+        assert assert_resume_identity(_cfg(tmp, model={"drop_path_rate": 0.1})) == []
+        lone = os.path.join(tmp, "moved.ckpt")
+        open(lone, "w").close()
+        assert assert_resume_identity(_cfg(tmp, mode="resume", ckpt_path=lone)) == []

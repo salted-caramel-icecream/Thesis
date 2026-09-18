@@ -83,3 +83,46 @@ def test_documented_commands_pass_dry_run():
     proc = subprocess.run([sys.executable, os.path.join(REPO, "train.py"), "--task", "ssl", "--dataset", "pass",
                            "--epochs", "0", "--dry-run"], capture_output=True, text=True, cwd=REPO)
     assert proc.returncode != 0 and "positive --epochs" in proc.stderr + proc.stdout
+
+
+def test_ssl_milestones_and_stop_at_are_measured_against_the_pretraining_budget():
+    """``--epochs`` on an SSL run sets ssl.epochs and leaves the supervised
+    ``epochs`` to the recipe, so the budget these two are checked against —
+    and the one the schedule line prints — must be ssl.epochs. Checking the
+    supervised field refused a milestone INSIDE the pretraining budget (the
+    recipe's 90 < a 100-epoch pretrain) and accepted one the run never
+    reaches.
+    """
+    c = _cfg(["--task", "ssl", "--dataset", "pass", "--epochs", "100",
+              "--milestones", "[25,50,100]"])
+    assert c["ssl"]["epochs"] == 100 and c["milestones"] == [25, 50, 100]
+    assert c["epochs"] != 100, "the supervised budget is the recipe's, and means nothing here"
+    assert "cosine over 100 ep" in describe(c)
+
+    # A milestone past the pretraining budget is still refused, by that budget.
+    try:
+        _cfg(["--task", "ssl", "--dataset", "pass", "--epochs", "100", "--milestones", "[150]"])
+    except ValueError as e:
+        assert "ssl.epochs=100" in str(e), e
+    else:
+        raise AssertionError("a milestone beyond ssl.epochs must be refused")
+
+    # stop_at follows the same budget (build_ssl_trainer stops at it).
+    c = _cfg(["--task", "ssl", "--dataset", "pass", "--epochs", "200", "--stop-at", "120"])
+    assert c["stop_at_epoch"] == 120 and "running to epoch 120 then stopping" in describe(c)
+    try:
+        _cfg(["--task", "ssl", "--dataset", "pass", "--epochs", "100", "--stop-at", "150"])
+    except ValueError as e:
+        assert "ssl.epochs=100" in str(e), e
+    else:
+        raise AssertionError("stop_at beyond ssl.epochs must be refused")
+
+    # Supervised runs keep checking the supervised budget.
+    sup = _cfg(["--epochs", "90", "--milestones", "[50,90]"])
+    assert sup["milestones"] == [50, 90]
+    try:
+        _cfg(["--epochs", "90", "--milestones", "[120]"])
+    except ValueError as e:
+        assert "epochs=90" in str(e) and "ssl" not in str(e), e
+    else:
+        raise AssertionError("a milestone beyond the supervised budget must be refused")

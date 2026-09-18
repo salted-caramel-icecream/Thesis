@@ -25,7 +25,7 @@ your LR.
 |---|---|---|---|
 | Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
-| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | `model.num_kv_heads` (None = heads) | PVT v2; GQA (`[1,1,1,2]`, v9 lineage) stays available as an ablation |
+| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | — (no knob: one kv head per query head) | PVT v2 |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
 | RoPE | mode **mixed** (RoPE-Mixed: learnable per-head 2D frequencies, one `attn.rope.freqs` per RoPE'd block, no weight decay, MHA only); `--rope-mode axial` = fixed frequencies (run tag `-ax`). theta: **10** for mixed — sets only the init spread of the frequencies — / **50** for axial — the frequencies themselves | `ablation.rope_mode`, `ablation.rope_theta` (None = per-mode default) | rope-vit (Heo et al. ECCV'24): RoPE-Mixed models use theta 10, axial 100; 50 is this repo's axial choice for the 7×7 stage-4 grid |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
@@ -37,21 +37,40 @@ your LR.
 | Warmup epochs | 5 | `optim.warmup_epochs` | PVT v2 (5/300) |
 | Weight decay | 0.05, uniform — no expert-specific value | `optim.weight_decay` | PVT v2; Tutel and ScMoE apply one decay |
 | Gradient clipping | max norm 5.0 | `optim.grad_clip` | Swin V2 |
-| Stochastic depth | 0.1; +0.05 for the 300-ep run | `model.drop_path_rate` | DeiT-3 raises drop-rate by 0.05 every 200 epochs |
+| Stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), at any budget | `model.drop_path_rate` | `classification/configs/pvt_v2/pvt_v2_b*.py` — see the reversal note below |
 | Init | from scratch | `mode: "scratch"` | — |
 
-**Epoch budget → stochastic depth** is derived, not hand-set
-(`config.scratch_drop_path`, DeiT-3's +0.05 per 200 epochs):
+**Variant → stochastic depth.** A from-scratch run takes the rate the
+official PVT v2 config trained that size with (`config.variant_drop_path`),
+whatever the epoch budget:
 
-| `epochs` | 90 | 150 | 300 |
-|---|---|---|---|
-| `drop_path_rate` | 0.1 | 0.1 | 0.15 |
+| variant | b0 | b1 | b2 | b3 | b4 | b5 | `custom` |
+|---|---|---|---|---|---|---|---|
+| `drop_path_rate` | 0.1 | 0.1 | 0.1 | 0.3 | 0.3 | 0.3 | 0.1 (B1's) |
 
-Set `model.drop_path_rate` explicitly to override.
+Source, per variant: [whai362/PVT](https://github.com/whai362/PVT) branch `v2`
+@ `57e2dfaa5a46f9050d76f306a4fcd9a7c061f520`,
+`classification/configs/pvt_v2/pvt_v2_b0.py` … `pvt_v2_b5.py` (`drop_path_rate`
+in each). Set `model.drop_path_rate` / `--drop-path` explicitly to override,
+per run.
+
+> **This replaced an epoch-based rule, and the replacement is a reversal of a
+> deliberate decision, not a bug fix.** Until it changed, the rate was derived
+> from the budget — DeiT-3's +0.05 per 200 epochs (`config.scratch_drop_path`),
+> giving 0.1 at 90 and 150 epochs and **0.15 at 300**, for every variant. That
+> was chosen knowingly: the code already held each variant's official rate in
+> `VARIANTS` and printed a notice when they disagreed (b3–b5), and a test
+> pinned the behaviour as "derivation deliberately unchanged". It was replaced
+> because **comparability with PVT v2's published numbers matters more here
+> than the DeiT-3 scaling convention**: a 300-epoch B2 run at 0.15 cannot be
+> read against the paper's 82.0% top-1, which was trained at 0.1. The
+> side effects, both intended: a 300-epoch arm and a 90-epoch arm now share a
+> drop path, so the budget is the only difference between them; and b3–b5 from
+> scratch move from 0.1 to their official 0.3.
 
 ### Variants (`model.variant`, `--variant`)
 
-| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
+| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path (= `drop_path_rate` from scratch) | Official clip_grad | HF checkpoint | Top-1 (official) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
 | **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |
@@ -80,10 +99,8 @@ Sources (the table in `config.VARIANTS` cites the same):
   224². MACs from `torch.utils.flop_counter` (matmul/conv only, so a few
   percent under a paper GFLOPs count that includes norms and activations).
   The paper's own GFLOPs column (arXiv 2106.13797) was not reachable and is
-  not reproduced here. Attention is plain MHA by default (kv heads = heads),
-  so the parameter count matches the official one; the GQA ablation
-  (`model.num_kv_heads`, e.g. the v9 lineage's [1,1,1,2]) trims it slightly
-  (12.86 M for B1).
+  not reproduced here. Attention is plain MHA (one kv head per query head),
+  so the parameter count matches the official one.
 
 Three rules the code enforces:
 
@@ -95,11 +112,10 @@ Three rules the code enforces:
 - **Placement is depth-independent.** The default `[[],[],[],[-1]]` is the
   last block of stage 4 whatever the depth (block 1 in B1, block 2 in B2);
   see §2.
-- **Stochastic depth is still derived by the B1-anchored rule above** (B1 and
-  B2 were both officially trained at 0.1, so the derivation is identical for
-  the two sizes this thesis uses). B3–B5 were trained at 0.3; the derivation
-  does not know that yet and prints the discrepancy — pass `--drop-path 0.3`
-  for those sizes until the rule is made variant-aware.
+- **Stochastic depth comes from the variant** (`config.variant_drop_path`):
+  0.1 for B0–B2, 0.3 for B3–B5, at any epoch budget. It used to be derived
+  from the budget, which gave B3–B5 0.1 and needed an explicit
+  `--drop-path 0.3`; see the reversal note in §1.
 
 B2-Linear is not a variant: linear (pooling) attention is `model.linear_attention`.
 
@@ -259,7 +275,7 @@ stay identical — `test_spec_pretrained_deltas` asserts that.
 | Epochs | 90 / 150 / 300 | 100 | ViMoE fine-tunes ViT-B for 100 ep |
 | Peak LR | 1e-3 | 1e-4 | ViMoE ViT-S 1e-4; Swin V2 fine-tune 4e-5 |
 | Warmup | 5 | 3 | ViMoE's CIFAR-100 config |
-| Stochastic depth | 0.1 (+0.05 @ 300) | 0.1 ("as pretraining") | CSWin: keeping the training-stage ratio helps fine-tuning |
+| Stochastic depth | the variant's official rate, any budget (B0–B2 0.1, B3–B5 0.3) | 0.1 ("as pretraining") | scratch: `pvt_v2_b*.py` (§1). pretrained: CSWin — keeping the training-stage ratio helps fine-tuning |
 | Differential LR for router/experts | n/a | **none** | Sparse Upcycling B.9: modifying expert/router LR generally hurt |
 | Layer-wise LR decay | n/a | none (the SSL chain's `ssl_finetune` / `downstream` recipes use 0.9 — §3b) | Swin V2's classification fine-tune uses none |
 | Weight decay | 0.05 | 0.05 | ViMoE keeps 0.05 |
@@ -415,7 +431,7 @@ only the optimization block differs from `scratch` / `pretrained`.
 | Base LR | 1.25e-3 @ 512 → 2.5e-3 at 1024 | same | `optim.base_lr`, `optim.lr_reference_batch` | SimMIM yaml `BASE_LR 1.25e-3` |
 | Warmup | 20 ep | 5 ep | `optim.warmup_epochs` | SimMIM yaml `WARMUP_EPOCHS 20`; short budgets |
 | Layer-wise LR decay | **0.9** | 0.9 | `optim.layer_decay` (`--layer-decay`; 1.0 = off) | SimMIM yaml `LAYER_DECAY 0.9` at 100-ep pretrain; reasoning below |
-| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | SimMIM finetune yaml |
+| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | `ssl_finetune`: SimMIM finetune yaml. `downstream`: **inherited from `ssl_finetune`** — the same fine-tuning regime one stage later, no separate source |
 | Stage-4 LR multiplier | 1.0 | 1.0 | `optim.stage4_lr_multiplier` | as the other recipes |
 | MoE at fine-tune | path 2 loads the pretrained experts as trained; path 3 upcycles from the encoder's FFN (`routed_zero`) | same | `model.moe.upcycle_init` | `docs/HPARAMS.md` §3, `SIMMIM_GUIDE.md` §4 |
 | Everything else | unchanged (batch 1024, wd 0.05, clip 5, DeiT-1 aug) | unchanged | | |

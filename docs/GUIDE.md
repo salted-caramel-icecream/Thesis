@@ -311,7 +311,7 @@ key nothing reads.
 | peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) | same |
 | warmup | 5 | 3 | 20 | 5 |
 | layer-wise LR decay | — | — | 0.9 | 0.9 |
-| stochastic depth | 0.1 (0.15 at 300 ep) | 0.1 | 0.1 | 0.1 |
+| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 | 0.1 |
 | everything else | identical (batch, aug, MoE, weight decay, clipping) | | | |
 
 Self-supervised pretraining is not a recipe but a task: `--task ssl`
@@ -430,9 +430,10 @@ python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
 The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
 `[100, 150, 200, 300]`, so a resume needs no edit. Two consequences:
 
-- Stochastic depth is **0.15**, not the 0.1 of the 90-epoch rows
-  (`scratch_drop_path` derives it from the budget). A 300-epoch arm is
-  comparable to other 300-epoch arms, never to a 90-epoch row.
+- Stochastic depth is **unchanged by the budget**: it is the variant's
+  official rate (0.1 for b0–b2), the same as the 90-epoch rows, so the budget
+  is the only thing that differs between them. It was derived from the epoch
+  count until that rule was replaced — `docs/HPARAMS.md` section 1 records why.
 - Run names end in `_scratch300` rather than `_scratch90`, so the two budgets
   never share a checkpoint directory or a W&B name.
 
