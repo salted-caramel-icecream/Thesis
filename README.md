@@ -375,7 +375,7 @@ cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "
 | Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) | same |
 | Warmup epochs | 5 | 3 | 20 | 5 |
 | Layer-wise LR decay | — | — | 0.9 | 0.9 |
-| Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") | 0.1 | 0.1 |
+| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 | 0.1 |
 | Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 | 1.0 |
 | Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical | identical |
 

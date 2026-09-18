@@ -196,13 +196,25 @@ LR_REFERENCE_BATCH = 1024
 WARMUP_START_LR = 1e-6
 
 
-def scratch_drop_path(epochs: int) -> float:
-    """Stochastic depth for a from-scratch run of ``epochs`` epochs.
+def variant_drop_path(variant: str) -> float:
+    """Stochastic depth for a from-scratch run of this variant.
 
-    DeiT-3 raises the drop rate by 0.05 every 200 epochs to fight overfitting
-    on long schedules. Anchored to the spec: 90 ep -> 0.1, 300 ep -> 0.15.
+    PVT v2 sets drop path per SIZE, not per schedule length: 0.1 for b0/b1/b2
+    and 0.3 for b3/b4/b5 (``VARIANTS``, from
+    ``classification/configs/pvt_v2/pvt_v2_b*.py``). Training a size at its
+    published rate is what makes this repo's top-1 comparable to the paper's
+    (B2: 82.0%).
+
+    REVERSAL, recorded in docs/HPARAMS.md section 1: until this changed, the
+    rate was derived from the epoch budget instead (DeiT-3's +0.05 per 200
+    epochs: 90 ep -> 0.1, 300 ep -> 0.15), a deliberate choice that made a
+    300-epoch B2 run train at 0.15 and so not directly comparable to the
+    published number. ``--drop-path`` still overrides, per run.
+
+    ``"custom"`` has no official recipe and falls back to B1's rate, the same
+    fallback ``apply_variant`` uses for its architecture fields.
     """
-    return round(0.1 + 0.05 * (epochs // 200), 4)
+    return VARIANTS["b1" if variant == "custom" else variant]["drop_path"]
 
 
 #: Recipe presets. Every value here is a DEFAULT: anything set explicitly in
@@ -220,7 +232,7 @@ RECIPES = {
             # a higher rate than any other stage when nothing is pretrained.
             "stage4_lr_multiplier": 1.0,
         },
-        # model.drop_path_rate is derived from epochs by scratch_drop_path().
+        # model.drop_path_rate: the variant's official rate (variant_drop_path).
     },
     # Intermediate stage: SSL checkpoint -> supervised ImageNet-1k.
     # Values from microsoft/SimMIM @ d3e29bc,
@@ -427,7 +439,7 @@ _DEFAULT: dict = {
 
     # None => recipe default (scratch: 90, pretrained: 100). For from-scratch
     # ablations pick one of config.SCRATCH_EPOCH_CHOICES == (90, 150, 300);
-    # stochastic depth follows automatically (scratch_drop_path).
+    # stochastic depth comes from the variant (variant_drop_path).
     "epochs": None,
     "precision": "bf16-mixed",
     # MICRO-batch: what actually fits in VRAM in one forward/backward.
@@ -505,9 +517,9 @@ _DEFAULT: dict = {
         "qkv_bias": True,
         "drop_rate": 0.0,
         "attn_drop_rate": 0.0,
-        # None => recipe default. scratch: 0.1, +0.05 per 200 epochs
-        # (DeiT-3), so 90/150 ep -> 0.1 and 300 ep -> 0.15. pretrained: 0.1
-        # ("as pretraining").
+        # None => derived. scratch: the VARIANT's official rate at any epoch
+        # budget (variant_drop_path; b0-b2 0.1, b3-b5 0.3). pretrained /
+        # ssl_finetune / downstream: 0.1 from the recipe. task ssl: 0.0.
         "drop_path_rate": None,
         # Stages (1-based) to run under gradient checkpointing while training:
         # recompute activations in the backward pass instead of storing them.
@@ -620,6 +632,12 @@ _DEFAULT: dict = {
         # differs from this run instead of loading what fits and leaving the
         # rest at random init. False downgrades the refusal to a warning.
         "ssl_init_check_arch": True,
+        # Resuming (--resume-from) refuses to silently change a setting the
+        # checkpoint cannot carry — drop_path_rate today
+        # (engine.results.RESUME_IDENTITY_FIELDS), compared against the
+        # identity block in the run directory's results.json. false loads
+        # anyway, for a change you mean to make.
+        "resume_check_identity": True,
         "num_frozen_stages": 0,
     },
 
@@ -1199,8 +1217,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
 
     1. recipe presets fill mode / epochs / lr / warmup_epochs /
        stage4_lr_multiplier / drop_path_rate / upcycling init flags;
-    2. from-scratch ``drop_path_rate`` follows the epoch budget
-       (``scratch_drop_path``) when still unset;
+    2. from-scratch ``drop_path_rate`` takes the variant's official rate
+       (``variant_drop_path``) when still unset;
     3. ``warmup_start_factor`` is derived so warmup begins at an absolute
        ``WARMUP_START_LR`` (1e-6) whatever the peak LR is.
 
@@ -1265,8 +1283,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         )
 
     # Stochastic depth for from-scratch runs scales with the epoch budget.
-    # The derivation is anchored on B1's official 0.1 (identical for B0-B2);
-    # B3-B5 were officially trained at 0.3, which this rule does not know.
+    # From scratch: the variant's OFFICIAL rate, whatever the epoch budget
+    # (variant_drop_path; the epoch-based rule it replaced is recorded there).
     # SSL PRETRAINING uses none: SimMIM's pretrain config sets DROP_PATH_RATE
     # 0.0 (microsoft/SimMIM configs/swin_base__100ep/simmim_pretrain_*.yaml;
     # 0.1 is its FINE-TUNE value, carried by the ssl_finetune recipe), and
@@ -1275,14 +1293,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         cfg["model"]["drop_path_rate"] = 0.0
         filled.append("model.drop_path_rate")
     if cfg["model"].get("drop_path_rate") is None:
-        cfg["model"]["drop_path_rate"] = scratch_drop_path(cfg["epochs"])
+        cfg["model"]["drop_path_rate"] = variant_drop_path(cfg["model"]["variant"])
         filled.append("model.drop_path_rate")
-        official = VARIANTS.get(cfg["model"]["variant"], {}).get("drop_path")
-        if official is not None and official != VARIANTS["b1"]["drop_path"]:
-            print(f"[config] model.drop_path_rate derived as "
-                  f"{cfg['model']['drop_path_rate']} (B1-anchored rule); the "
-                  f"official PVT v2 {cfg['model']['variant']} recipe used "
-                  f"{official}. Pass --drop-path {official} to match it.")
 
     # Warmup starts at an absolute 1e-6, not at lr * 1e-6.
     optim = cfg["optim"]

@@ -37,21 +37,40 @@ your LR.
 | Warmup epochs | 5 | `optim.warmup_epochs` | PVT v2 (5/300) |
 | Weight decay | 0.05, uniform — no expert-specific value | `optim.weight_decay` | PVT v2; Tutel and ScMoE apply one decay |
 | Gradient clipping | max norm 5.0 | `optim.grad_clip` | Swin V2 |
-| Stochastic depth | 0.1; +0.05 for the 300-ep run | `model.drop_path_rate` | DeiT-3 raises drop-rate by 0.05 every 200 epochs |
+| Stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), at any budget | `model.drop_path_rate` | `classification/configs/pvt_v2/pvt_v2_b*.py` — see the reversal note below |
 | Init | from scratch | `mode: "scratch"` | — |
 
-**Epoch budget → stochastic depth** is derived, not hand-set
-(`config.scratch_drop_path`, DeiT-3's +0.05 per 200 epochs):
+**Variant → stochastic depth.** A from-scratch run takes the rate the
+official PVT v2 config trained that size with (`config.variant_drop_path`),
+whatever the epoch budget:
 
-| `epochs` | 90 | 150 | 300 |
-|---|---|---|---|
-| `drop_path_rate` | 0.1 | 0.1 | 0.15 |
+| variant | b0 | b1 | b2 | b3 | b4 | b5 | `custom` |
+|---|---|---|---|---|---|---|---|
+| `drop_path_rate` | 0.1 | 0.1 | 0.1 | 0.3 | 0.3 | 0.3 | 0.1 (B1's) |
 
-Set `model.drop_path_rate` explicitly to override.
+Source, per variant: [whai362/PVT](https://github.com/whai362/PVT) branch `v2`
+@ `57e2dfaa5a46f9050d76f306a4fcd9a7c061f520`,
+`classification/configs/pvt_v2/pvt_v2_b0.py` … `pvt_v2_b5.py` (`drop_path_rate`
+in each). Set `model.drop_path_rate` / `--drop-path` explicitly to override,
+per run.
+
+> **This replaced an epoch-based rule, and the replacement is a reversal of a
+> deliberate decision, not a bug fix.** Until it changed, the rate was derived
+> from the budget — DeiT-3's +0.05 per 200 epochs (`config.scratch_drop_path`),
+> giving 0.1 at 90 and 150 epochs and **0.15 at 300**, for every variant. That
+> was chosen knowingly: the code already held each variant's official rate in
+> `VARIANTS` and printed a notice when they disagreed (b3–b5), and a test
+> pinned the behaviour as "derivation deliberately unchanged". It was replaced
+> because **comparability with PVT v2's published numbers matters more here
+> than the DeiT-3 scaling convention**: a 300-epoch B2 run at 0.15 cannot be
+> read against the paper's 82.0% top-1, which was trained at 0.1. The
+> side effects, both intended: a 300-epoch arm and a 90-epoch arm now share a
+> drop path, so the budget is the only difference between them; and b3–b5 from
+> scratch move from 0.1 to their official 0.3.
 
 ### Variants (`model.variant`, `--variant`)
 
-| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path | Official clip_grad | HF checkpoint | Top-1 (official) |
+| Variant | depths | embed_dims | heads | mlp_ratios | sr_ratios | Params, M: official / this repo (MHA, the default) | GMACs @224² (this repo, dense) | Official drop_path (= `drop_path_rate` from scratch) | Official clip_grad | HF checkpoint | Top-1 (official) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | b0 | [2,2,2,2] | [32,64,160,256] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 3.7 / 3.67 | 0.53 | 0.1 | — | `OpenGVLab/pvt_v2_b0` | 70.5 |
 | **b1** (default) | [2,2,2,2] | [64,128,320,512] | [1,2,5,8] | [8,8,4,4] | [8,4,2,1] | 14.0 / 14.01 | 2.03 | 0.1 | — | `OpenGVLab/pvt_v2_b1` | 78.7 |

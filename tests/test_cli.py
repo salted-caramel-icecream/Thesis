@@ -59,9 +59,10 @@ def test_flags_override_the_recipe():
     assert c["epochs"] == 40
 
 
-def test_epoch_budget_drives_drop_path():
+def test_drop_path_comes_from_the_variant_not_the_budget():
     assert _cfg("--epochs", "90")["model"]["drop_path_rate"] == 0.1
-    assert _cfg("--epochs", "300")["model"]["drop_path_rate"] == 0.15
+    assert _cfg("--epochs", "300")["model"]["drop_path_rate"] == 0.1       # was 0.15
+    assert _cfg("--variant", "b3", "--epochs", "90")["model"]["drop_path_rate"] == 0.3
     assert _cfg("--epochs", "300", "--drop-path", "0.3")["model"]["drop_path_rate"] == 0.3
 
 

@@ -12,8 +12,11 @@
 # NOTE: block too — the architecture edit as a whole. Pass --rope-placement
 # NOTE: for a narrower arm.
 #
-# NOTE: drop_path resolves to 0.15 here, not the 0.1 of the 90-epoch row.
-# NOTE: Compare this arm only against the other 300-epoch arms.
+# NOTE: drop_path is 0.1 here, the same as the 90-epoch row: it comes from
+# NOTE: the VARIANT's official rate (variant_drop_path), not the epoch budget.
+# NOTE: The budget is the only thing that differs from the 90-epoch arm, so
+# NOTE: the two are directly comparable. docs/HPARAMS.md section 1 records
+# NOTE: why the old epoch-based rule (0.15 at 300 ep) was replaced.
 
 recipe: "scratch"
 epochs: 300

@@ -300,14 +300,20 @@ def test_batch_suggestion_is_variant_aware():
     assert 1.8 <= gib_per_image("b2") / gib_per_image("b1") <= 2.0
 
 
-# --- stochastic depth: derivation deliberately unchanged (see HPARAMS §1) ----
+# --- stochastic depth: each variant's official rate (see HPARAMS §1) --------
 
-def test_drop_path_derivation_is_identical_for_b1_and_b2():
-    for v in ("b1", "b2"):
-        assert _cli("--variant", v, "--epochs", "90")["model"]["drop_path_rate"] == 0.1
-        assert _cli("--variant", v, "--epochs", "300")["model"]["drop_path_rate"] == 0.15
+def test_drop_path_is_each_variants_official_rate():
+    """The from-scratch rate is the one the official config trained that size
+    with, at any budget. It replaced a rule that read the epoch count (300 ep
+    -> 0.15 for every size), which left a 300-epoch B2 run incomparable to
+    PVT v2's published 82.0% at 0.1.
+    """
+    for v in ("b0", "b1", "b2", "b3", "b4", "b5"):
+        official = VARIANTS[v]["drop_path"]
+        for epochs in ("90", "300"):
+            assert _cli("--variant", v, "--epochs", epochs)["model"]["drop_path_rate"] == official, v
+        # The fine-tuning recipes keep their own cited value (SimMIM finetune
+        # yaml / "as pretraining"), which the variant rate does not touch.
         assert _cli("--variant", v, "--recipe", "pretrained")["model"]["drop_path_rate"] == 0.1
-    # B3-B5 keep the B1-anchored rule (0.1 @ 90 ep) although the official
-    # recipe used 0.3 for them; apply_recipe prints the discrepancy.
-    assert _cli("--variant", "b3", "--epochs", "90")["model"]["drop_path_rate"] == 0.1
-    assert VARIANTS["b3"]["drop_path"] == 0.3
+    # An explicit rate still wins over the variant's.
+    assert _cli("--variant", "b3", "--drop-path", "0.1")["model"]["drop_path_rate"] == 0.1
