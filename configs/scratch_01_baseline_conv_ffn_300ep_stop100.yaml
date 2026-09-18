@@ -1,0 +1,29 @@
+# Baseline, conv-FFN intact — 300-epoch schedule, stopped at 100
+# Base arm (scratch ladder row 1) on the long schedule — docs/HPARAMS.md section 4.
+#
+#   python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
+#
+# Same architecture as scratch_01_baseline_conv_ffn.yaml; only the budget
+# differs. `epochs` is the SCHEDULE (the cosine is built for 300) and
+# `stop_at_epoch` is where this session gets off, so the LR trajectory is
+# identical to one uninterrupted 300-epoch run. Resume with the SAME
+# `epochs: 300` and --resume-from .../milestone-epoch100.ckpt; dropping the
+# budget to 100 on the resume would build a different, compressed schedule.
+#
+# NOTE: drop_path resolves to 0.15 here, not the 0.1 of the 90-epoch row —
+# NOTE: scratch_drop_path() derives stochastic depth from the epoch budget
+# NOTE: (DeiT-3: +0.05 per 200 ep). This arm is therefore NOT directly
+# NOTE: comparable to the 90-epoch ladder rows.
+#
+# Milestones past 100 never fire in this session; they are pre-set so a
+# resume needs no edit.
+
+recipe: "scratch"
+epochs: 300
+stop_at_epoch: 100
+milestones: [100, 150, 200, 300]
+model:
+  dense_dwconv: true
+  ablation:
+    use_moe: false
+    use_rope: false

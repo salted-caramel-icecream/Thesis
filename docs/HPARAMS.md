@@ -285,11 +285,11 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 
 | Check | Backend it ran on | Where |
 |---|---|---|
-| HF path: whole model, dense vs upcycled, < 1e-4 | fake Tutel (Tutel's parameter layout, every token to expert 0, no dispatch) | `tests/test_shared_expert.py::test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval` |
+| HF path: whole model, dense vs upcycled, < 1e-4 | fake Tutel **and** native, end to end through `load_hf_pretrained` with a complete HF-named state dict (every dense tensor mapped, kv fused, MoE'd FFN diverted and upcycled) | `tests/test_hf_upcycling.py::test_hf_loader_maps_every_dense_tensor_and_preserves_the_function`; `..._reproduces_the_dense_model_under_the_scratch_recipe` pins the config resolution; `tests/test_shared_expert.py::test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval` covers the seeding helpers alone |
 | HF path: block-level, < 1e-5 | fake Tutel; native (real top-1 routing) | `test_shared_expert.py`, `test_native_moe.py::test_R2_*` |
 | ssl_init path: whole model, < 1e-4 (measured 0.0) | fake Tutel **and** native | `tests/test_ssl_init.py::test_ssl_init_upcycled_model_matches_the_dense_backbone_to_1e4` |
 | Real Tutel expert arithmetic (`FusedExpertsNetwork`): seeded expert == dense FFN, zeroed expert == 0 | real Tutel *expert module only* (no `moe_layer` dispatch/combine), CPU, one-off script | not in the suite |
-| Real Tutel `moe_layer` end to end, both paths, 224², GPU | **never run yet** | `python tools/verify_upcycling.py --variant b1 --hf` on the GPU box |
+| Real Tutel `moe_layer` end to end, both paths, 224², GPU | run once on an RTX 5090 with real Tutel: `ssl_init` **0.0**; `hf_pretrained` **1.01, FAILED** — `upcycle_init` had resolved to `none` under the tool's inherited scratch recipe (`seeded_shared=1 zeroed_routed_fc2=0`, the routed experts were never zeroed). Fixed by the fill rule, the `validate_config` guard and the tool's required `--recipe`; re-run pending | `python tools/verify_upcycling.py --variant b1 --recipe pretrained --hf` on the GPU box |
 
 The suite always uses the fake Tutel layer even when Tutel is installed, so
 a green suite says nothing about Tutel's dispatch/combine. Run the tool once
@@ -338,18 +338,21 @@ the arms cannot contradict each other:
 |---|---|---|---|
 | `"routed_zero"` | keeps the pretrained FFN | fc2 zeroed | **recipe default** — exact at any top_k |
 | `"shared_zero"` | output projection zeroed | replicate the FFN | the spec's scheme; exact only at top_k > 1 |
-| `"none"` | keeps the FFN | replicate the FFN | both branches copy it — the block emits ~2x the dense layer at step 0 |
+| `"none"` | keeps the FFN | replicate the FFN | both branches copy it — the block would emit ~2x the dense layer at step 0, so `validate_config` **refuses** it whenever experts are seeded from a dense FFN with a shared expert (modes `ssl_init` and `hf_pretrained`); reachable only with `--no-seed-experts`, where nothing is upcycled |
 
 ```bash
 python train.py --recipe pretrained                            # routed_zero
 python train.py --recipe pretrained --upcycle-init shared_zero # the spec's
-python train.py --recipe pretrained --upcycle-init none        # no zeroing
+python train.py --recipe pretrained --no-seed-experts          # random experts: nothing to zero
 ```
 
-All three get distinct run names (`+sh`, `+sh-szi`, `+sh-nozi`), so an init
-ablation cannot put two arms in one checkpoint directory. The marker appears
-only on runs that actually upcycle — a from-scratch run resolves to `"none"`
-but never seeds anything, so its name stays unmarked.
+The two admissible schemes get distinct run names (`+sh`, `+sh-szi`), so an
+init ablation cannot put two arms in one checkpoint directory. Explicit
+`"none"` with seeded experts is refused at validate time rather than named, so
+no run carries a `-nozi` marker; the random-expert control is tagged
+`-randexp`. The marker appears only on runs that actually upcycle — a
+from-scratch run resolves to `"none"` but never seeds anything, so its name
+stays unmarked.
 
 **With no shared expert** (ladder row 3, or a bare `--no-shared-expert`) the
 value resolves to `"none"` and says so:

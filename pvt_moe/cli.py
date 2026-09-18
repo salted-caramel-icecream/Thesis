@@ -13,10 +13,11 @@ its own beyond ``--recipe``. That keeps `docs/HPARAMS.md` the single source of
 truth: if a value is not on the command line, it came from the recipe.
 
 ``--set a.b.c=value`` is the escape hatch for anything without a flag, and
-``--config file.json`` merges a saved config first. Precedence, lowest to
-highest::
+``--config file.json`` merges a saved config first; it may be repeated, and
+the files merge in order (later files win on conflicting keys). Precedence,
+lowest to highest::
 
-    default_config()  <  --config  <  --ladder  <  named flags  <  --set
+    default_config()  <  --config (in order)  <  --ladder  <  named flags  <  --set
 
 Running the whole ablation ladder is then a shell loop::
 
@@ -247,9 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
                "bit-reproducible but slower (cudnn deterministic)")
 
     g = p.add_argument_group("escape hatches & inspection")
-    g.add_argument("--config", metavar="FILE",
+    g.add_argument("--config", metavar="FILE", action="append", default=None,
                    help="YAML or JSON config merged before any flag "
-                        "(.yaml/.yml need PyYAML)")
+                        "(.yaml/.yml need PyYAML). Repeatable: files merge "
+                        "in order, later files win on conflicting keys, e.g. "
+                        "--config configs/my_paths.local.yaml "
+                        "--config configs/scratch_01_baseline_conv_ffn.yaml")
     g.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
@@ -271,6 +275,32 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Args -> config
 # ---------------------------------------------------------------------------
+
+# Machine-local path configs (``configs/<name>.local.yaml``) hold only
+# ``dataset.arrow_dirs`` / ``checkpoint_root`` / ``log_root``. They are
+# gitignored and meant to be composed with an ablation arm; run alone they
+# resolve to the default arm and would share row 4's checkpoint directory, so
+# they are never counted as a shipped ablation arm.
+#: every extension load_config_file accepts, so a machine-local file can never
+#: be a shipped arm whichever format it was written in (all three are gitignored)
+LOCAL_CONFIG_SUFFIXES = (".local.yaml", ".local.yml", ".local.json")
+LOCAL_CONFIG_SUFFIX = LOCAL_CONFIG_SUFFIXES[0]
+
+
+def is_local_config(path) -> bool:
+    """True for a machine-local ``*.local.{yaml,yml,json}`` config (never a shipped arm)."""
+    return str(path).endswith(LOCAL_CONFIG_SUFFIXES)
+
+
+def shipped_config_files(config_dir: str = "configs") -> list:
+    """Sorted paths of the shipped ablation arms under ``config_dir``.
+
+    Every ``*.yaml`` except the gitignored machine-local ``*.local.yaml``
+    files, which may legitimately collide with a ladder row on run_name.
+    """
+    return sorted(str(f) for f in pathlib.Path(config_dir).glob("*.yaml")
+                  if not is_local_config(f))
+
 
 def load_config_file(path: str) -> dict:
     """Load a YAML or JSON config fragment.
@@ -372,13 +402,22 @@ _FLAG_PATHS = {
 def build_config(args, verbose: bool = True) -> dict:
     """Resolve parsed args into a validated config.
 
-    Precedence: default_config < --config < --ladder < flags < --set.
+    Precedence: default_config < --config (in order) < --ladder < flags < --set.
     """
     cfg = default_config()
     cfg = merge_config(cfg, {"recipe": args.recipe})
 
-    if args.config:
-        cfg = merge_config(cfg, load_config_file(args.config))
+    # --config is repeatable: every file merges in order, so a machine-local
+    # paths file composes with an ablation arm and the later file wins on any
+    # key both set. A single str is accepted for callers that bypass argparse.
+    config_files = args.config or []
+    if isinstance(config_files, str):
+        config_files = [config_files]
+    for path in config_files:
+        if not os.path.isfile(path):
+            # A typo'd path is user error: one line, not a traceback.
+            raise ValueError(f"--config file not found: {path}")
+        cfg = merge_config(cfg, load_config_file(path))
 
     if args.ladder is not None:
         overrides, desc, note = ladder_overrides(args.recipe, args.ladder)
@@ -432,10 +471,12 @@ def build_config(args, verbose: bool = True) -> dict:
         # Dense is the pretraining default (paths 1 and 3 of the three-path
         # ablation); path 2 asks for it with --moe. Anything explicit — the
         # flag, a config file, --set — wins.
+        files = args.config or []
+        files = [files] if isinstance(files, str) else files
         explicit = (args.use_moe is not None
                     or any(o.split("=")[0].strip() == "model.ablation.use_moe" for o in args.overrides)
-                    or (args.config and "use_moe" in load_config_file(args.config)
-                        .get("model", {}).get("ablation", {})))
+                    or any("use_moe" in load_config_file(f).get("model", {}).get("ablation", {})
+                           for f in files))
         if not explicit:
             cfg["model"]["ablation"]["use_moe"] = False
             if verbose:

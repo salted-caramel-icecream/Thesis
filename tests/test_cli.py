@@ -7,6 +7,7 @@ precedence order is default < --config < --ladder < flags < --set.
 from __future__ import annotations
 
 import json
+import pathlib
 import tempfile
 
 from pvt_moe.cli import _FLAG_PATHS, build_config, build_parser, describe
@@ -93,12 +94,24 @@ def test_upcycle_init_can_be_swapped_on_the_command_line():
     assert "-szi" in c["run_name"], "the init arms must not share a run name"
 
 
-def test_all_three_init_arms_get_distinct_run_names():
+def test_admissible_init_arms_get_distinct_run_names_and_explicit_none_is_refused():
     names = {
         init: _cfg("--recipe", "pretrained", "--upcycle-init", init)["run_name"]
-        for init in ("routed_zero", "shared_zero", "none")
+        for init in ("routed_zero", "shared_zero")
     }
-    assert len(set(names.values())) == 3, names
+    assert len(set(names.values())) == 2, names
+    # "none" with a shared expert AND seeded experts is refused for BOTH
+    # warm-start modes (the block would emit ~2x the pretrained FFN); it is
+    # only reachable when seeding is switched off on purpose.
+    try:
+        _cfg("--recipe", "pretrained", "--upcycle-init", "none")
+    except ValueError as e:
+        assert "hf_pretrained" in str(e) and "twice" in str(e), str(e)
+    else:
+        raise AssertionError("--recipe pretrained --upcycle-init none must be refused")
+    c = _cfg("--recipe", "pretrained", "--upcycle-init", "none", "--no-seed-experts")
+    assert c["model"]["moe"]["upcycle_init"] == "none"
+    assert c["run_name"] not in names.values()
 
 
 def test_init_arm_is_not_tagged_on_runs_that_never_upcycle():
@@ -319,19 +332,113 @@ def test_config_errors_exit_2_instead_of_raising():
 def test_every_shipped_config_file_resolves():
     """configs/*.yaml are the ablation arms — all must build a valid config
     and none may collide on run_name (that would share a checkpoint dir)."""
-    import pathlib
+    from pvt_moe.cli import load_config_file, shipped_config_files
 
-    from pvt_moe.cli import load_config_file
-
-    files = sorted(pathlib.Path("configs").glob("*.yaml"))
+    # shipped_config_files() skips the gitignored *.local.yaml machine-path
+    # files: alone they resolve to the default arm and may collide with a row.
+    files = shipped_config_files()
     assert len(files) >= 18, f"expected the full ladder, found {len(files)}"
     names = {}
     for f in files:
-        assert load_config_file(str(f)), f
-        cfg = _cfg("--config", str(f))
-        names.setdefault(cfg["run_name"], []).append(f.name)
+        assert load_config_file(f), f
+        cfg = _cfg("--config", f)
+        names.setdefault(cfg["run_name"], []).append(pathlib.Path(f).name)
     dupes = {k: v for k, v in names.items() if len(v) > 1}
     assert not dupes, f"config files collide on run_name: {dupes}"
+
+
+def test_two_config_files_compose_in_order_and_later_wins():
+    """--config is repeatable: a machine-local paths file composes with an
+    ablation arm, and the later file wins on any key both set."""
+    import os
+    import tempfile
+
+    import yaml
+
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.yaml")
+        b = os.path.join(d, "b.yaml")
+        pathlib.Path(a).write_text(yaml.safe_dump(
+            {"checkpoint_root": "/tmp/a_ckpt", "epochs": 7}))
+        pathlib.Path(b).write_text(yaml.safe_dump(
+            {"epochs": 11, "model": {"dense_dwconv": False}}))
+
+        c = _cfg("--config", a, "--config", b)
+        assert c["checkpoint_root"] == "/tmp/a_ckpt"      # only a sets it
+        assert c["epochs"] == 11                           # b came later
+        assert c["model"]["dense_dwconv"] is False
+
+        c = _cfg("--config", b, "--config", a)
+        assert c["epochs"] == 7                            # a came later
+        assert c["checkpoint_root"] == "/tmp/a_ckpt"
+        assert c["model"]["dense_dwconv"] is False
+
+        c = _cfg("--config", a)                            # a single file still works
+        assert c["epochs"] == 7 and c["checkpoint_root"] == "/tmp/a_ckpt"
+
+
+def test_local_config_files_are_excluded_from_the_shipped_sweep():
+    """A gitignored configs/*.local.yaml holds only machine paths, so alone it
+    resolves to the default arm and collides with scratch_04 on run_name. The
+    shipped-config sweeps must skip it instead of failing the suite. The
+    exclusion lives in pvt_moe.cli (is_local_config / shipped_config_files),
+    which both sweeps use, so this fails against a cli.py without it."""
+    import test_variants
+    from pvt_moe.cli import is_local_config, shipped_config_files
+
+    local = pathlib.Path("configs") / "_wf_tmp.local.yaml"
+    assert not local.exists(), local
+    local.write_text(
+        "dataset:\n  arrow_dirs:\n    imagenet-1k: /tmp/wf_arrow\n"
+        "checkpoint_root: /tmp/wf_ckpt\nlog_root: /tmp/wf_logs\n")
+    try:
+        # It collides with row 4 by construction ...
+        assert _cfg("--config", str(local))["run_name"] == \
+            _cfg("--config", "configs/scratch_04_moe_shared.yaml")["run_name"]
+        # ... is recognised as machine-local and left out of the shipped list
+        # (which still holds every real arm) ...
+        assert is_local_config(local) and is_local_config(str(local))
+        assert not is_local_config("configs/scratch_04_moe_shared.yaml")
+        assert str(local) not in shipped_config_files()
+        assert "configs/scratch_04_moe_shared.yaml" in shipped_config_files()
+        assert shipped_config_files() == sorted(
+            str(f) for f in pathlib.Path("configs").glob("*.yaml")
+            if f.name != local.name)
+        # ... and both sweeps must still pass with it present.
+        test_every_shipped_config_file_resolves()
+        test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
+    finally:
+        local.unlink()
+
+
+def test_missing_config_file_is_a_clean_error():
+    """A typo'd --config path exits 2 with 'error: ...', not a traceback."""
+    import io
+    import contextlib
+
+    from pvt_moe.cli import main
+
+    missing = "configs/_wf_does_not_exist.yaml"
+    assert not pathlib.Path(missing).exists()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["--config", missing, "--dry-run"])
+    assert rc == 2
+    assert "error: --config file not found" in err.getvalue() and missing in err.getvalue()
+
+
+def test_local_configs_are_gitignored():
+    """Every extension load_config_file accepts is covered, so a machine path
+    can never be committed whichever format the local file uses."""
+    from pvt_moe.cli import is_local_config
+
+    lines = [ln.strip() for ln in pathlib.Path(".gitignore").read_text().splitlines()]
+    active = [ln for ln in lines if ln and not ln.startswith("#")]
+    for ext in ("yaml", "yml", "json"):
+        assert f"configs/*.local.{ext}" in active, ext
+        assert is_local_config(f"configs/my_paths.local.{ext}"), ext
+    assert not is_local_config("configs/scratch_01_baseline_conv_ffn.yaml")
+    assert not is_local_config("configs/notes.local.txt")
 
 
 def test_yaml_and_json_configs_are_equivalent():

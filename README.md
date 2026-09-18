@@ -15,9 +15,14 @@ PVT_Tutelmoe_v10_patched.ipynb
 archive/        the original v9 notebook, unmaintained, kept for provenance
 notebooks/      thin launchers — v11_train.ipynb is the current supervised
                 one; 03_ssl_pretrain.ipynb is SSL pretraining (SimMIM / JEPA);
+                quick_bench.ipynb times a few epochs on this machine;
                 01 supervised/Tutel and 02 MegaBlocks are older
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
+                scratch_NN_*.yaml        the 90-epoch ladder rows
+                *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
+                bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
+                ssl_NN_*.yaml            SSL pretraining arms (dense / MoE / pixel-space mask / JEPA)
 docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
                 SIMMIM_GUIDE.md (SSL: recipe, the stem leak, three pretraining
@@ -209,16 +214,22 @@ python train.py --recipe scratch --epochs 300 \
 ```bash
 # Linux / WSL2 / macOS
 for f in configs/scratch_0*.yaml; do
+    case "$f" in *_300ep_stop100.yaml) continue ;; esac   # ladder rows only
     python train.py --config "$f" --data-dir /data/imagenet_arrow || break
 done
 ```
 ```powershell
 # Windows — D: is only an example; substitute your own drive
-foreach ($f in Get-ChildItem configs/scratch_0*.yaml) {
+foreach ($f in Get-ChildItem configs/scratch_0*.yaml |
+                Where-Object { $_.Name -notlike '*_300ep_stop100.yaml' }) {   # ladder rows only
     python train.py --config $f.FullName --data-dir D:/data/imagenet_arrow
     if ($LASTEXITCODE -ne 0) { break }
 }
 ```
+
+The guard matters: every scratch arm also ships a `_300ep_stop100` sibling
+that matches the same glob, and those are 300-epoch schedules — without the
+skip the loop would launch both budgets.
 
 Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
@@ -228,11 +239,12 @@ weeks, not days — see `docs/HPARAMS.md` §5.
 
 ## Or use a notebook
 
-Two, for different purposes:
+Three, for different purposes:
 
 | | |
 |---|---|
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 241 tests. Prefer this. |
+| `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 262 tests. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
@@ -275,8 +287,14 @@ recipe**, so the command line stays short and `docs/HPARAMS.md` remains the
 source of truth. Precedence, lowest to highest:
 
 ```
-default_config()  <  --config file.yaml  <  --ladder N  <  named flags  <  --set a.b=v
+default_config()  <  --config a.yaml  <  --config b.yaml  <  --ladder N  <  named flags  <  --set a.b=v
 ```
+
+`--config` may be repeated: the files merge in order and a later file wins on
+any key both set. Put machine paths (`dataset.arrow_dirs`, `checkpoint_root`,
+`log_root`) in `configs/my_paths.local.yaml` (gitignored, see `docs/GUIDE.md`)
+and compose it with an arm file — never run the paths file alone, since alone
+it is the default arm and would share row 4's checkpoint directory.
 
 ```bash
 python train.py --recipe scratch --epochs 300          # final run
@@ -286,6 +304,7 @@ python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
 python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
+python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm (create the .local file first)
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
@@ -392,7 +411,8 @@ sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
 theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
-`-randexp` (random expert init), `-szi`/`-nozi` (upcycling init).
+`-randexp` (random expert init), `-szi` (`shared_zero` upcycling init; an explicit
+`none` with seeded experts is refused at validate time, so `-nozi` never appears).
 
 ## RoPE frequency diagnostics
 
