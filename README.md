@@ -615,9 +615,13 @@ SimMIM's recipe (32-px patches, ratio 0.6, L1 on masked pixels, base LR
 clip 5, 224 throughout) is followed exactly where PVT v2 allows it; the one
 place it cannot be is PVT v2's **overlapping** 7×7/stride-4 stem, which lets
 visible tokens see a 3-px band of each masked patch (measured: 6.9 % of the
-masked pixels at ratio 0.6). `--mask-space pixel` removes the band and
-changes nothing else. Linear-probe / k-NN accuracy is **expected to be low**
-for a MIM encoder; the headline of an SSL arm is the fine-tuned top-1.
+masked pixels at ratio 0.6). The real runs use `token` (SimMIM's own
+behaviour; the band is too small to justify leaving the published recipe);
+`--mask-space pixel` removes the band and changes nothing else, kept as the
+control. With `--moe` the load-balancing loss counts the masked positions —
+a stated decision, `docs/SIMMIM_GUIDE.md` §4. Linear-probe / k-NN accuracy
+is **expected to be low** for a MIM encoder; the headline of an SSL arm is
+the fine-tuned top-1.
 
 ## Warm starts (`mode`)
 
