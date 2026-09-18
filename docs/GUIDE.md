@@ -568,7 +568,7 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_moe-s4b2-…`), so logs stay
+same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
 The `r224` field is the input resolution (`dataset.img_size`). It arrived with

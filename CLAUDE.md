@@ -45,7 +45,10 @@ e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`,
 `r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived
 with the SSL chain, so a run directory created before that has no `_r224_`.
 `--resume-from` keeps the derived name, so resume such a run with
-`--run-name <its old name>` to stay in its directory.
+`--run-name <its old name>` to stay in its directory. `run_suffix`
+(`--run-suffix v2`) appends a repeat marker to the DERIVED name so one arm
+can be rerun without sharing a checkpoint directory or a W&B name; an
+explicit `run_name` replaces the derived name entirely instead.
 The `sv1` prefix (`config.py` `"version"`) is bumped on every architecture
 change so old and new runs never share a W&B name or a checkpoint directory.
 Two configs that differ in anything that changes the model must give

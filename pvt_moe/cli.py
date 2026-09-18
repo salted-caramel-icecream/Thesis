@@ -234,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--precision")
     g.add_argument("--seed", type=int)
     g.add_argument("--run-name", help="default: derived from the ablation flags")
+    g.add_argument("--run-suffix", dest="run_suffix", metavar="TAG",
+                   help="append a repeat marker to the DERIVED run name, e.g. "
+                        "--run-suffix v2 -> ..._scratch90_v2 — rerun one arm "
+                        "without sharing its checkpoint directory or W&B name "
+                        "(letters, digits, '-' and '.')")
     g.add_argument("--checkpoint-root", dest="checkpoint_root", metavar="DIR",
                    help="where run directories (checkpoints) are written")
     g.add_argument("--checkpoint-dir", dest="checkpoint_root",
@@ -391,6 +396,7 @@ _FLAG_PATHS = {
     "precision": "precision",
     "seed": "seed",
     "run_name": "run_name",
+    "run_suffix": "run_suffix",
     "checkpoint_root": "checkpoint_root",
     "log_root": "log_root",
     "use_wandb": "use_wandb",
