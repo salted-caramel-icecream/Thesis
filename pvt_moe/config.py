@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -386,6 +387,12 @@ _DEFAULT: dict = {
     "chain": [],
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
+    # Appended to the DERIVED run name, e.g. run_suffix "v2" ->
+    # sv1_b2_in1k_r224_dense_norope_ln_scratch90_v2. For repeats of one arm
+    # (a rerun, another seed, a second attempt) that must not share a
+    # checkpoint directory or a W&B name with the first. Ignored when
+    # run_name is set explicitly, which replaces the derived name entirely.
+    "run_suffix": None,
     "experiment_group": "ablations",
     "seed": 42,
     # True => bit-reproducible (cudnn deterministic, benchmark off) but slower.
@@ -799,7 +806,7 @@ def parent_tag(ckpt_path: str | None) -> str | None:
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
-    Example: ``sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+    Example: ``sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
 
     The variant sits right after the version: two sizes in one W&B project
     are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
@@ -871,20 +878,22 @@ def build_run_tag(cfg: dict) -> str:
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
     budget = {"scratch": "scratch", "pretrained": "ft", "ssl_finetune": "sslft",
               "downstream": "dstr"}.get(cfg.get("recipe"), "run")
+    # Repeat marker: last, so the arm is still readable left to right.
+    suffix = f"_{cfg['run_suffix']}" if cfg.get("run_suffix") else ""
     if cfg.get("task") == "ssl":
         # An SSL run is identified by its method and pretraining length; the
         # mask space changes what the encoder sees, so it is tagged too.
         ssl = cfg["ssl"]
         px = "-px" if ssl.get("mask_space") == "pixel" else ""
         return (f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_"
-                f"{ssl['method']}{ssl['epochs']}{px}")
+                f"{ssl['method']}{ssl['epochs']}{px}{suffix}")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
     # A warm start from an SSL / fine-tuned checkpoint is named after its
     # parent too (parent_tag), so paths 2 and 3 never share a directory.
     parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "ssl_init" else None
     parent = f"_{parent}" if parent else ""
-    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}"
+    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -1555,6 +1564,13 @@ def validate_config(cfg: dict) -> dict:
     if not cfg.get("chain"):
         cfg["chain"] = [stage_tag(cfg)]
 
+    suffix = cfg.get("run_suffix")
+    if suffix is not None:
+        if not isinstance(suffix, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", suffix):
+            raise ValueError(
+                f"run_suffix must be a short filename-safe tag such as 'v2' or 'seed7' "
+                f"(letters, digits, '-' and '.', starting alphanumeric), got {suffix!r}. "
+                "It becomes part of the checkpoint directory name.")
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)
         if cfg["mode"] == "ssl_init" and parent_tag(cfg.get("ckpt_path")) is None:

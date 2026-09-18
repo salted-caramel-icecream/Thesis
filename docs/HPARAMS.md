@@ -455,7 +455,7 @@ A row sets only what the spec's table names for it; everything else comes from
 the recipe and your own flags, and named flags override the row. Rows print a
 `[ladder]` line naming what they set, plus a note wherever the spec left a
 choice open (marked **(choice)** below). Run names self-document
-(`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
+(`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
 every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
 enforces that, since a collision would mean two runs sharing a checkpoint
 directory and a W&B run.

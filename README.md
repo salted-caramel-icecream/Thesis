@@ -235,6 +235,34 @@ Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
 weeks, not days — see `docs/HPARAMS.md` §5.
 
+### 9. The B2 2×2: {dense, MoE} × {no RoPE, RoPE}, all from scratch
+
+Four cells, no dedicated config files: each is a shipped ladder file plus
+`--variant b2` (plus `--rope` for cell 2) and resolves byte-for-byte to what
+a pinned file would give. The size is visible before the first step — the
+run name printed at start-up begins `sv1_b2_` — so a forgotten `--variant b2`
+cannot go unnoticed. Batch composition, workers and paths are per machine;
+the values below are a 32 GB 5090 (256 × 4 = 1024, 32 loader workers):
+
+```bash
+python train.py --config configs/scratch_01_baseline_conv_ffn.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow           # 1. dense, no RoPE
+python train.py --config configs/scratch_01_baseline_conv_ffn.yaml --variant b2 --rope --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow    # 2. dense + RoPE
+python train.py --config configs/scratch_10_moe_dwconv_norope.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow           # 3. MoE, no RoPE
+python train.py --config configs/scratch_04_moe_shared.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow                  # 4. MoE + RoPE
+```
+
+Run names: `sv1_b2_in1k_r224_dense_norope_ln_scratch90`,
+`sv1_b2_in1k_r224_dense_rope-s4b2_ln_scratch90`,
+`sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_norope_ln_scratch90`,
+`sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_rope-s4b2_ln_scratch90`. Both axes sit on
+the LAST block of stage 4 (block 2 in B2 — the ladder convention, so the
+cells are comparable to the B1 ladder); `--moe-last-n 1` / `--rope-last-n 1`
+switch to the whole stage (tag `s4`). Budget: the scratch recipe's 90 epochs.
+For the 300-epoch cosine stopped at 100, use the `_300ep_stop100` sibling of
+the same file (cell 4 has none: `--config configs/scratch_05_final_300ep.yaml
+--variant b2 --stop-at 100`). Repeat a cell without sharing its checkpoint
+directory or W&B name: `--run-suffix v2`.
+
 ---
 
 ## Or use a notebook
@@ -244,7 +272,7 @@ Three, for different purposes:
 | | |
 |---|---|
 | `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 262 tests. Prefer this. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
@@ -396,16 +424,17 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-└─────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
-│   └─────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
-│   │  └──────────────────────────────────────────── dataset
-│   │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
-│   │  │        │    └────────────────────────────── 4 experts, top-1
-│   │  │        │    │   └────────────────────────── shared expert
-│   │  │        │    │   │   └────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
-│   │  │        │    │   │   │         └──────────── norm
-│   │  │        │    │   │   │         │  └───────── recipe + epoch budget
+sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+└─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | pass | fmnist | eurosat | path)
+│   │  │    └─────────────────────────────────────────────── input resolution (dataset.img_size; 224 = default)
+│   │  │    │        └────────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │    │        │    └───────────────────────────────── 4 experts, top-1
+│   │  │    │        │    │   └───────────────────────────── shared expert
+│   │  │    │        │    │   │   └───────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
+│   │  │    │        │    │   │   │         └─────────────── norm
+│   │  │    │        │    │   │   │         │  └──────────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),
