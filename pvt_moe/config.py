@@ -1479,17 +1479,24 @@ def validate_config(cfg: dict) -> dict:
         )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
-    budget = cfg["epochs"]
+    # An SSL run's budget is ssl.epochs (--epochs sets it and leaves the
+    # supervised `epochs` to the recipe, where it means nothing); that is what
+    # build_ssl_trainer runs to, so it is what these two must be measured
+    # against. Checking the supervised field instead would refuse a milestone
+    # inside the pretraining budget and accept one the run never reaches.
+    ssl_run = cfg.get("task") == "ssl"
+    budget = cfg["ssl"]["epochs"] if ssl_run else cfg["epochs"]
+    field = "ssl.epochs" if ssl_run else "epochs"
     stop_at = cfg.get("stop_at_epoch")
     if stop_at is not None and not 1 <= stop_at <= budget:
         raise ValueError(
-            f"stop_at_epoch must be in [1, epochs={budget}], got {stop_at}. "
+            f"stop_at_epoch must be in [1, {field}={budget}], got {stop_at}. "
             "It truncates the run; it never extends it."
         )
     late = [m for m in cfg.get("milestones") or [] if not 1 <= m <= budget]
     if late:
         raise ValueError(
-            f"milestones must be within [1, epochs={budget}], got {late}"
+            f"milestones must be within [1, {field}={budget}], got {late}"
         )
     cfg["milestones"] = sorted(set(cfg.get("milestones") or []))
 

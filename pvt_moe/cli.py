@@ -547,10 +547,13 @@ def describe(cfg: dict) -> str:
                  f"{' ' + abl['rope_mode'] + ' theta ' + str(abl['rope_theta']) if abl['use_rope'] else ''} "
                  f"| aug {aug}")
     if cfg.get("milestones") or cfg.get("stop_at_epoch"):
-        stop = cfg.get("stop_at_epoch") or cfg["epochs"]
+        # An SSL run's schedule is built for ssl.epochs, not the supervised
+        # `epochs` the recipe left behind (build_ssl_trainer, validate_config).
+        total = cfg["ssl"]["epochs"] if cfg["task"] == "ssl" else cfg["epochs"]
+        stop = cfg.get("stop_at_epoch") or total
         lines.append(
-            f"  schedule: cosine over {cfg['epochs']} ep, running to epoch "
-            f"{stop}{' then stopping' if stop < cfg['epochs'] else ''} "
+            f"  schedule: cosine over {total} ep, running to epoch "
+            f"{stop}{' then stopping' if stop < total else ''} "
             f"| milestones {cfg.get('milestones') or 'none'}"
         )
     if cfg["mode"] == "resume":
