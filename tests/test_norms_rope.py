@@ -47,7 +47,7 @@ def test_rope_cache_shape_and_dtype():
 
 
 def test_rope_rotation_preserves_norm_and_dtype():
-    rope = RotaryEmbedding2D(head_dim=16, theta=50.0)
+    rope = RotaryEmbedding2D(head_dim=16, theta=50.0, mode="axial")
     x = torch.randn(2, 4, 49, 16)
     cis = rope.get(7, 7, x.device)
     out = apply_rotary_emb(x, cis)
@@ -59,14 +59,14 @@ def test_rope_rotation_preserves_norm_and_dtype():
 
 
 def test_rope_bf16_roundtrip():
-    rope = RotaryEmbedding2D(head_dim=16, theta=50.0)
+    rope = RotaryEmbedding2D(head_dim=16, theta=50.0, mode="axial")
     x = torch.randn(1, 2, 49, 16, dtype=torch.bfloat16)
     out = apply_rotary_emb(x, rope.get(7, 7, x.device))
     assert out.dtype == torch.bfloat16
 
 
 def test_rope_cache_reused():
-    rope = RotaryEmbedding2D(head_dim=16)
+    rope = RotaryEmbedding2D(head_dim=16, mode="axial")
     a = rope.get(7, 7, torch.device("cpu"))
     b = rope.get(7, 7, torch.device("cpu"))
     assert a is b
@@ -76,7 +76,7 @@ def test_rope_cache_reused():
 
 def test_rope_rejects_bad_head_dim():
     try:
-        RotaryEmbedding2D(head_dim=18)
+        RotaryEmbedding2D(head_dim=18, mode="axial")
     except ValueError:
         return
     raise AssertionError("head_dim % 4 != 0 must raise")
@@ -103,7 +103,7 @@ def test_rope_scaled_k_coordinates_in_full_grid_units():
 
 
 def test_rope_cache_keyed_by_scale():
-    rope = RotaryEmbedding2D(head_dim=16, theta=50.0)
+    rope = RotaryEmbedding2D(head_dim=16, theta=50.0, mode="axial")
     a = rope.get(7, 7, torch.device("cpu"))
     b = rope.get(7, 7, torch.device("cpu"), scale_h=8.0, scale_w=8.0)
     assert a is not b and not torch.equal(a, b)

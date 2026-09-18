@@ -94,8 +94,7 @@ def test_rope_head_dim_check():
     cfg = merge_config(default_config(), {
         # stage-4 head_dim = 510/6 = 85 -> not divisible by 4 -> must raise
         "model": {"variant": "custom",
-                  "embed_dims": [64, 128, 320, 510], "num_heads": [1, 2, 5, 6],
-                  "num_kv_heads": [1, 1, 1, 2]},
+                  "embed_dims": [64, 128, 320, 510], "num_heads": [1, 2, 5, 6]},
     })
     try:
         validate_config(cfg)

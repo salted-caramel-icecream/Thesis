@@ -21,20 +21,22 @@ names.** Renaming them silently breaks warm starts (they load 0 weights).
 ## 1. Attention (`models/attention.py`)
 
 SRA (spatial-reduction attention) exactly as PVT v2, with separate `q` /
-fused `kv` projections, computed by `F.scaled_dot_product_attention`. The
-default is plain multi-head attention (`num_kv_heads` = `num_heads`,
-[1,2,5,8]), which is the unmasked SDPA call that dispatches to the flash
-kernel on CUDA under bf16 — nothing to install. Grouped-query attention is
-an ablation: set fewer kv heads per stage (the v9 lineage ran
-`num_kv_heads = [1,1,1,2]`: stage 1 MHA, stages 2–3 MQA, stage 4 8:2 GQA).
+fused `kv` projections, computed by `F.scaled_dot_product_attention`.
 
-- Under GQA, SDPA `enable_gqa=True` needs torch ≥ 2.5; older torch takes a
-  `repeat_interleave` fallback (correct, slower) so CPU tests run anywhere.
+**INVARIANT — attention is plain multi-head, one kv head per query head**
+(`num_heads` [1,2,5,8] for B1). That is the unmasked SDPA call that
+dispatches to the flash kernel on CUDA under bf16 — nothing to install, no
+head-count knob. Grouped-query attention was removed: `SRAttention` takes no
+kv-head argument, and a config carrying the old `model.num_kv_heads` key is
+dropped when it equals `num_heads` (every run ever trained here) and refused
+otherwise (`drop_removed_keys`), so an old checkpoint's config still
+resolves and a GQA config cannot be silently run as MHA. Mixed RoPE learns
+one frequency set per query head, which needs exactly this layout.
+
 - HF checkpoints have separate k/v — the loader **fuses** them
-  (`torch.cat([k, v], dim=0) → attn.kv`). With the MHA default every stage's
-  kv loads. Under a GQA ablation the stages whose kv-head count differs from
-  HF's get a shape mismatch on the fused kv and are skipped by design
-  (counted as `kv_skipped`).
+  (`torch.cat([k, v], dim=0) → attn.kv`), and every stage's kv loads. A
+  fused-kv shape mismatch (a non-official head layout) is counted as
+  `kv_skipped` and should be 0.
 
 ## 2. MoE FFN (`models/ffn.py`)
 
@@ -170,7 +172,7 @@ selected by `model.ablation.rope_mode`:
 | parameters | `block{S}.{B}.attn.rope.freqs`, shape `(2, heads, head_dim//2)` | none |
 | `rope_theta` | 10 — sets only the **initial** magnitude ladder | 50 — the frequencies themselves (the paper uses 100; 50 suits the 7×7 stage-4 grid) |
 | run tag | `rope-s4b1` (untagged) | `rope-s4b1-ax` |
-| attention | MHA only: `num_kv_heads == num_heads` in every RoPE'd stage | MHA or GQA |
+| attention | multi-head (the only kind); frequencies are per query head | multi-head |
 
 **Parameter semantics (mixed).** `freqs[0]` is ω_x, `freqs[1]` is ω_y; dim 1
 is the head, dim 2 the frequency channel (`head_dim // 2` complex pairs — the
@@ -190,9 +192,8 @@ Invariants, both flavours unless stated:
   grid **expressed in full-grid units** (centered coordinate scaling
   `(i+0.5)·s − 0.5` with `s = H/H_kv`, exact identity at s=1) so q–k relative
   phases stay geometrically meaningful when RoPE is placed in stages with
-  `sr_ratio > 1`; V never. Mixed frequencies are per *query* head, which is
-  why K must carry the same head count — `validate_config` and `GQAttention`
-  both reject mixed + GQA with a message that names the fix.
+  `sr_ratio > 1`; V never. Mixed frequencies are per *query* head, and K
+  carries the same head count by construction (attention is multi-head only).
 - `head_dim % 4 == 0` wherever RoPE is enabled (validated in config).
 - The mixed phase `exp(i(ω_x·x + ω_y·y))` is computed in fp32 with autocast
   disabled (`compute_mixed_cis`), and the rotation itself runs in fp32 and

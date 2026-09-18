@@ -25,7 +25,7 @@ your LR.
 |---|---|---|---|
 | Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
-| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | `model.num_kv_heads` (None = heads) | PVT v2; GQA (`[1,1,1,2]`, v9 lineage) stays available as an ablation |
+| Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | — (no knob: one kv head per query head) | PVT v2 |
 | FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
 | RoPE | mode **mixed** (RoPE-Mixed: learnable per-head 2D frequencies, one `attn.rope.freqs` per RoPE'd block, no weight decay, MHA only); `--rope-mode axial` = fixed frequencies (run tag `-ax`). theta: **10** for mixed — sets only the init spread of the frequencies — / **50** for axial — the frequencies themselves | `ablation.rope_mode`, `ablation.rope_theta` (None = per-mode default) | rope-vit (Heo et al. ECCV'24): RoPE-Mixed models use theta 10, axial 100; 50 is this repo's axial choice for the 7×7 stage-4 grid |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
@@ -80,10 +80,8 @@ Sources (the table in `config.VARIANTS` cites the same):
   224². MACs from `torch.utils.flop_counter` (matmul/conv only, so a few
   percent under a paper GFLOPs count that includes norms and activations).
   The paper's own GFLOPs column (arXiv 2106.13797) was not reachable and is
-  not reproduced here. Attention is plain MHA by default (kv heads = heads),
-  so the parameter count matches the official one; the GQA ablation
-  (`model.num_kv_heads`, e.g. the v9 lineage's [1,1,1,2]) trims it slightly
-  (12.86 M for B1).
+  not reproduced here. Attention is plain MHA (one kv head per query head),
+  so the parameter count matches the official one.
 
 Three rules the code enforces:
 

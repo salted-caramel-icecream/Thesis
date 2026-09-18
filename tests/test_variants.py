@@ -75,7 +75,6 @@ def test_default_is_b1_and_unchanged():
     assert m["depths"] == [2, 2, 2, 2]
     assert m["embed_dims"] == [64, 128, 320, 512]
     assert m["num_heads"] == [1, 2, 5, 8]
-    assert m["num_kv_heads"] == [1, 2, 5, 8]           # MHA: kv heads == heads
     assert m["mlp_ratios"] == [8, 8, 4, 4]
     assert m["sr_ratios"] == [8, 4, 2, 1]
     assert m["pretrained_hf_id"] == "OpenGVLab/pvt_v2_b1"

@@ -8,7 +8,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 - `pvt_moe/config.py` — plain-dict config: `_DEFAULT`, recipes, variants, ladders, `build_run_tag`, `validate_config`, `assert_known_keys`
 - `pvt_moe/cli.py` — argparse front end; `train.py` at the root is a shim over it
-- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA + GQA + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `norms.py`, `pretrained.py` (HF remap), `moe_native.py`
+- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA multi-head + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `norms.py`, `pretrained.py` (HF remap), `moe_native.py`
 - `pvt_moe/engine/` — `classifier.py` (LitClassifier, optimizer groups, layer-wise LR decay, chain provenance at warm start), `callbacks.py` (checkpoints, `RopeFreqSnapshot`, `build_trainer`, `build_ssl_trainer`), `results.py` (`ResultsWriter`: results.json / results.md every epoch), `env.py`
 - `pvt_moe/data/` — ImageNet / PASS / small-set Arrow pipeline; `pvt_moe/utils/` — FLOPs, expert diagnostics
 - `pvt_moe/ssl/` — `simmim.py` (`LitSimMIM`, the default method), `jepa.py` (`LitJEPA`, dense only), `backbone.py` (`build_ssl_backbone`, honours `use_moe`), `diagnostics.py` (`mask_token_routing`), `masking.py`, `predictor.py`; `build_ssl_module(cfg)` dispatches on `ssl.method`

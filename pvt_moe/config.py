@@ -498,12 +498,6 @@ _DEFAULT: dict = {
         "variant": "b1",
         "embed_dims": None,               # b1: [64, 128, 320, 512]
         "num_heads": None,                # b1: [1, 2, 5, 8]
-        # kv heads per stage. None => equal to num_heads: standard multi-head
-        # attention, which takes the plain SDPA call and is eligible for the
-        # flash kernel under bf16 (attention.py). Set fewer kv heads per stage
-        # for grouped-query attention (the v9 lineage ran [1, 1, 1, 2]); that
-        # is an ablation, not the default, and not part of the variant table.
-        "num_kv_heads": None,
         "mlp_ratios": None,               # b1: [8, 8, 4, 4]
         "depths": None,                   # b1: [2, 2, 2, 2]
         "sr_ratios": None,                # b1: [8, 4, 2, 1]
@@ -564,7 +558,6 @@ _DEFAULT: dict = {
             # every RoPE'd block, weight-decay excluded, snapshotted at step 0
             # (rope_freqs_init.pt) for the drift plot (tools/plot_rope_freqs.py).
             # "axial": fixed frequencies, no parameters (the v10 behaviour).
-            # Mixed needs num_kv_heads == num_heads in the RoPE'd stages.
             "rope_mode": "mixed",
             # None => ROPE_THETA_DEFAULT[rope_mode] (mixed 10.0, axial 50.0).
             # For mixed it only sets the INITIAL magnitude ladder.
@@ -1165,10 +1158,6 @@ def apply_variant(cfg: dict) -> list:
                 f"hand-tune the architecture (no official checkpoint then)."
             )
 
-    if model.get("num_kv_heads") is None:          # MHA unless asked otherwise
-        model["num_kv_heads"] = list(model["num_heads"])
-        filled.append("model.num_kv_heads")
-
     hf_id = model.get("pretrained_hf_id")
     if variant == "custom":
         pass                                  # never filled; yours to set
@@ -1354,6 +1343,43 @@ def _suggest(unknown: str, known: set) -> str:
     return ""
 
 
+def drop_removed_keys(cfg: dict) -> list:
+    """Drop config keys this package no longer has, so an OLD config resolves.
+
+    Every checkpoint stores the config it was trained with
+    (``hyper_parameters["cfg"]``), and ``evaluate.py`` / ``--config saved.json``
+    feed it straight back into ``validate_config``, where an unknown key is a
+    hard error. A key that was removed because its only admissible value became
+    the sole behaviour is therefore dropped here instead — but only when it
+    carries that value, so no old run is silently reinterpreted.
+
+    ``model.num_kv_heads`` (grouped-query attention) is the one such key:
+    attention is plain multi-head now, so a config that set it equal to
+    ``num_heads`` (every shipped arm, and the default) loses nothing, while a
+    genuine GQA config is refused — loading it would build a different model.
+
+    Returns the list of dropped key paths. Called first by ``validate_config``.
+    """
+    dropped = []
+    model = cfg.get("model")
+    if isinstance(model, dict) and "num_kv_heads" in model:
+        kv = model.pop("num_kv_heads")
+        dropped.append("model.num_kv_heads")
+        heads = model.get("num_heads")
+        if heads is None:                     # not resolved yet: the variant's
+            variant = model.get("variant")    # table has the value it will get
+            spec = VARIANTS.get("b1" if variant == "custom" else variant)
+            heads = spec["num_heads"] if spec else None
+        if kv is not None and heads is not None and list(kv) != list(heads):
+            raise ValueError(
+                f"model.num_kv_heads {list(kv)} asks for grouped-query attention, which "
+                f"this version does not have: attention is plain multi-head "
+                f"(num_kv_heads == num_heads == {list(heads)}). Drop the key to run the "
+                f"same architecture as MHA; a GQA run needs the version that had it."
+            )
+    return dropped
+
+
 def assert_known_keys(cfg: dict) -> None:
     """Reject config keys that do not exist in ``default_config()``.
 
@@ -1404,6 +1430,8 @@ def assert_json_safe(cfg: dict) -> None:
 def validate_config(cfg: dict) -> dict:
     """Validate and normalize a config in place (returns it for chaining).
 
+    - drops keys removed in a later version of this package
+      (``drop_removed_keys``), so a config saved by an older one still resolves
     - rejects unknown keys (``assert_known_keys``) — a typo must not silently
       become a new key that nothing reads
     - resolves ``model.variant`` into depths / dims / heads / ratios /
@@ -1415,6 +1443,7 @@ def validate_config(cfg: dict) -> dict:
     - derives run_name when unset
     - asserts JSON-serializability
     """
+    drop_removed_keys(cfg)
     assert_known_keys(cfg)
     apply_variant(cfg)
     apply_recipe(cfg)
@@ -1472,12 +1501,9 @@ def validate_config(cfg: dict) -> dict:
             f"model.grad_checkpointing must contain 1-based stage numbers in "
             f"[1, {n}], got {bad}"
         )
-    for key in ("embed_dims", "num_heads", "num_kv_heads", "mlp_ratios", "sr_ratios"):
+    for key in ("embed_dims", "num_heads", "mlp_ratios", "sr_ratios"):
         if len(model[key]) != n:
             raise ValueError(f"model.{key} must have {n} entries, got {len(model[key])}")
-    for heads, kv in zip(model["num_heads"], model["num_kv_heads"]):
-        if heads % kv != 0:
-            raise ValueError(f"num_heads {heads} must be divisible by num_kv_heads {kv}")
 
     moe = model["moe"]
     if moe["upcycle_init"] not in VALID_UPCYCLE_INITS:
@@ -1516,8 +1542,7 @@ def validate_config(cfg: dict) -> dict:
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
 
-    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled;
-    # mixed needs one kv head per query head in every RoPE'd stage.
+    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled.
     if abl.get("rope_mode") not in VALID_ROPE_MODES:
         raise ValueError(
             f"model.ablation.rope_mode must be one of {VALID_ROPE_MODES}, "
@@ -1537,13 +1562,6 @@ def validate_config(cfg: dict) -> dict:
             if head_dim % 4 != 0:
                 raise ValueError(
                     f"RoPE enabled in stage {i + 1} but head_dim={head_dim} is not divisible by 4"
-                )
-            if abl["rope_mode"] == "mixed" and model["num_kv_heads"][i] != model["num_heads"][i]:
-                raise ValueError(
-                    f"rope_mode 'mixed' in stage {i + 1} needs num_kv_heads == num_heads "
-                    f"({model['num_kv_heads'][i]} != {model['num_heads'][i]}): the learnable "
-                    f"frequencies are per query head. Use rope_mode 'axial' with GQA, or "
-                    f"drop the GQA override for that stage."
                 )
 
     # The recipe's LR is calibrated for a specific effective batch; say so
