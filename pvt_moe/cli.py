@@ -471,12 +471,10 @@ def build_config(args, verbose: bool = True) -> dict:
         # Dense is the pretraining default (paths 1 and 3 of the three-path
         # ablation); path 2 asks for it with --moe. Anything explicit — the
         # flag, a config file, --set — wins.
-        files = args.config or []
-        files = [files] if isinstance(files, str) else files
         explicit = (args.use_moe is not None
                     or any(o.split("=")[0].strip() == "model.ablation.use_moe" for o in args.overrides)
                     or any("use_moe" in load_config_file(f).get("model", {}).get("ablation", {})
-                           for f in files))
+                           for f in config_files))
         if not explicit:
             cfg["model"]["ablation"]["use_moe"] = False
             if verbose:

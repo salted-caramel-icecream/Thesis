@@ -27,7 +27,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 ## Config rules
 
-- Plain nested dicts, JSON-serialisable by construction. A recipe (`scratch` | `pretrained`) fills only the fields left as `None`; anything set explicitly wins.
+- Plain nested dicts, JSON-serialisable by construction. A recipe (`scratch` | `pretrained` | `ssl_finetune` | `downstream`) fills only the fields left as `None`; anything set explicitly wins.
 - `assert_known_keys` rejects unknown keys — a typo must never silently create a dead key.
 - Precedence, lowest to highest: `default_config()` < `--config file` (repeatable; files merge in order, later wins) < `--ladder N` < named flags < `--set a.b=v`. A machine-local `configs/*.local.{yaml,yml,json}` is gitignored, skipped by the config sweep, and composed with an arm file, never run alone.
 - `model.variant` (b0…b5) sets depths / dims / heads / ratios / HF id as one set and rejects a disagreeing explicit value; `custom` hand-tunes them.
@@ -42,6 +42,10 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 `sv1_{variant}_{in1k|in22k|pass|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{ln|rms}_{scratch90|ft100|sslft100|dstr50|eval|simmim200[-px]|jepa100}[_from-{dense|moe}-{parent budget}]`,
 e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`,
 `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_sslft100_from-dense-simmim200`.
+`r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived
+with the SSL chain, so a run directory created before that has no `_r224_`.
+`--resume-from` keeps the derived name, so resume such a run with
+`--run-name <its old name>` to stay in its directory.
 The `sv1` prefix (`config.py` `"version"`) is bumped on every architecture
 change so old and new runs never share a W&B name or a checkpoint directory.
 Two configs that differ in anything that changes the model must give

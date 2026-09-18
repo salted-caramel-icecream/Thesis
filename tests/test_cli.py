@@ -401,9 +401,11 @@ def test_local_config_files_are_excluded_from_the_shipped_sweep():
         assert not is_local_config("configs/scratch_04_moe_shared.yaml")
         assert str(local) not in shipped_config_files()
         assert "configs/scratch_04_moe_shared.yaml" in shipped_config_files()
+        # (every machine-local file is excluded, not just this fixture: a
+        # developer's own my_paths.local.yaml must not fail the gate)
         assert shipped_config_files() == sorted(
             str(f) for f in pathlib.Path("configs").glob("*.yaml")
-            if f.name != local.name)
+            if not is_local_config(f))
         # ... and both sweeps must still pass with it present.
         test_every_shipped_config_file_resolves()
         test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
