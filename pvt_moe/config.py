@@ -32,8 +32,10 @@ import re
 #: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
 #: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
 #: refused by every supervised recipe at validate time. PASS (Asano et al.,
-#: NeurIPS Datasets & Benchmarks 2021; HF ``yukimasano/pass``): 1,439,588
-#: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
+#: NeurIPS Datasets & Benchmarks 2021): 1,439,588 images, CC-BY 4.0, no people,
+#: a single ``train`` split, no labels. Its ``hf_id`` is None because the Hub
+#: cannot serve it (loading script, no parquet branch); it is built from the
+#: Zenodo tars with ``download_data.py --from-images`` — docs/GUIDE.md section 2.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
 #: ``finetune_epochs`` is a FIXED budget per small dataset: open-ended runs on
@@ -48,7 +50,8 @@ DATASETS = {
                      "hf_id": "timm/imagenet-22k-wds", "gated": True, "finetune_epochs": None,
                      "licence": "ImageNet terms of access; gated on HF"},
     "pass": {"num_classes": 0, "labelled": False, "tag": "pass",
-             "hf_id": "yukimasano/pass", "gated": False, "finetune_epochs": None,
+             "hf_id": None, "gated": False, "finetune_epochs": None,
+             "hf_id_hint": "yukimasano/pass (loading script — not loadable; use Zenodo)",
              "licence": "CC-BY 4.0 (images and dataset)"},
     # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
     # Native resolutions are far below 224; dataset.img_size (224) upsamples
@@ -246,7 +249,11 @@ RECIPES = {
             "base_lr": 1.25e-3,
             "lr_reference_batch": 512,
             "lr": None,                    # DERIVED by the linear scaling rule
-            "warmup_epochs": 20,
+            # SimMIM section 4.1's ablation protocol: "100-epoch training, and a
+            # cosine learning rate scheduler with 10-epoch warm-up". The
+            # reference yaml's WARMUP_EPOCHS 20 belongs to the 800-epoch
+            # scaling config, which is not the setting this chain reproduces.
+            "warmup_epochs": 10,
             "stage4_lr_multiplier": 1.0,
             # Layer-wise decay compounding from the head down. SimMIM §4.3
             # uses 0.9 for a 100-epoch pretrain and lowers it with model size
@@ -328,10 +335,10 @@ VALID_MASK_SPACES = ("token", "pixel")
 #: jepa:   I-JEPA-style values this repo shipped before SimMIM was added.
 SSL_METHOD_DEFAULTS = {
     "simmim": {"epochs": 200, "base_lr": 2e-4, "lr_reference_batch": 512,
-               "warmup_epochs": 10, "warmup_lr": 1e-6, "final_lr": 1e-5,
+               "warmup_epochs": 10, "warmup_lr_base": 1e-6, "final_lr_base": 1e-5,
                "weight_decay": 0.05, "betas": [0.9, 0.999], "grad_clip": 5.0},
     "jepa": {"epochs": 100, "base_lr": 1.5e-3, "lr_reference_batch": 2048,
-             "warmup_epochs": 15, "warmup_lr": 0.0, "final_lr": 1e-6,
+             "warmup_epochs": 15, "warmup_lr_base": 0.0, "final_lr_base": 1e-6,
              "weight_decay": 0.04, "betas": [0.9, 0.95], "grad_clip": 3.0},
 }
 
@@ -343,8 +350,16 @@ SSL_DEFAULTS = {
     "lr_reference_batch": None,   # simmim 512, jepa 2048
     "lr": None,                   # DERIVED; set explicitly to bypass the rule
     "warmup_epochs": None,
-    "warmup_lr": None,            # DERIVED from warmup_lr_base by the same rule
-    "final_lr": None,             # DERIVED likewise
+    # The three LRs are DERIVED from the three *_base fields, which the
+    # resolution never writes to. Deriving warmup_lr/final_lr IN PLACE (reading
+    # the field the scaled value is then stored in) made them non-idempotent:
+    # every re-validate multiplied them by batch/reference again, so a config
+    # round-tripped through --save-config, or a checkpoint's config re-read by
+    # evaluate.py, silently doubled both.
+    "warmup_lr_base": None,       # simmim 1e-6, jepa 0.0
+    "final_lr_base": None,        # simmim 1e-5, jepa 1e-6
+    "warmup_lr": None,            # DERIVED from warmup_lr_base
+    "final_lr": None,             # DERIVED from final_lr_base
     "weight_decay": None,
     "betas": None,
     "grad_clip": None,
@@ -1092,11 +1107,13 @@ def apply_ssl_method(cfg: dict) -> list:
     eff = (cfg.get("effective_batch_size")
            or cfg["batch_size"] * (cfg.get("accumulate_grad_batches") or 1))
     ref = ssl["lr_reference_batch"]
-    for key, base in (("lr", ssl["base_lr"]), ("warmup_lr", ssl["warmup_lr"]),
-                      ("final_lr", ssl["final_lr"])):
-        if key == "lr" and ssl.get("lr") is not None:
-            continue
-        ssl[key] = resolve_lr(base, eff, ref)
+    # Derive from the *_base fields, never from the field being written: an
+    # already-resolved value must survive a second validate_config unchanged.
+    for key, base_key in (("lr", "base_lr"), ("warmup_lr", "warmup_lr_base"),
+                          ("final_lr", "final_lr_base")):
+        if ssl.get(key) is not None:
+            continue                 # explicit, or resolved on an earlier pass
+        ssl[key] = resolve_lr(ssl[base_key], eff, ref)
         filled.append(f"ssl.{key}")
     if method == "simmim" and cfg.get("task") == "ssl":
         img = cfg["dataset"]["img_size"]

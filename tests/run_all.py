@@ -48,7 +48,10 @@ def main() -> int:
                 fn()
                 passed += 1
                 print(f"  PASS {name} ({time.time() - t0:.2f}s)")
-            except Exception:
+            except BaseException:      # noqa: BLE001
+                # BaseException, not Exception: argparse's error() raises
+                # SystemExit, and a test that lets one escape used to kill the
+                # runner mid-suite — 76 of 315 tests ran and no summary printed.
                 failed += 1
                 errors.append((mod_name, name, traceback.format_exc()))
                 print(f"  FAIL {name}")

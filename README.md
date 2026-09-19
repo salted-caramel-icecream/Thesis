@@ -235,35 +235,63 @@ Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
 weeks, not days — see `docs/HPARAMS.md` §5.
 
-### 9. The B2 2×2: {dense, MoE} × {no RoPE, RoPE}, all from scratch
+### 9. Wave 1: expert count at fixed placement, plus the SSL pair
 
-Four cells, no dedicated config files: each is a shipped ladder file plus
-`--variant b2` (plus `--rope` for cell 2) and resolves byte-for-byte to what
-a pinned file would give. The size is visible before the first step — the
-run name printed at start-up begins `sv1_b2_` — so a forgotten `--variant b2`
-cannot go unnoticed. Batch composition, workers and paths are per machine;
-the values below are a 32 GB 5090 (256 × 4 = 1024, 32 loader workers):
+Four arms, B2 throughout, all from scratch on the shipped 90-epoch ladder
+budget (90 matches ScMoE's comparison budget). No dedicated config files —
+each supervised arm is a shipped ladder row plus `--variant b2`, resolving
+byte-for-byte to what a pinned file would give. The size is visible before
+the first step: the run name printed at start-up begins `sv1_b2_`.
+
+| GPU | arm | command | run name |
+|---|---|---|---|
+| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
+| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
+| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
+| 3 | SimMIM pretrain | `--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100` | `sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100` |
+
+Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
+also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
+shared-expert branch, and the routed experts never carry one (an
+`ARCHITECTURE.md` invariant). The 15 dense blocks keep their conv untouched.
+The two differ **only** in expert count, so the pair prices E at fixed
+placement.
 
 ```bash
-python train.py --config configs/scratch_01_baseline_conv_ffn.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow           # 1. dense, no RoPE
-python train.py --config configs/scratch_01_baseline_conv_ffn.yaml --variant b2 --rope --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow    # 2. dense + RoPE
-python train.py --config configs/scratch_10_moe_dwconv_norope.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow           # 3. MoE, no RoPE
-python train.py --config configs/scratch_04_moe_shared.yaml --variant b2 --batch-size 256 --accum 4 --num-workers 32 --data-dir /data/imagenet_arrow                  # 4. MoE + RoPE
+COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 12 \
+        --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
+
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
+CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
+CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --task ssl --ssl-method simmim --no-moe \
+    --dataset imagenet-1k --epochs 100 $COMMON
 ```
 
-Run names: `sv1_b2_in1k_r224_dense_norope_ln_scratch90`,
-`sv1_b2_in1k_r224_dense_rope-s4b2_ln_scratch90`,
-`sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_norope_ln_scratch90`,
-`sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_rope-s4b2_ln_scratch90`. Both axes sit on
-the LAST block of stage 4 (block 2 in B2 — the ladder convention, so the
-cells are comparable to the B1 ladder); `--moe-last-n 1` / `--rope-last-n 1`
-switch to the whole stage (tag `s4`). Budget: the scratch recipe's 90 epochs.
-For the 300-epoch cosine stopped at 100, use the `_300ep_stop100` sibling of
-the same file (cell 4 has none: `--config configs/scratch_05_final_300ep.yaml
---variant b2 --stop-at 100`). Repeat a cell without sharing its checkpoint
-directory or W&B name: `--run-suffix v2`.
+`drop_path` resolves to 0.1 on GPUs 0–2 (the variant's official rate) and 0.0
+on GPU 3 (SimMIM's pretrain value). All four run names are distinct, so no two
+arms can share a checkpoint directory.
 
----
+**The SSL pair.** GPU 3 pretrains on **ImageNet-1k**; the same command with
+`--dataset pass --data-dir /data/pass_arrow` is the second arm. Running
+ImageNet first gives the PASS arm a reference it otherwise has none of — no
+third-party MIM result on PASS is known — and the pair then isolates the
+pretraining corpus with everything else fixed. MoE is **off on both**: adding
+experts would confound the dataset comparison and put untested parameters into
+a path that has never completed an epoch. `mask_token_routing` therefore emits
+nothing on these arms (it requires `--moe`); it belongs to a later arm, once
+SimMIM is known to work.
+
+**Scope of the RoPE claim.** RoPE is on in both MoE arms and is not varied in
+Wave 1. It is tested later by re-running the winning MoE configuration with
+`--no-rope`, which measures RoPE's contribution **inside the MoE setting
+only** — it does not measure RoPE's effect on a dense model. Any statement
+about RoPE from this ladder has to carry that scope.
+
+Budget: the scratch recipe's 90 epochs. For the 300-epoch cosine stopped
+early, use the `_300ep_stop100` sibling of the same file, or add
+`--epochs 300 --stop-at N --milestones "[...]"`. Repeat an arm without sharing
+its checkpoint directory or W&B name: `--run-suffix v2`.
 
 ## Or use a notebook
 

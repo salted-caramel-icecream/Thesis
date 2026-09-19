@@ -429,12 +429,21 @@ only the optimization block differs from `scratch` / `pretrained`.
 | Init | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone, or any `last.ckpt`) | `ssl_init` from `--ckpt` (usually the fine-tune's `last.ckpt`) | `mode`, `ckpt_path` | |
 | Epochs | 100 | **fixed per dataset**: fashionmnist 30, eurosat 50, pathmnist 30 | `epochs` ← `DATASETS[...]["finetune_epochs"]` | SimMIM 100-ep FT; small sets train in an hour, an open-ended budget overruns |
 | Base LR | 1.25e-3 @ 512 → 2.5e-3 at 1024 | same | `optim.base_lr`, `optim.lr_reference_batch` | SimMIM yaml `BASE_LR 1.25e-3` |
-| Warmup | 20 ep | 5 ep | `optim.warmup_epochs` | SimMIM yaml `WARMUP_EPOCHS 20`; short budgets |
+| Warmup | **10 ep** | 5 ep | `optim.warmup_epochs` | SimMIM §4.1's ablation protocol — "100-epoch training, and a cosine learning rate scheduler with 10-epoch warm-up". **Not** the reference yaml's `WARMUP_EPOCHS 20`, which belongs to the 800-epoch scaling config; short budgets for `downstream` |
 | Layer-wise LR decay | **0.9** | 0.9 | `optim.layer_decay` (`--layer-decay`; 1.0 = off) | SimMIM yaml `LAYER_DECAY 0.9` at 100-ep pretrain; reasoning below |
 | Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | `ssl_finetune`: SimMIM finetune yaml. `downstream`: **inherited from `ssl_finetune`** — the same fine-tuning regime one stage later, no separate source |
 | Stage-4 LR multiplier | 1.0 | 1.0 | `optim.stage4_lr_multiplier` | as the other recipes |
 | MoE at fine-tune | path 2 loads the pretrained experts as trained; path 3 upcycles from the encoder's FFN (`routed_zero`) | same | `model.moe.upcycle_init` | `docs/HPARAMS.md` §3, `SIMMIM_GUIDE.md` §4 |
 | Everything else | unchanged (batch 1024, wd 0.05, clip 5, DeiT-1 aug) | unchanged | | |
+
+**Warmup 10, not the yaml's 20.** SimMIM publishes two fine-tuning settings.
+Section 4.1's *ablation* protocol — the one used to compare variants, and the
+one this chain reproduces — is 100 epochs with a 10-epoch warmup. The
+`simmim_finetune__swin_base__img224_window7__100ep.yaml` in the reference repo
+carries `WARMUP_EPOCHS 20`, which belongs to the 800-epoch *scaling* config.
+Earlier versions of this table cited the yaml and used 20; the recipe now uses
+10 and this note records that the two settings differ, so a reader comparing
+against either source knows which one is in force.
 
 **Layer decay 0.9 at 200 epochs.** SimMIM fine-tunes with layer decay 0.9
 after its 100-epoch pretrain and, per its §4.3 ablation, tightens it for the

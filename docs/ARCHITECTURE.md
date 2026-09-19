@@ -49,6 +49,28 @@ RoPE in exactly the MoE blocks to reinject position. If you place MoE without
 RoPE, know that those blocks are position-blind (that is itself an ablation,
 but an intentional one).
 
+**Two different knobs, often confused.** `model.moe.moe_block_dwconv` feeds
+**only** the shared-expert branch (`ffn.py`, inside
+`if moe_cfg.get("shared_expert")`): with `shared_expert: false` it is a dead
+knob, and the MoE'd block then contains no DWConv module at all, by the
+invariant above. `model.dense_dwconv` governs the **dense** blocks and is a
+single bool handed identically to every one of them (`pvt.py`, inside the
+per-block comprehension but with no dependence on the stage or block index),
+unlike `use_moe` / `use_rope`, which are per-block placement lookups.
+
+So "remove the DWConv from one block only" is already true for a MoE'd block
+without a shared expert, and is **not expressible for a dense block**: at B2
+you can have 16 of 16 dense blocks with the conv, or 0 of 16, and nothing in
+between. A future arm that needs a *dense* block stripped while its
+neighbours keep theirs — a dense + RoPE arm built to mirror a MoE arm
+block-for-block, say — needs a small addition, deliberately not built until
+something needs it: a `model.dense_dwconv_placement` following the same
+per-stage list convention as `moe_placement` / `rope_placement` (`-1` = the
+stage's last block), threaded through `PyramidVisionTransformerV2` → `Block`
+→ `Mlp(use_dwconv=...)`, a run-name marker distinct from the global `_nodw`
+so the two cannot collide on a checkpoint directory, validation, and tests.
+Unset would mean today's behaviour exactly, so no existing arm moves.
+
 **Shared expert (`moe.shared_expert`, optional, default off).** An always-on
 dense FFN added to the routed output for every token:
 

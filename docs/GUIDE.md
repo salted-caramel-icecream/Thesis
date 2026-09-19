@@ -224,22 +224,41 @@ re-downloading 160 GB.
 |---|---|
 | what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
 | licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
-| HF id | `yukimasano/pass` — single `train` split, no validation/test |
+| source | **not the Hub.** `yukimasano/pass` ships a loading script (`pass.py`), `datasets` removed loading-script support in 5.0.0, and the repo has no `refs/convert/parquet` branch to fall back on (at ~167 GB it is past the Hub's auto-conversion limit). The images come from Zenodo (record 6615455) via the dataset's own `download.sh`; this repo converts the extracted folder. Single `train` split, no validation/test |
 | `arrow_dirs` key | `pass` |
-| disk | ~166 GB snapshot; **~333 GB free while building** (the staged build holds the Arrow cache and the snapshot at once; a naive build would peak near 500 GB) |
+| disk | ~166 GB snapshot, and **~333 GB while building**: the extracted JPEGs (~167 GB) and the snapshot (~166 GB) must coexist, because `save_to_disk` reads the JPEGs to embed them. `imagefolder`'s own Arrow cache holds file *paths*, not pixels, so it costs kilobytes. Delete the JPEGs once the build prints `done` and you are back to ~166 GB |
 | usable with | `task: "ssl"` only — `train.py --task ssl --dataset pass` or `notebooks/03_ssl_pretrain.ipynb` (SimMIM by default, `--ssl-method jepa`). Every supervised recipe refuses it at validate time: the corpus has no labels |
 | validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is `evaluate.py` (k-NN, linear probe) plus the intermediate fine-tune on a labelled set (`docs/SIMMIM_GUIDE.md` §6) |
 
+Two steps. First fetch and extract the tars with the dataset's own script —
+delete each tar as it extracts if space is tight, since the tars and the
+extracted JPEGs are each ~167 GB and never need to coexist:
+
 ```bash
-python download_data.py --dataset pass --out /data/pass_arrow                       # Linux / macOS / WSL2
-python download_data.py --dataset pass --out D:/data/pass_arrow --hf-cache E:/hf     # Windows; cache on another drive
+git clone https://github.com/yukimasano/PASS
+cd PASS && bash download.sh /data/pass_jpg
 ```
 
-The script downloads, converts to Arrow, **deletes only PASS's raw download
-under the HF hub cache** (logged as `[cleanup] removing the raw download of
-yukimasano/pass only`), then writes the snapshot. It prints the snapshot's
-feature names when the conversion finishes; the loader itself finds the image
-column by feature type and never reads the creator, date or GPS columns.
+Then convert that folder into the snapshot this repo reads:
+
+```bash
+python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
+rm -rf /data/pass_jpg      # only after it prints `done` — reclaims ~167 GB
+```
+
+`--dataset pass` **without** `--from-images` exits 2 with that route spelled
+out, rather than a traceback from inside `datasets`.
+
+The conversion passes `drop_labels=True` deliberately: `download.sh` extracts
+into numbered subfolders, and `imagefolder` would otherwise read those
+directory names as a `ClassLabel` and hand an unlabelled corpus a fabricated
+ground truth. The snapshot ends up with one `image` column, which is what the
+loader expects — it finds the image column by feature type and never reads the
+creator, date or GPS columns. The build also checks the row count against
+PASS's own 1,439,588 and warns loudly if the extraction came up short.
+
+Because `save_to_disk` embeds the image bytes, the finished snapshot is
+self-contained: the JPEG folder and the `imagefolder` cache can both go.
 
 ### Small downstream sets (`--recipe downstream`)
 

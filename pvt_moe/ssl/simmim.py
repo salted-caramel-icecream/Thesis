@@ -216,10 +216,14 @@ class LitSimMIM(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, _ = batch                                       # labels unused (PASS has none)
         out = self.masked_forward(x)
+        # on_step for the two that can expose broken masking early: at b2/224 on
+        # ImageNet an epoch is 85-170 min, and epoch-end-only logging meant the
+        # realised mask ratio and the reconstruction term did not exist until
+        # then. With log_every_n_steps=50 they land within the first minutes.
         self.log("ssl_loss", out["loss"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("recon_loss", out["recon"], on_step=False, on_epoch=True)
+        self.log("recon_loss", out["recon"], on_step=True, on_epoch=True)
         self.log("train_aux", out["aux"], on_step=False, on_epoch=True)
-        self.log("mask_ratio", out["mask_ratio"], on_step=False, on_epoch=True)
+        self.log("mask_ratio", out["mask_ratio"], on_step=True, on_epoch=True, prog_bar=True)
         if batch_idx == 0:
             self._last_x = x[:16].detach()
         return out["loss"]
@@ -299,7 +303,12 @@ class LitSimMIM(pl.LightningModule):
         out = {"ssl": {
             "method": "simmim",
             "mask_patch_size": self.ssl["mask_patch_size"],
-            "mask_ratio": self.ssl["mask_ratio"],
+            # CONFIGURED, under its own key: results.record() has already put the
+            # MEASURED ratio in "mask_ratio", and this dict is merged over it.
+            # Writing the configured value there made results.md report 0.600
+            # however the masker actually behaved, which is the one number that
+            # could have caught a broken mask.
+            "mask_ratio_configured": self.ssl["mask_ratio"],
             "mask_space": self.mask_space,
             "note": ("linear-probe / k-NN accuracy is EXPECTED to be low under masked image "
                      "modelling; they are collapse detectors here. The headline number for a "

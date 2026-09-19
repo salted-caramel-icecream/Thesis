@@ -158,4 +158,11 @@ def test_download_cleanup_removes_only_the_pass_hub_entry():
             assert "refusing" in str(e)
         else:
             raise AssertionError("must refuse a path outside the hub cache")
-    assert download_data.DATASETS["pass"][0] == "yukimasano/pass" and download_data.DATASETS["pass"][3] is False
+    # PASS itself no longer HAS a hub entry — its repo ships a loading script
+    # datasets 5.0 cannot run, so the registry carries no repo id for it and
+    # the build comes from a local image folder (--from-images). The cleanup
+    # helper above is still exercised on that id because it is the path an old
+    # cache would have used.
+    assert download_data.DATASETS["pass"][0] is None, "pass must not claim a Hub source"
+    assert download_data.DATASETS["pass"][3] is False, "pass is not gated"
+    assert "pass" in download_data.IMAGEFOLDER_DATASETS

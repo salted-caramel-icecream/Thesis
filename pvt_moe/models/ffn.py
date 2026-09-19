@@ -137,6 +137,9 @@ class MoEMlp(nn.Module):
         self.backend = moe_cfg["backend"]
         self.num_experts = moe_cfg["num_experts"]
         self.top_k = moe_cfg["top_k"]
+        # Kept for the drop accounting in utils.diagnostics: Tutel's layer does
+        # not expose the capacity it enforces, and megablocks has none at all.
+        self.capacity_factor = moe_cfg.get("capacity_factor")
         self.in_features = in_features
         self.hidden_features = hidden_features
         self.drop = nn.Dropout(drop)

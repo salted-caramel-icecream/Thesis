@@ -2,8 +2,9 @@
 """Build the Arrow snapshot the training pipeline expects.
 
     python download_data.py --out /data/imagenet_arrow                     # ImageNet-1k
-    python download_data.py --dataset pass --out /data/pass_arrow           # PASS (SSL only)
-    python download_data.py --dataset pass --out D:/data/pass_arrow --hf-cache E:/hf_cache
+    # PASS (SSL only) is NOT on the Hub any more — extract it with the project's
+    # own download.sh (Zenodo record 6615455), then convert the folder:
+    python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
     python download_data.py --out /data/imagenet_25 --fraction 0.25         # a quarter of train, ALL of val
     python download_data.py --from-snapshot /data/imagenet_arrow --out /data/imagenet_20k \\
                             --n-train 20000 --n-val 2000                   # carve, no network
@@ -20,8 +21,20 @@ to an interactive session is a good way to lose it to a dropped connection.
 On a remote box run it under tmux:
 
     tmux new -s dataprep
-    python download_data.py --dataset pass --out /data/pass_arrow
+    python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
     # Ctrl-B then D to detach; `tmux attach -t dataprep` to come back
+
+PASS takes a different route entirely (``--from-images``). Its Hub repo ships
+a loading script, ``datasets`` dropped loading-script support in 5.0.0, and the
+repo has no ``refs/convert/parquet`` branch to fall back on, so there is
+nothing to load remotely: the images come from Zenodo via the dataset's own
+``download.sh`` and this script converts the extracted folder. Its disk ledger
+is its own — ``imagefolder``'s Arrow cache holds file PATHS (kilobytes), not
+pixels, so the two copies that matter are the extracted JPEGs (~167 GB) and
+the snapshot (~166 GB), and they MUST coexist: ``save_to_disk`` reads the
+JPEGs to embed them. Peak ~333 GB, falling to ~166 GB once the JPEGs are
+deleted afterwards. ``drop_labels=True`` is passed explicitly — PASS is
+unlabelled and its extracted subfolders would otherwise become classes.
 
 Disk, the thing that bites: a naive ``load_dataset`` + ``save_to_disk`` keeps
 THREE copies at once — the raw download under ``<HF cache>/hub/``, the
@@ -85,7 +98,13 @@ DATASETS = {
     "imagenet-22k": ("timm/imagenet-22k-wds", 1300, 2600, True, 0, 21841),
     # PASS: 1,439,588 unlabelled images, CC-BY 4.0, no people (Asano et al.,
     # NeurIPS Datasets & Benchmarks 2021). Single 'train' split. SSL only.
-    "pass": ("yukimasano/pass", 166, 333, False, 0, None),
+    # Repo id None: NOT buildable from the Hub. yukimasano/pass ships a
+    # loading script (pass.py) and `datasets` removed loading-script support
+    # in 5.0.0; the repo has no refs/convert/parquet branch either (at 167 GB
+    # it is past the Hub's auto-conversion limit), so there is nothing to load
+    # remotely. Build it from the official Zenodo tars instead — see
+    # IMAGEFOLDER_HELP and --from-images.
+    "pass": (None, 166, 333, False, 0, None),
     # Small downstream sets (pvt_moe.config.DATASETS carries classes, licences,
     # native sizes and the fixed fine-tune budgets). Repo id None = not
     # verified from this machine: pass --hf-id (the registry's hf_id_hint is
@@ -96,6 +115,44 @@ DATASETS = {
 }
 #: the small sets: normalised layout, --hf-id / --npz, seeded carve-outs
 SMALL_DATASETS = ("fashionmnist", "eurosat", "pathmnist")
+
+#: Sets built from a LOCAL folder of extracted images (--from-images) rather
+#: than from the Hub, because the Hub cannot serve them any more.
+IMAGEFOLDER_DATASETS = ("pass",)
+
+#: PASS's own count (Asano et al. 2021). A short build means the extraction
+#: did not finish — worth a loud warning, not a silent 900k-image corpus.
+PASS_EXPECTED_IMAGES = 1_439_588
+
+#: What to tell someone who asked for PASS with no local images.
+IMAGEFOLDER_HELP = """\
+PASS cannot be downloaded through `datasets` any more.
+
+  why: the Hub repo yukimasano/pass ships a LOADING SCRIPT (pass.py), and
+       datasets removed loading-script support in 5.0.0. The repo has no
+       refs/convert/parquet branch to fall back on either — at ~167 GB it is
+       past the Hub's auto-conversion limit — so there is nothing to load.
+
+  do this instead (the dataset's own route, via Zenodo record 6615455):
+
+    1. fetch and extract the tars with the official script
+       (github.com/yukimasano/PASS, download.sh) into a folder of JPEGs:
+
+         git clone https://github.com/yukimasano/PASS
+         cd PASS && bash download.sh /data/pass_jpg
+
+       Delete each tar as it extracts if space is tight: the tars and the
+       extracted JPEGs are each ~167 GB and do not have to coexist.
+
+    2. convert that folder into the Arrow snapshot this repo reads:
+
+         python download_data.py --dataset pass --from-images /data/pass_jpg \\
+                                 --out /data/pass_arrow
+
+    3. once step 2 prints `done`, the JPEGs are no longer needed — the
+       snapshot embeds the image bytes (verified) — so `rm -rf /data/pass_jpg`
+       reclaims ~167 GB.
+"""
 
 #: label column names the loader (pvt_moe/data/imagenet.py) probes, in order
 LABEL_KEYS = ("label", "labels", "cls", "fine_label")
@@ -383,6 +440,56 @@ def load_medmnist_npz(path: str, num_classes: int):
     return DatasetDict(out)
 
 
+def count_images(root: str, limit: int | None = None) -> int:
+    """Image files under ``root``, recursively. ``limit`` stops the walk early
+    (enough to answer "is this folder empty?" without stat-ing 1.4M files)."""
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+    n = 0
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if f.lower().endswith(exts):
+                n += 1
+                if limit is not None and n >= limit:
+                    return n
+    return n
+
+
+def build_from_images(src: str, out: str, expected: int | None = None):
+    """A folder of extracted images -> the Arrow snapshot the pipeline reads.
+
+    ``drop_labels=True`` is not optional here: ``imagefolder`` otherwise
+    invents a ClassLabel from the directory names, and PASS is unlabelled — a
+    fabricated label column would be carried for the life of the snapshot and
+    read as ground truth by anything that went looking.
+
+    The snapshot is SELF-CONTAINED: imagefolder's own Arrow cache stores file
+    PATHS (kilobytes), and ``save_to_disk`` embeds the image bytes, so the
+    source folder can be deleted afterwards — but not before, or the save has
+    nothing to read from.
+
+    Returns the ``DatasetDict`` that was written.
+    """
+    from datasets import DatasetDict, load_dataset
+
+    d = load_dataset("imagefolder", data_dir=src, drop_labels=True)
+    splits = dict(d.items())
+    if "train" not in splits:
+        if len(splits) == 1:                      # imagefolder named it after a subfolder
+            splits = {"train": next(iter(splits.values()))}
+        else:
+            raise SystemExit(f"error: no 'train' split in {list(d)} — an unlabelled corpus "
+                             "should be one flat folder of images")
+    d = DatasetDict(splits)
+    n = len(d["train"])
+    if expected is not None and n != expected:
+        print(f"\nWARNING: {n:,} images, expected {expected:,} ({n - expected:+,}). "
+              "A short count means the extraction did not finish — check the tars "
+              "before pretraining on this.\n")
+    print(f"[2/3] save_to_disk({out!r}) — embeds the image bytes, so this is the slow part")
+    d.save_to_disk(out)
+    return d
+
+
 def _write_split_info(out_dir: str, info: dict) -> None:
     import json
 
@@ -406,7 +513,8 @@ class _Parser(argparse.ArgumentParser):
                                              ("--hf-cache", ns.hf_cache is not None),
                                              ("--keep-raw", ns.keep_raw),
                                              ("--hf-id", ns.hf_id is not None),
-                                             ("--npz", ns.npz is not None)) if on]
+                                             ("--npz", ns.npz is not None),
+                                             ("--from-images", ns.from_images is not None)) if on]
             if clashes:
                 self.error("--from-snapshot carves a local snapshot and takes no download flags: "
                            f"drop {', '.join(clashes)}")
@@ -425,8 +533,22 @@ class _Parser(argparse.ArgumentParser):
             self.error("--npz converts a local file and takes no download flags: "
                        "drop --hf-id / --fraction / --hf-cache / --keep-raw")
         if ns.dataset in SMALL_DATASETS and ns.fraction < 1.0:
-            self.error("--fraction is for the parquet-sharded ImageNet / PASS repos; the small "
+            self.error("--fraction is for the parquet-sharded ImageNet repos; the small "
                        "sets are downloaded whole (use --from-snapshot to carve afterwards)")
+        if ns.from_images:
+            if ns.dataset not in IMAGEFOLDER_DATASETS:
+                self.error(f"--from-images applies to {', '.join(IMAGEFOLDER_DATASETS)} only "
+                           f"(got --dataset {ns.dataset}); the others come from the Hub")
+            clashes = [flag for flag, on in (("--fraction", ns.fraction < 1.0),
+                                             ("--hf-id", ns.hf_id is not None),
+                                             ("--npz", ns.npz is not None),
+                                             ("--keep-raw", ns.keep_raw)) if on]
+            if clashes:
+                self.error("--from-images converts a local folder and takes no download "
+                           f"flags: drop {', '.join(clashes)}")
+        elif ns.dataset in IMAGEFOLDER_DATASETS and ns.fraction < 1.0:
+            self.error(f"--fraction cannot apply to {ns.dataset}: it is built from a local "
+                       "image folder (--from-images), not from Hub shards")
         return ns
 
 
@@ -457,6 +579,15 @@ def build_parser() -> argparse.ArgumentParser:
         "The Hub id comes from --hf-id (the registry prints the id to try), MedMNIST from --npz. "
         "Splits the source lacks are carved class-balanced with a fixed seed and recorded in "
         "split_info.json; the class count is checked against pvt_moe.config.DATASETS.")
+    folder = ap.add_argument_group(
+        "sets built from local images (--dataset pass)",
+        "PASS is no longer loadable from the Hub (loading script, and no parquet branch to "
+        "fall back on). Extract it with the project's own download.sh, then convert the "
+        "folder here. Labels are dropped explicitly: the corpus is unlabelled and directory "
+        "names must not become classes.")
+    folder.add_argument("--from-images", metavar="DIR",
+                        help="folder of extracted images to convert into the snapshot")
+
     small.add_argument("--hf-id", metavar="NAMESPACE/NAME",
                        help="Hub id for a small dataset whose id the registry leaves unverified")
     small.add_argument("--npz", metavar="FILE",
@@ -506,12 +637,75 @@ def _carve_main(args) -> int:
     return 0
 
 
+def _imagefolder_main(args, final_gb: float) -> int:
+    """--from-images: a local folder of extracted images -> Arrow snapshot."""
+    src = args.from_images
+    if not os.path.isdir(src):
+        print(f"error: --from-images {src} is not a directory", file=sys.stderr)
+        return 2
+    if count_images(src, limit=1) == 0:
+        print(f"error: no image files under {src} — is this the folder download.sh "
+              f"extracted into?", file=sys.stderr)
+        return 2
+
+    print(f"dataset : {args.dataset} (local images)")
+    print(f"source  : {src}")
+    print(f"output  : {args.out}")
+    print("licence : CC-BY 4.0, not gated — no token needed")
+    if args.hf_cache:
+        os.environ["HF_HOME"] = args.hf_cache          # before any HF import
+        print(f"HF_HOME : {args.hf_cache}")
+
+    # Disk: imagefolder's Arrow CACHE holds file paths (kilobytes), so the two
+    # copies that matter are the extracted images and the snapshot, and they
+    # must coexist — save_to_disk reads the JPEGs to embed them. What has to be
+    # FREE is therefore one snapshot, not two.
+    snap_parent = os.path.dirname(os.path.abspath(args.out)) or "."
+    try:
+        free_gb = shutil.disk_usage(snap_parent).free / 1024**3
+        print(f"snapshot: {snap_parent} — {free_gb:.0f} GB free, need ~{final_gb:.0f} GB "
+              f"(the images stay put until this finishes, then ~{final_gb:.0f} GB more "
+              f"can be reclaimed)")
+        if free_gb < final_gb and not args.force:
+            print(f"\nerror: {args.dataset} needs ~{final_gb:.0f} GB free for the snapshot, "
+                  f"only {free_gb:.0f} GB on {snap_parent}.\n"
+                  "       Free space or pass --force to try anyway.", file=sys.stderr)
+            return 2
+    except OSError:
+        print(f"snapshot: {snap_parent} — cannot stat, skipping the space check")
+
+    print(f"\n[1/3] load_dataset('imagefolder', {src!r}, drop_labels=True) — walking the "
+          f"folder; for a corpus this size expect minutes before the first progress bar\n")
+    expected = PASS_EXPECTED_IMAGES if args.dataset == "pass" else None
+    d = build_from_images(src, args.out, expected=expected)
+
+    print(f"\ndone -> {args.out}")
+    for split in d:
+        print(f"{split:<10}: {len(d[split]):,} rows")
+    report_labels(d["train"], None)
+    print(f"\n[3/3] the snapshot embeds the image bytes: {src} is no longer needed.\n"
+          f"      rm -rf {src}    # reclaims ~{final_gb:.0f} GB")
+    if args.dataset == "pass":
+        print("\nPASS is unlabelled: SSL pretraining only (train.py --task ssl --dataset pass, "
+              "or notebooks/03_ssl_pretrain.ipynb).")
+    print(f"Point the code at it: --data-dir {args.out}  /  "
+          f"dataset.arrow_dirs[{args.dataset!r}] = {args.out!r}")
+    return 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.from_snapshot:
         return _carve_main(args)
 
     repo_id, final_gb, peak_gb, gated, val_gb, expected_classes = DATASETS[args.dataset]
+    if args.from_images:
+        return _imagefolder_main(args, final_gb)
+    if args.dataset in IMAGEFOLDER_DATASETS:
+        # repo_id is None for these: there is nothing to reach on the Hub, and
+        # failing here beats a traceback from inside `datasets`.
+        print(f"\n{IMAGEFOLDER_HELP}", file=sys.stderr)
+        return 2
     fraction = args.fraction
     small = args.dataset in SMALL_DATASETS
     spec = None

@@ -52,7 +52,11 @@ def test_moe_pretraining_needs_an_explicit_ask():
 
 def test_chained_recipes_resolve_their_documented_values():
     c = _cfg(["--recipe", "ssl_finetune", "--ckpt", "/r/sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200/simmim_backbone.pt"])
-    assert c["mode"] == "ssl_init" and c["epochs"] == 100 and c["optim"]["warmup_epochs"] == 20
+    # 10, not the reference yaml's 20: SimMIM section 4.1's ablation protocol
+    # ("100-epoch training, and a cosine learning rate scheduler with 10-epoch
+    # warm-up") is the setting this chain reproduces; 20 is its 800-epoch
+    # scaling config. docs/HPARAMS.md section 3b records both.
+    assert c["mode"] == "ssl_init" and c["epochs"] == 100 and c["optim"]["warmup_epochs"] == 10
     assert c["optim"]["base_lr"] == 1.25e-3 and c["optim"]["lr"] == 1.25e-3 * 1024 / 512
     assert c["optim"]["layer_decay"] == 0.9 and c["model"]["drop_path_rate"] == 0.1
     assert c["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_sslft100_from-dense-simmim200"

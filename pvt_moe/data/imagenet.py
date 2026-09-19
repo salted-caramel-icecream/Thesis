@@ -171,9 +171,14 @@ def build_datasets(cfg: dict):
     if not os.path.isdir(arrow_dir) and ds_cfg["name"] == "pass":
         raise FileNotFoundError(
             f"No Arrow snapshot at {arrow_dir} for PASS. Build it once (no HF token, "
-            "~166 GB final, ~333 GB free while building):\n"
-            f"  python download_data.py --dataset pass --out {arrow_dir}\n"
-            "then re-run."
+            "~166 GB final, ~333 GB free while building). PASS is NOT on the Hub any "
+            "more — its repo ships a loading script datasets 5.0 cannot run — so the "
+            "images come from Zenodo via the dataset's own script, in two steps:\n"
+            "  git clone https://github.com/yukimasano/PASS\n"
+            "  cd PASS && bash download.sh /data/pass_jpg\n"
+            f"  python download_data.py --dataset pass --from-images /data/pass_jpg "
+            f"--out {arrow_dir}\n"
+            "then re-run (and `rm -rf /data/pass_jpg` once it prints done)."
         )
     if not os.path.isdir(arrow_dir):
         raise FileNotFoundError(
