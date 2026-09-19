@@ -110,9 +110,15 @@ def run_identity(cfg: dict) -> dict:
         "drop_path_rate": m["drop_path_rate"],
         "rope": ({"mode": abl["rope_mode"], "placement": abl["rope_placement"],
                   "theta": abl["rope_theta"]} if abl["use_rope"] else None),
+        # capacity_factor and gate_noise change what the router does and are in
+        # neither the run name nor the state dict: a finished run that does not
+        # record them cannot say whether an arm underperformed from capacity
+        # starvation or from expert count.
         "moe": ({"placement": abl["moe_placement"], "num_experts": moe["num_experts"],
                  "top_k": moe["top_k"], "shared_expert": moe["shared_expert"],
-                 "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init")}
+                 "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init"),
+                 "capacity_factor": moe.get("capacity_factor"),
+                 "gate_noise": moe.get("gate_noise")}
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
@@ -120,12 +126,12 @@ def run_identity(cfg: dict) -> dict:
         s = cfg["ssl"]
         ident["ssl"] = {"method": s["method"], "lr": s["lr"], "base_lr": s["base_lr"],
                         "mask_patch_size": s["mask_patch_size"], "mask_ratio": s["mask_ratio"],
-                        "mask_space": s["mask_space"]}
+                        "mask_space": s["mask_space"], "grad_clip": s.get("grad_clip")}
     else:
         o = cfg["optim"]
         ident["optim"] = {"lr": o["lr"], "base_lr": o.get("base_lr"),
                           "layer_decay": o.get("layer_decay"), "warmup_epochs": o["warmup_epochs"],
-                          "weight_decay": o["weight_decay"]}
+                          "weight_decay": o["weight_decay"], "grad_clip": o.get("grad_clip")}
     return ident
 
 
@@ -192,28 +198,39 @@ class ResultsWriter(pl.Callback):
         abl = cfg["model"]["ablation"]
         if not (abl["use_moe"] and any(abl["moe_placement"])):
             return None
-        block = {"aux_weight": cfg["loss"]["aux_weight"]}
+        moe_cfg = cfg["model"]["moe"]
+        block = {"aux_weight": cfg["loss"]["aux_weight"],
+                 "capacity_factor": moe_cfg.get("capacity_factor"),
+                 "gate_noise": moe_cfg.get("gate_noise")}
         model = getattr(pl_module, "model", None)
         loader = getattr(trainer, "val_dataloaders", None)
         if model is not None and loader is not None and self.utilization_batches > 0:
             try:
-                from pvt_moe.utils.diagnostics import expert_utilization
+                from pvt_moe.utils.diagnostics import routing_stats
                 import contextlib
                 import io
                 import math
 
                 with contextlib.redirect_stdout(io.StringIO()):
-                    counts = expert_utilization(model, loader, num_batches=self.utilization_batches)
-                util = {}
-                for name, c in counts.items():
-                    c = c.float()
+                    stats = routing_stats(model, loader, num_batches=self.utilization_batches)
+                util, drops = {}, {}
+                for name, st in stats.items():
+                    c = st["counts"].float()
                     share = c / c.sum().clamp(min=1)
                     p = share[share > 0]
                     util[name] = {"share": [round(float(v), 4) for v in share],
                                   "entropy": round(float(-(p * p.log()).sum()), 4),
                                   "max_entropy": round(math.log(c.numel()), 4),
                                   "tokens": int(c.sum())}
+                    # The direct measurement: what fraction of the routed
+                    # tokens capacity threw away. Separates "MoE did not help"
+                    # from "the tokens never reached an expert".
+                    drops[name] = {"drop_fraction": st["drop_fraction"],
+                                   "dropped": st["dropped"], "routed": st["routed"],
+                                   "capacity": st["capacity"],
+                                   "tokens_per_forward": st["tokens_per_forward"]}
                 block["expert_utilization"] = util
+                block["token_drops"] = drops
                 block["utilization_batches"] = self.utilization_batches
             except Exception as e:  # noqa: BLE001 — diagnostics never kill a run
                 block["expert_utilization"] = {"error": f"{type(e).__name__}: {e}"[:200]}
@@ -436,11 +453,21 @@ def render_markdown(rec: dict) -> str:
     if moe:
         lines += ["", "## MoE", "", f"aux weight {moe.get('aux_weight')} | train_aux "
                   f"{_fmt(acc.get('train_aux') if 'train_aux' in acc else (rec['history'][-1].get('train_aux') if rec.get('history') else None), nd=4)}"]
+        lines[-1] += (f" | capacity_factor {moe.get('capacity_factor')} "
+                      f"| gate_noise {moe.get('gate_noise')}")
         util = moe.get("expert_utilization") or {}
+        drops = moe.get("token_drops") or {}
         if util and "error" not in util:
-            lines += ["", "| block | token share per expert | entropy / max |", "|---|---|---|"]
+            lines += ["", "| block | token share per expert | entropy / max | tokens dropped |",
+                      "|---|---|---|---|"]
             for name, u in util.items():
-                lines.append(f"| {name} | {u['share']} | {u['entropy']:.2f} / {u['max_entropy']:.2f} |")
+                d = drops.get(name) or {}
+                cap = d.get("capacity")
+                dropped = ("n/a (no cap)" if cap is None and d
+                           else f"{d['drop_fraction'] * 100:.2f}% ({d['dropped']}/{d['routed']}, "
+                                f"cap {cap}/expert per fwd)" if d else "not measured")
+                lines.append(f"| {name} | {u['share']} | "
+                             f"{u['entropy']:.2f} / {u['max_entropy']:.2f} | {dropped} |")
     mr = rec.get("mask_routing")
     if mr and "error" not in mr:
         lines += ["", "## Mask-token vs visible-token routing (MoE pretraining)", "",

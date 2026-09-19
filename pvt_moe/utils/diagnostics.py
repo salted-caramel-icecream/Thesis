@@ -4,6 +4,14 @@ Expert utilization is THE first thing to check when an MoE run underperforms:
 top-1 routing can collapse onto a few experts, at which point the extra
 capacity is dead weight. Healthy top-1 routing with 8 experts shows every
 expert between ~5% and ~25% token share and entropy near log(8) = 2.08.
+
+The SECOND thing to check is whether tokens were dropped. An expert takes at
+most ``capacity_factor * ceil(tokens / E)`` tokens per forward (``top_k`` x
+that when routing k-way); everything past that gets exactly zero from the
+routed branch. A collapsed router and a starved capacity look identical in
+the loss and opposite in the fix, so ``routing_stats`` measures both in one
+pass: "MoE did not help" and "the tokens never reached an expert" are
+different results.
 """
 
 from __future__ import annotations
@@ -33,15 +41,59 @@ def gate_logits(moe_mlp, x_flat: torch.Tensor) -> torch.Tensor:
     return lin(x_flat.to(lin.weight.dtype))
 
 
-@torch.no_grad()
-def expert_utilization(model, dataloader, num_batches: int = 50, device=None) -> dict:
-    """Route ``num_batches`` of data and count tokens per expert per MoE block.
+def expert_capacity(moe_mlp, tokens: int) -> int | None:
+    """Per-expert token cap for ONE forward over ``tokens`` tokens.
 
-    Works with both backends via forward-pre-hooks on each ``MoEMlp`` (the
+    The native backend owns the formula (``NativeMoEFFN.capacity_for``) and is
+    asked directly, so this can never drift from what that layer actually
+    enforces. Tutel uses the same formula
+    (``top_k * int(capacity_factor * ceil(tokens / E))``), replicated here
+    because its layer does not expose it.
+
+    ``None`` means no cap applies and nothing can be dropped: the megablocks
+    backend is dropless by construction, and ``capacity_factor <= 0`` is
+    Tutel's dynamic capacity.
+    """
+    layer = getattr(moe_mlp, "moe_layer", None)
+    if getattr(moe_mlp, "backend", None) == "megablocks":
+        return None
+    cap_f = getattr(moe_mlp, "capacity_factor", None)
+    if cap_f is not None and cap_f <= 0:
+        return None
+    fn = getattr(layer, "capacity_for", None)
+    if callable(fn):
+        return int(fn(tokens))
+    if cap_f is None:
+        return None
+    per_expert = math.ceil(tokens / moe_mlp.num_experts)
+    return max(1, moe_mlp.top_k * int(cap_f * per_expert))
+
+
+@torch.no_grad()
+def routing_stats(model, dataloader, num_batches: int = 50, device=None) -> dict:
+    """Route ``num_batches`` of data and measure, per MoE block, BOTH which
+    experts the router picked and how many tokens capacity threw away.
+
+    Works with every backend via forward-pre-hooks on each ``MoEMlp`` (the
     hook recomputes the router decision on the layer's actual input — no
     manual forward re-implementation to drift out of sync).
 
-    Returns ``{block_name: LongTensor[num_experts]}``.
+    Returns ``{block_name: {"counts": LongTensor[E], "routed": int,
+    "dropped": int, "drop_fraction": float, "capacity": int | None,
+    "tokens_per_forward": int, "forwards": int}}``.
+
+    Capacity is enforced per FORWARD over the whole flattened micro-batch
+    (``MoEMlp`` reshapes (B, N, C) -> (B*N, C)), not per image, so the drop
+    accounting is done per forward and then summed — aggregating counts first
+    and applying a cap afterwards would understate drops on a peaked router
+    and overstate them on a flat one.
+
+    ``dropped`` counts routing SLOTS, not tokens: at ``top_k`` k each token
+    makes k requests and ``routed`` is ``k * tokens``. At the top_k=1 every
+    shipped arm uses, a slot is a token and the two coincide. The per-expert
+    queue is filled in token order, exactly as ``NativeMoEFFN.forward`` does
+    it, which makes the count exact there; for Tutel at top_k > 1 it is close
+    but not exact, since Tutel ranks each k-slot separately.
     """
     from pvt_moe.models.ffn import MoEMlp
 
@@ -56,8 +108,10 @@ def expert_utilization(model, dataloader, num_batches: int = 50, device=None) ->
         print("No MoE modules in this model.")
         return {}
 
-    counts = {
-        name: torch.zeros(m.num_experts, dtype=torch.long) for name, m in moe_modules
+    stats = {
+        name: {"counts": torch.zeros(m.num_experts, dtype=torch.long), "routed": 0,
+               "dropped": 0, "capacity": None, "tokens_per_forward": 0, "forwards": 0}
+        for name, m in moe_modules
     }
 
     hooks = []
@@ -66,10 +120,22 @@ def expert_utilization(model, dataloader, num_batches: int = 50, device=None) ->
         def hook(module, args):
             x = args[0]
             x_flat = x.reshape(-1, x.shape[-1])
-            idx = gate_logits(moe_mlp, x_flat).argmax(dim=-1)
-            counts[name] += torch.bincount(
-                idx.cpu(), minlength=moe_mlp.num_experts
-            )
+            tokens, k = x_flat.shape[0], moe_mlp.top_k
+            logits = gate_logits(moe_mlp, x_flat)
+            assign = logits.topk(k, dim=-1).indices if k > 1 else logits.argmax(dim=-1)[:, None]
+            s = stats[name]
+            # counts stay the TOP-1 choice at any k, so the share/entropy
+            # numbers mean the same thing they always did.
+            s["counts"] += torch.bincount(assign[:, 0].cpu(), minlength=moe_mlp.num_experts)
+            s["forwards"] += 1
+            s["tokens_per_forward"] = tokens
+            capacity = expert_capacity(moe_mlp, tokens)
+            s["capacity"] = capacity
+            s["routed"] += tokens * k
+            if capacity is not None:
+                per_expert = torch.bincount(assign.reshape(-1).cpu(),
+                                            minlength=moe_mlp.num_experts)
+                s["dropped"] += int((per_expert - capacity).clamp(min=0).sum())
 
         return hook
 
@@ -91,7 +157,21 @@ def expert_utilization(model, dataloader, num_batches: int = 50, device=None) ->
             h.remove()
         model.train(was_training)
 
-    return counts
+    for s in stats.values():
+        s["drop_fraction"] = (round(s["dropped"] / s["routed"], 6) if s["routed"] else 0.0)
+    return stats
+
+
+@torch.no_grad()
+def expert_utilization(model, dataloader, num_batches: int = 50, device=None) -> dict:
+    """Token counts per expert per MoE block: ``{block_name: LongTensor[E]}``.
+
+    The counts half of ``routing_stats`` (same single pass, same numbers),
+    kept as its own name because the notebooks and ``plot_expert_utilization``
+    take exactly this shape.
+    """
+    return {name: s["counts"]
+            for name, s in routing_stats(model, dataloader, num_batches, device).items()}
 
 
 def plot_expert_utilization(counts: dict):

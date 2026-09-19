@@ -21,6 +21,7 @@ from pvt_moe.engine.callbacks import build_trainer
 from pvt_moe.engine.classifier import LitClassifier
 from pvt_moe.engine.results import ResultsWriter, read_results, render_markdown, run_identity, write_results
 from pvt_moe.eval.knn import knn_classify
+from pvt_moe.models import build_model
 from pvt_moe.eval.lowshot import class_balanced_indices, load_subset, write_subset
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -211,3 +212,70 @@ def test_lowshot_subsets_are_seeded_class_balanced_and_checked_on_load():
                 pass
             else:
                 raise AssertionError(f"must refuse {kw}")
+
+
+def test_results_record_the_knobs_that_change_routing_and_the_tokens_capacity_dropped():
+    """capacity_factor, gate_noise and grad_clip change training, are absent
+    from the run name AND from the state dict, and were recorded nowhere. A
+    finished run has to be able to say whether an arm underperformed because
+    the experts were starved or because the router collapsed — which is what
+    the measured drop fraction separates.
+
+    The drop count is checked against the native backend's own
+    ``dropped_tokens`` counter, so the diagnostic cannot drift from what the
+    layer actually enforces.
+    """
+    from pvt_moe.models.ffn import MoEMlp
+    from pvt_moe.utils.diagnostics import expert_capacity, routing_stats
+
+    # 1. the identity block records all three.
+    cfg = tiny_config(model={"moe": {"capacity_factor": 0.5, "gate_noise": 0.25},
+                             "ablation": {"use_moe": True, "moe_placement": [[], [], [], [-1]]}})
+    ident = run_identity(cfg)
+    assert ident["moe"]["capacity_factor"] == 0.5 and ident["moe"]["gate_noise"] == 0.25
+    assert ident["optim"]["grad_clip"] == cfg["optim"]["grad_clip"]
+    ssl_ident = run_identity(tiny_config(task="ssl", model={"ablation": {"use_moe": False}}))
+    assert ssl_ident["ssl"]["grad_clip"] == cfg["ssl"]["grad_clip"]
+
+    # 2. the measurement is EXACT against the layer that does the dropping.
+    for capacity_factor, expect_drops in ((1.0, True), (0.25, True), (0.0, False)):
+        c = tiny_config(model={"moe": {"backend": "native", "num_experts": 4, "top_k": 1,
+                                       "capacity_factor": capacity_factor, "gate_noise": 0.0,
+                                       "shared_expert": False},
+                               "ablation": {"use_moe": True, "moe_placement": [[], [], [], [-1]]}})
+        with contextlib.redirect_stdout(io.StringIO()):
+            model = build_model(c)
+        torch.manual_seed(0)
+        batch = [(torch.randn(4, 3, 64, 64), torch.zeros(4, dtype=torch.long))]
+        with contextlib.redirect_stdout(io.StringIO()):
+            stats = routing_stats(model, batch, num_batches=1)
+        name, st = next(iter(stats.items()))
+        native = next(m for _, m in model.named_modules() if isinstance(m, MoEMlp))
+        if expect_drops:
+            assert st["capacity"] == expert_capacity(native, st["tokens_per_forward"])
+            assert st["dropped"] == native.moe_layer.dropped_tokens, (capacity_factor, st)
+            assert st["drop_fraction"] == round(st["dropped"] / st["routed"], 6)
+        else:
+            # capacity_factor 0 is Tutel's dynamic capacity: nothing can drop.
+            assert st["capacity"] is None and st["dropped"] == 0 and st["drop_fraction"] == 0.0
+        assert int(st["counts"].sum()) == st["tokens_per_forward"]
+
+    # 3. a real run writes it per epoch, and results.md shows it.
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = _labelled_snapshot(os.path.join(d, "in1k_arrow"))
+            cfg, lit, trainer = _fit(d, root)
+            rec = read_results(os.path.join(d, cfg["run_name"]))
+            moe_cfg = cfg["model"]["moe"]
+            assert rec["moe"]["capacity_factor"] == moe_cfg["capacity_factor"]
+            assert rec["moe"]["gate_noise"] == moe_cfg["gate_noise"]
+            drops = rec["moe"]["token_drops"]["block4.1.mlp"]
+            assert 0.0 <= drops["drop_fraction"] <= 1.0
+            assert drops["routed"] > 0 and drops["capacity"] >= 1
+            assert drops["dropped"] == round(drops["drop_fraction"] * drops["routed"])
+            md = open(os.path.join(d, cfg["run_name"], "results.md")).read()
+            assert "tokens dropped" in md
+            assert f"capacity_factor {moe_cfg['capacity_factor']}" in md
+    finally:
+        undo()

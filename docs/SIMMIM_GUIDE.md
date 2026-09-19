@@ -260,10 +260,27 @@ resolution, seed, the **chain** of stages that produced the weights, the
 parent checkpoint, git commit, config hash), accuracy (latest / best
 validation top-1 & top-5, macro precision / recall, losses), measured
 efficiency (seconds per epoch, images per second, peak VRAM, parameters,
-GFLOPs when fvcore is installed), MoE diagnostics (aux loss, expert token
-shares and routing entropy on validation batches; the mask-routing split for
-path 2), the environment, a per-epoch history, and whatever `evaluate.py`
-merged under `eval`.
+GFLOPs when fvcore is installed), MoE diagnostics (aux loss, `capacity_factor`
+and `gate_noise`, expert token shares and routing entropy on validation
+batches, the **token-drop fraction** capacity cost that epoch, and the
+mask-routing split for path 2), the environment, a per-epoch history, and
+whatever `evaluate.py` merged under `eval`.
+
+**Token drops (`moe.token_drops`).** An expert takes at most
+`capacity_factor x ceil(tokens / E)` tokens per forward (`top_k` x that when
+routing k-way) and everything past that receives exactly zero from the routed
+branch. A collapsed router and a starved capacity look the same in the loss
+and have opposite fixes, so the measurement is recorded next to the shares:
+`drop_fraction`, the raw `dropped` / `routed` counts, the `capacity` enforced
+and the `tokens_per_forward` it was computed from. Capacity applies to the
+whole flattened micro-batch, not per image — at B=256 on B2's 7x7 stage-4 map
+that is 12,544 tokens and, with E=8 at `capacity_factor` 1.0, 1,568 per
+expert, so a token is only lost to genuine router imbalance, not to
+small-sample noise. Measured from the router's own decisions
+(`pvt_moe.utils.diagnostics.routing_stats`): exact at `top_k` 1, which every
+shipped arm uses, and cross-checked against `NativeMoEFFN.dropped_tokens`, the
+counter of the layer that does the dropping. It is not measured on SSL runs,
+which have no validation loader.
 
 ---
 
