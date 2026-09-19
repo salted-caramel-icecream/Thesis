@@ -20,6 +20,13 @@ through the same front ends: `train.py --task ssl` and
 (2111.09886) never reached this machine, so the cross-check of §1 against the
 paper's §4.1 / appendix is still open; the yaml values are quoted verbatim
 with their file names so that check takes minutes once the PDF is in `docs/`.
+**One exception, flagged where it appears:** the UM-MAE figure in §9 is cited
+from that paper's table, not derived from any code that ran here.
+
+One §1 value HAS since been settled against the paper: the intermediate
+fine-tune's warmup is 10 epochs, per SimMIM §4.1's ablation protocol, not the
+reference yaml's 20 (which belongs to the 800-epoch scaling config) —
+`docs/HPARAMS.md` §3b records both settings and which is in force.
 
 ---
 
@@ -314,6 +321,9 @@ interesting part — whether routing learned without labels differs from
 routing upcycled after supervised training — and it does not need the SSL
 arm to beat the supervised one to be informative.
 
+For an absolute magnitude to sanity-check the ImageNet SimMIM arm against
+(cited, not verified here), see §9.
+
 ---
 
 ## 8. Layer-wise LR decay 0.9 at 200 epochs — the reasoning
@@ -345,6 +355,41 @@ map to whole tokens at every stage, which the 32-px unit does here
 resolution avoids the RoPE-grid change a 192 → 224 switch would cause for
 RoPE-Mixed frequencies (§2 table). SimMIM at 224 satisfies both without
 token dropping, which PVT v2's conv stems, SRA and DWConv could not survive.
+
+**The one number kept from it — a sanity anchor, CITED not verified.** UM-MAE
+Table 3 reports **79.28 top-1** on ImageNet-1k for **PVT-S** pretrained with
+**SimMIM for 200 epochs and fine-tuned for 100**. Provenance, stated plainly
+because it is the only figure in this file that did not come from code that
+ran here: it is read from the paper's table (confirmed by the author of this
+repo against a local copy of arXiv 2205.10063), *not* reproduced from a
+reference implementation, which could not be reached from this environment.
+Treat it accordingly — a magnitude to sanity-check against, not a baseline to
+claim parity with.
+
+Two differences make it an anchor rather than a comparison:
+
+| | UM-MAE Table 3 | the ImageNet SimMIM arm here |
+|---|---|---|
+| architecture | PVT-**S** | PVT v2 **B2** — a different family, not a size of the same one |
+| pretrain budget | 200 ep | 100 ep (SimMIM §4.1's ablation protocol) |
+| fine-tune | 100 ep | 100 ep (`recipe: ssl_finetune`) |
+| masking | UM-MAE's uniform masking | SimMIM 32-px, ratio 0.6, `mask_space: token` |
+
+So a result some points either side of 79.28 says nothing on its own. What it
+is good for is catching an order-of-magnitude failure: an ImageNet SimMIM →
+fine-tune chain that lands near 70, or near 82, means something in the chain
+is wrong before any ablation conclusion is drawn from it.
+
+**Why the ImageNet arm exists at all.** PASS has no reference number — the
+PASS authors validated MoCo-v2, SwAV and DINO, all contrastive or
+self-distillation, and no third-party masked-image-modelling result on PASS
+is known to this repo (a negative claim about the literature, scoped to what
+was checked: the PASS paper's own experiments). Running SimMIM on ImageNet-1k
+first supplies the reference the PASS arm otherwise lacks, and the pair then
+isolates the pretraining corpus with architecture, schedule, masking and
+fine-tune all fixed. The clean-provenance argument for PASS covers
+**pretraining only**: the evaluation stage fine-tunes and measures on
+ImageNet-1k, so the pipeline as a whole is not ImageNet-free.
 
 ---
 
