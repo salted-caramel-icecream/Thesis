@@ -227,22 +227,33 @@ def test_carve_counts_must_be_positive_and_seed_needs_from_snapshot():
 
 def test_free_space_preflight_in_main_uses_the_scaled_requirement():
     """main() must call required_gb with the fraction: with almost no disk it
-    exits 2 BEFORE any network access, naming the scaled figure. PASS is not
-    gated, so no token is involved either."""
+    exits 2 BEFORE any network access, naming the scaled figure.
+
+    ImageNet-1k, not PASS: PASS stopped being a fractional Hub build when its
+    loading script became unloadable, and --fraction is refused for it now.
+    The gate check runs first, so the test supplies a token it never spends.
+    """
     import contextlib, io, types
 
     real = download_data.shutil.disk_usage
     download_data.shutil.disk_usage = lambda path: types.SimpleNamespace(free=1 * 1024**3, total=0, used=0)
+    had_token = os.environ.get("HF_TOKEN")
+    os.environ["HF_TOKEN"] = "hf_not_a_real_token_never_used"
     try:
-        for fraction, expect, scaled_note in (("0.25", "~83 GB", True), ("1.0", "~333 GB", False)):
+        for fraction, expect, scaled_note in (("0.25", "~90 GB", True), ("1.0", "~320 GB", False)):
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = download_data.main(["--dataset", "pass", "--out", "/tmp/_wf_pass_arrow", "--fraction", fraction])
-            assert rc == 2, (fraction, rc)
+                rc = download_data.main(["--dataset", "imagenet-1k",
+                                         "--out", "/tmp/_wf_in1k_arrow", "--fraction", fraction])
+            assert rc == 2, (fraction, rc, err.getvalue())
             assert expect in err.getvalue(), (fraction, err.getvalue())
             assert ("at --fraction" in err.getvalue()) is scaled_note, err.getvalue()
     finally:
         download_data.shutil.disk_usage = real
+        if had_token is None:
+            os.environ.pop("HF_TOKEN", None)
+        else:
+            os.environ["HF_TOKEN"] = had_token
 
 
 def _documented_commands():
@@ -293,3 +304,105 @@ def test_quick_bench_notebook_config_cell_points_at_a_snapshot_dir():
     assert len(md) >= 1
     assert "4,098" in "".join(md[0]["source"]) or "4098" in "".join(md[0]["source"])
     assert "num_workers" in "".join(md[0]["source"])
+
+
+def test_pass_refuses_the_hub_route_with_an_explanation_not_a_traceback():
+    """yukimasano/pass ships a loading script and datasets 5.0 removed loading
+    -script support; the repo has no parquet branch either. Asking for PASS
+    without local images must say that, and say what to do, rather than dying
+    inside `datasets` — and it must never reach the network to find out.
+    """
+    import contextlib, io
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = download_data.main(["--dataset", "pass", "--out", "/tmp/_wf_pass_arrow"])
+    msg = err.getvalue()
+    assert rc == 2
+    low = msg.lower()
+    for expected in ("loading script", "5.0", "refs/convert/parquet", "download.sh",
+                     "6615455", "--from-images"):
+        assert expected in low, (expected, msg)
+    # the registry carries no Hub id, so nothing can try to fetch it
+    assert download_data.DATASETS["pass"][0] is None
+
+
+def test_from_images_flag_rules():
+    p = download_data.build_parser()
+    ok = p.parse_args(["--dataset", "pass", "--from-images", "/data/pass_jpg",
+                       "--out", "/data/pass_arrow"])
+    assert ok.from_images == "/data/pass_jpg" and ok.dataset == "pass"
+
+    def refused(argv, needle):
+        try:
+            p.parse_args(argv)
+        except SystemExit:
+            return True
+        raise AssertionError(f"should have been refused ({needle}): {argv}")
+
+    # only the imagefolder sets
+    refused(["--dataset", "imagenet-1k", "--from-images", "/x", "--out", "/o"], "wrong dataset")
+    refused(["--dataset", "eurosat", "--from-images", "/x", "--out", "/o"], "small set")
+    # no download flags alongside it
+    for clash in (["--fraction", "0.5"], ["--hf-id", "a/b"], ["--npz", "/f.npz"], ["--keep-raw"]):
+        refused(["--dataset", "pass", "--from-images", "/x", "--out", "/o", *clash], clash[0])
+    # a carve takes no --from-images
+    refused(["--from-snapshot", "/s", "--out", "/o", "--n-train", "10", "--n-val", "2",
+             "--from-images", "/x"], "--from-snapshot")
+    # PASS has no shards to take a fraction of any more
+    refused(["--dataset", "pass", "--fraction", "0.5", "--out", "/o"], "--fraction on pass")
+
+
+def test_from_images_builds_an_unlabelled_single_split_snapshot():
+    """The extracted PASS tree has subfolders. Without drop_labels imagefolder
+    would turn those directory names into a ClassLabel and the snapshot would
+    carry fabricated ground truth for an unlabelled corpus. It must not.
+    """
+    import contextlib, io
+
+    from datasets import load_from_disk
+
+    with tempfile.TemporaryDirectory() as d:
+        src, out = os.path.join(d, "jpg"), os.path.join(d, "arrow")
+        rng = np.random.default_rng(0)
+        for sub in ("0", "1"):                       # the layout download.sh leaves
+            os.makedirs(os.path.join(src, sub))
+            for i in range(4):
+                PILImage.fromarray(rng.integers(0, 255, (32, 32, 3), dtype=np.uint8)).save(
+                    os.path.join(src, sub, f"{sub}_{i}.jpg"))
+        assert download_data.count_images(src) == 8
+        assert download_data.count_images(src, limit=1) == 1      # early exit
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dd = download_data.build_from_images(src, out, expected=download_data.PASS_EXPECTED_IMAGES)
+        assert list(dd) == ["train"] and len(dd["train"]) == 8
+        assert dd["train"].column_names == ["image"], dd["train"].column_names
+        # a short extraction is called out rather than silently pretrained on
+        assert "WARNING" in buf.getvalue() and "1,439,588" in buf.getvalue()
+
+        # the snapshot embeds the bytes: the source folder is disposable after
+        import shutil as _sh
+        _sh.rmtree(src)
+        back = load_from_disk(out)
+        assert back["train"].column_names == ["image"] and len(back["train"]) == 8
+        assert back["train"][0]["image"].size == (32, 32)
+
+
+def test_from_images_rejects_a_missing_or_empty_folder():
+    import contextlib, io, types
+
+    real = download_data.shutil.disk_usage
+    download_data.shutil.disk_usage = lambda p: types.SimpleNamespace(free=10**15, total=0, used=0)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            empty = os.path.join(d, "empty"); os.makedirs(empty)
+            for src, needle in ((os.path.join(d, "nope"), "not a directory"),
+                                (empty, "no image files")):
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = download_data.main(["--dataset", "pass", "--from-images", src,
+                                             "--out", os.path.join(d, "arrow")])
+                assert rc == 2 and needle in err.getvalue(), (needle, err.getvalue())
+    finally:
+        download_data.shutil.disk_usage = real

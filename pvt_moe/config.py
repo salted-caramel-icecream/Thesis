@@ -32,8 +32,10 @@ import re
 #: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
 #: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
 #: refused by every supervised recipe at validate time. PASS (Asano et al.,
-#: NeurIPS Datasets & Benchmarks 2021; HF ``yukimasano/pass``): 1,439,588
-#: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
+#: NeurIPS Datasets & Benchmarks 2021): 1,439,588 images, CC-BY 4.0, no people,
+#: a single ``train`` split, no labels. Its ``hf_id`` is None because the Hub
+#: cannot serve it (loading script, no parquet branch); it is built from the
+#: Zenodo tars with ``download_data.py --from-images`` — docs/GUIDE.md section 2.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
 #: ``finetune_epochs`` is a FIXED budget per small dataset: open-ended runs on
@@ -48,7 +50,8 @@ DATASETS = {
                      "hf_id": "timm/imagenet-22k-wds", "gated": True, "finetune_epochs": None,
                      "licence": "ImageNet terms of access; gated on HF"},
     "pass": {"num_classes": 0, "labelled": False, "tag": "pass",
-             "hf_id": "yukimasano/pass", "gated": False, "finetune_epochs": None,
+             "hf_id": None, "gated": False, "finetune_epochs": None,
+             "hf_id_hint": "yukimasano/pass (loading script — not loadable; use Zenodo)",
              "licence": "CC-BY 4.0 (images and dataset)"},
     # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
     # Native resolutions are far below 224; dataset.img_size (224) upsamples
