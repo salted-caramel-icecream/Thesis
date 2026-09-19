@@ -248,7 +248,7 @@ the first step: the run name printed at start-up begins `sv1_b2_`.
 | 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
 | 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
 | 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
-| 3 | SimMIM pretrain | `--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100` | `sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100` |
+| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1+sh_rope-s3b5+s4b2_ln_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -258,22 +258,28 @@ The two differ **only** in expert count, so the pair prices E at fixed
 placement.
 
 ```bash
-COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 12 \
+COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
         --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
 
 CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
 CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
 CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
-CUDA_VISIBLE_DEVICES=3 python train.py --task ssl --ssl-method simmim --no-moe \
-    --dataset imagenet-1k --epochs 100 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 $COMMON
 ```
 
-`drop_path` resolves to 0.1 on GPUs 0–2 (the variant's official rate) and 0.0
-on GPU 3 (SimMIM's pretrain value). All four run names are distinct, so no two
-arms can share a checkpoint directory.
+`drop_path` resolves to 0.1 on all four (the variant's official rate). All four
+run names are distinct, so no two arms can share a checkpoint directory.
 
-**The SSL pair.** GPU 3 pretrains on **ImageNet-1k**; the same command with
-`--dataset pass --data-dir /data/pass_arrow` is the second arm. Running
+**GPU 2 vs GPU 3 moves two variables, not one.** `scratch_08` places MoE in
+stages 3 *and* 4 **and** turns the shared expert on (`+sh` in its run name),
+while GPUs 1–2 have none. So that pair is not a clean placement ablation: read
+it as "wider MoE with a shared expert" against "stage-4-only without one".
+GPU 1 vs GPU 2 remains the clean expert-count comparison.
+
+**The SSL pair — a later wave, not this one.** The SimMIM arms are
+`--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
+(`sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100`) and the same command with
+`--dataset pass --data-dir /data/pass_arrow`. Running
 ImageNet first gives the PASS arm a reference it otherwise has none of — no
 third-party MIM result on PASS is known — and the pair then isolates the
 pretraining corpus with everything else fixed. MoE is **off on both**: adding
