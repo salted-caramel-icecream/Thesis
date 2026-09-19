@@ -702,12 +702,26 @@ def _exportable(cfg: dict) -> dict:
     """
     from pvt_moe.config import ROPE_THETA_DEFAULT, build_run_tag
 
+    from pvt_moe.config import resolve_lr
+
     out = copy.deepcopy({k: v for k, v in cfg.items() if not k.startswith("_")})
     if out.get("run_name") == build_run_tag(cfg):
         out["run_name"] = None
     abl = out["model"]["ablation"]
     if abl.get("rope_theta") == ROPE_THETA_DEFAULT.get(abl.get("rope_mode")):
         abl["rope_theta"] = None
+    # The SSL LRs are scaled from their *_base by the effective batch. Written
+    # back as numbers they would be treated as explicit on reload and would NOT
+    # rescale, so `--config saved.json --batch-size X` would keep the old
+    # machine's LRs. Null the ones that are exactly the derivation.
+    ssl = out.get("ssl") or {}
+    eff = cfg.get("effective_batch_size")
+    ref = ssl.get("lr_reference_batch")
+    if eff and ref:
+        for key, base_key in (("lr", "base_lr"), ("warmup_lr", "warmup_lr_base"),
+                              ("final_lr", "final_lr_base")):
+            if ssl.get(base_key) is not None and ssl.get(key) == resolve_lr(ssl[base_key], eff, ref):
+                ssl[key] = None
     return out
 
 

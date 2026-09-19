@@ -266,6 +266,20 @@ batches, the **token-drop fraction** capacity cost that epoch, and the
 mask-routing split for path 2), the environment, a per-epoch history, and
 whatever `evaluate.py` merged under `eval`.
 
+**Watching a pretraining run early.** `ssl_loss`, `recon_loss` and
+`mask_ratio` are logged **per step** (every `log_every_n_steps`, 50 by
+default) as well as per epoch, because an ImageNet epoch at B2/224 is 85–170
+minutes and epoch-end-only logging meant the two numbers that can expose a
+broken masker did not exist until then. `results.json` records the **measured**
+mask ratio under `ssl.mask_ratio` and the **configured** one under
+`ssl.mask_ratio_configured`; `results.md` prints both, labelled. They are not
+expected to be equal: the mask count is `ceil(patches x ratio)`, so at 224 px
+with 32-px patches it is `ceil(49 x 0.6) = 30`, i.e. 30/49 = **0.612 measured
+against 0.600 configured**. A measured value far from that — 0.0, 1.0, or
+drifting between steps — is the masker, not the schedule. (Until this was
+fixed, `results.md` printed the configured value whatever the masker did,
+because `results_extra` overwrote the measured one.)
+
 **Token drops (`moe.token_drops`).** An expert takes at most
 `capacity_factor x ceil(tokens / E)` tokens per forward (`top_k` x that when
 routing k-way) and everything past that receives exactly zero from the routed

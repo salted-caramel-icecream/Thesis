@@ -118,7 +118,8 @@ def run_identity(cfg: dict) -> dict:
                  "top_k": moe["top_k"], "shared_expert": moe["shared_expert"],
                  "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init"),
                  "capacity_factor": moe.get("capacity_factor"),
-                 "gate_noise": moe.get("gate_noise")}
+                 "gate_noise": moe.get("gate_noise"),
+                 "aux_weight": (cfg.get("loss") or {}).get("aux_weight")}
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
@@ -343,13 +344,39 @@ def read_results(dirpath: str) -> dict | None:
         return None
 
 
-#: Resolved fields that change training but leave NO trace in the checkpoint,
-#: so a resume can silently continue a run under different settings. Each is
-#: compared against the identity block results.json recorded for the run being
-#: resumed. ``drop_path_rate`` is the case that motivated the check: DropPath
-#: has no parameters and no buffers, the state-dict keys are identical at any
-#: rate, and the rate is not in the run name either, so nothing else notices.
-RESUME_IDENTITY_FIELDS = ("drop_path_rate",)
+#: ``(config path, identity path)`` for every resolved value that CHANGES
+#: TRAINING, leaves no trace in the checkpoint, and is absent from the run
+#: name — so a resume could silently continue one run under two settings.
+#: Each is compared against the identity block results.json recorded for the
+#: run being resumed; a side that is absent or None is skipped, which is what
+#: makes the MoE-only and SSL-only entries no-ops elsewhere.
+#:
+#: Deliberately NOT here: optim.layer_decay. Changing it between 1.0 and a
+#: decay changes the optimizer's param-group COUNT, which makes
+#: ``load_state_dict`` raise on its own; changing it between two decays is a
+#: silent NO-OP, because the restored base_lrs win. Guarding a no-op is worse
+#: than not guarding it. What a resume silently IGNORES is reported instead,
+#: by ``resume_provenance``.
+RESUME_IDENTITY_FIELDS = (
+    ("model.drop_path_rate", "drop_path_rate"),
+    ("effective_batch_size", "effective_batch_size"),
+    ("model.moe.capacity_factor", "moe.capacity_factor"),
+    ("model.moe.gate_noise", "moe.gate_noise"),
+    ("loss.aux_weight", "moe.aux_weight"),
+    ("optim.grad_clip", "optim.grad_clip"),
+    ("ssl.grad_clip", "ssl.grad_clip"),
+    ("ssl.mask_ratio", "ssl.mask_ratio"),
+)
+
+
+def _dig(node, dotted: str):
+    """``_dig(cfg, "model.moe.gate_noise")`` -> the value, or None if any hop
+    is missing or not a dict (an SSL field on a supervised run, say)."""
+    for part in dotted.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
 
 
 def resume_identity_mismatches(cfg: dict, ckpt_path: str) -> list:
@@ -363,13 +390,71 @@ def resume_identity_mismatches(cfg: dict, ckpt_path: str) -> list:
     rec = read_results(os.path.dirname(os.path.abspath(ckpt_path))) or {}
     ident = rec.get("identity") or {}
     out = []
-    for key in RESUME_IDENTITY_FIELDS:
-        have, want = ident.get(key), cfg["model"].get(key)
+    for cfg_path, ident_path in RESUME_IDENTITY_FIELDS:
+        have, want = _dig(ident, ident_path), _dig(cfg, cfg_path)
         if have is None or want is None or have == want:
             continue
-        out.append(f"model.{key}: the run being resumed trained at {have}, "
+        out.append(f"{cfg_path}: the run being resumed trained at {have}, "
                    f"this command resolves {want}")
     return out
+
+
+def resume_provenance(cfg: dict, ckpt_path: str) -> list:
+    """What a resume takes FROM THE CHECKPOINT rather than the command line.
+
+    Lightning restores the optimizer's ``initial_lr`` and the scheduler's
+    ``base_lrs``, so a changed ``--lr`` on a resume is silently ignored: the
+    run continues on the original schedule. That wastes a run rather than
+    corrupting one, which is precisely why it is easy to miss — so it is
+    printed, with the two values side by side, whether or not they differ.
+
+    Returns display lines; empty when the checkpoint cannot be read (never a
+    reason to stop a resume).
+    """
+    import torch
+
+    try:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as e:                       # noqa: BLE001 — never block a resume
+        return [f"  (could not read {ckpt_path} to report it: {type(e).__name__}: {e})"]
+    if not isinstance(ck, dict):
+        return []
+
+    lines = []
+    epoch, step = ck.get("epoch"), ck.get("global_step")
+    if epoch is not None:
+        lines.append(f"  loop state: resuming after epoch {epoch} (0-based), global step {step}")
+
+    # base_lrs is the number the scheduler rebuilds every LR from. SequentialLR
+    # nests its children, which is the shape LitClassifier already handles.
+    base_lrs = []
+    for sched in ck.get("lr_schedulers") or []:
+        if isinstance(sched, dict):
+            if "_schedulers" in sched:
+                for sub in sched["_schedulers"]:
+                    base_lrs += list((sub or {}).get("base_lrs") or [])
+            base_lrs += list(sched.get("base_lrs") or [])
+    if base_lrs:
+        ckpt_lr = max(base_lrs)
+        asked = (cfg["ssl"]["lr"] if cfg.get("task") == "ssl" else cfg["optim"]["lr"])
+        key = "ssl.lr" if cfg.get("task") == "ssl" else "optim.lr"
+        same = asked is not None and abs(ckpt_lr - asked) <= 1e-12 * max(1.0, abs(asked))
+        lines.append(
+            f"  {key}: this command resolves {asked:.3e}, the checkpoint restores "
+            f"{ckpt_lr:.3e}" + ("  (same)" if same else "  <-- the checkpoint WINS; "
+                                "your value is ignored"))
+    opt_states = ck.get("optimizer_states") or []
+    if opt_states and isinstance(opt_states[0], dict):
+        groups = opt_states[0].get("param_groups") or []
+        wds = {g.get("weight_decay") for g in groups if isinstance(g, dict)}
+        wds.discard(None)
+        asked_wd = (cfg["ssl"] if cfg.get("task") == "ssl" else cfg["optim"]).get("weight_decay")
+        if wds and asked_wd is not None and asked_wd not in wds:
+            lines.append(f"  weight_decay: this command resolves {asked_wd}, the checkpoint "
+                         f"restores {sorted(wds)}  <-- the checkpoint WINS")
+        lines.append(f"  optimizer: {len(groups)} param group(s) restored "
+                     f"(momentum/variance included)")
+    return lines
 
 
 def assert_resume_identity(cfg: dict) -> list:
@@ -383,6 +468,12 @@ def assert_resume_identity(cfg: dict) -> list:
     if cfg.get("mode") != "resume" or not cfg.get("ckpt_path"):
         return []
     problems = resume_identity_mismatches(cfg, cfg["ckpt_path"])
+    provenance = resume_provenance(cfg, cfg["ckpt_path"])
+    if provenance:
+        print(f"[resume] {cfg['ckpt_path']} — what comes from the checkpoint, "
+              f"not the command line:")
+        for line in provenance:
+            print(line)
     if problems and cfg["model"].get("resume_check_identity", True):
         text = "\n  - ".join(problems)
         raise ValueError(
@@ -438,7 +529,9 @@ def render_markdown(rec: dict) -> str:
         s = rec["ssl"]
         lines += ["", "## SSL pretraining", "",
                   f"ssl_loss {_fmt(s.get('ssl_loss'), nd=4)} | recon {_fmt(s.get('recon_loss'), nd=4)} | "
-                  f"mask ratio {_fmt(s.get('mask_ratio'), nd=3)}"
+                  f"mask ratio {_fmt(s.get('mask_ratio'), nd=3)} measured"
+                  + (f" / {_fmt(s.get('mask_ratio_configured'), nd=3)} configured"
+                     if s.get("mask_ratio_configured") is not None else "")
                   + (f" | target_std {_fmt(s.get('target_std'), nd=3)}" if s.get("target_std") is not None else ""),
                   "", f"> {s.get('note', MIM_PROBE_NOTE)}"]
     params, gfl = eff.get("params") or {}, eff.get("gflops") or {}

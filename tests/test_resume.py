@@ -283,3 +283,102 @@ def test_resume_refuses_a_silent_drop_path_change():
         lone = os.path.join(tmp, "moved.ckpt")
         open(lone, "w").close()
         assert assert_resume_identity(_cfg(tmp, mode="resume", ckpt_path=lone)) == []
+
+
+def test_resume_guards_every_field_that_changes_training_invisibly():
+    """Each of these changes training, leaves no trace in the checkpoint and is
+    absent from the run name, so a resume could otherwise continue one run
+    under two settings. layer_decay is deliberately NOT guarded: 1.0 <-> decay
+    raises on its own (param-group count), and decay <-> decay is a silent
+    no-op because the restored base_lrs win.
+    """
+    import copy
+
+    from pvt_moe.engine.results import (JSON_NAME, RESUME_IDENTITY_FIELDS,
+                                        resume_provenance, run_identity)
+
+    guarded = {c for c, _ in RESUME_IDENTITY_FIELDS}
+    for expected in ("model.drop_path_rate", "effective_batch_size", "loss.aux_weight",
+                     "model.moe.capacity_factor", "model.moe.gate_noise",
+                     "optim.grad_clip", "ssl.grad_clip", "ssl.mask_ratio"):
+        assert expected in guarded, expected
+    assert not any("layer_decay" in c for c in guarded), "guarding a no-op is worse than not"
+
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            trained = _cfg(tmp, model={"ablation": {"use_moe": True,
+                                                    "moe_placement": [[], [], [], [-1]]}})
+            run_dir = os.path.join(tmp, trained["run_name"])
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, JSON_NAME), "w") as fh:
+                json.dump({"schema": 1, "identity": run_identity(trained)}, fh)
+            ckpt = os.path.join(run_dir, "milestone-epoch001.ckpt")
+            open(ckpt, "w").close()
+
+            def resuming(path, value):
+                c = copy.deepcopy(trained)
+                c["mode"], c["ckpt_path"] = "resume", ckpt
+                node = c
+                *head, leaf = path.split(".")
+                for h in head:
+                    node = node[h]
+                node[leaf] = value
+                return c
+
+            for path, value in (("model.drop_path_rate", 0.42),
+                                ("effective_batch_size", trained["effective_batch_size"] * 2),
+                                ("loss.aux_weight", 0.5),
+                                ("model.moe.capacity_factor", 0.25),
+                                ("model.moe.gate_noise", 0.0),
+                                ("optim.grad_clip", 1.0)):
+                try:
+                    assert_resume_identity(resuming(path, value))
+                except ValueError as e:
+                    assert path in str(e), (path, str(e))
+                else:
+                    raise AssertionError(f"a resume that changes {path} must be refused")
+
+            # an unchanged resume is clean, and the override still loads anyway
+            same = copy.deepcopy(trained)
+            same["mode"], same["ckpt_path"] = "resume", ckpt
+            assert assert_resume_identity(same) == []
+            loud = resuming("model.drop_path_rate", 0.42)
+            loud["model"]["resume_check_identity"] = False
+            assert assert_resume_identity(loud), "reports without raising"
+
+            # a checkpoint it cannot read never blocks the resume
+            assert resume_provenance(same, ckpt)[0].startswith("  (could not read")
+    finally:
+        undo()
+
+
+def test_resume_reports_what_the_checkpoint_overrides():
+    """A changed --lr on a resume is silently ignored: Lightning restores the
+    optimizer's initial_lr and the scheduler's base_lrs. That wastes a run
+    rather than corrupting one, so it is printed rather than refused.
+    """
+    import copy
+
+    from pvt_moe.engine.results import resume_provenance
+
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, epochs=2, milestones=[1])
+            _run(cfg)
+            ckpt = os.path.join(tmp, cfg["run_name"], "last.ckpt")
+            assert os.path.exists(ckpt)
+
+            asked = copy.deepcopy(cfg)
+            asked["mode"], asked["ckpt_path"] = "resume", ckpt
+            asked["optim"]["lr"] = cfg["optim"]["lr"] / 2
+            lines = "\n".join(resume_provenance(asked, ckpt))
+            assert "optim.lr" in lines and "checkpoint WINS" in lines, lines
+            assert "loop state" in lines and "param group" in lines, lines
+
+            unchanged = copy.deepcopy(cfg)
+            unchanged["mode"], unchanged["ckpt_path"] = "resume", ckpt
+            assert "(same)" in "\n".join(resume_provenance(unchanged, ckpt))
+    finally:
+        undo()
