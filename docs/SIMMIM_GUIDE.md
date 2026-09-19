@@ -118,8 +118,12 @@ worth a paragraph in the thesis. Two ways to run:
   the only difference between the two arms is the band. Run name suffix
   `-px`; the chain and `results.json` record it.
 
-Which one to run is a decision for the thesis, not the code: `token` is the
-faithful reproduction, `pixel` is the controlled variant.
+**Decision (for the real runs): `token`.** It is SimMIM's own behaviour, and
+6.9 % of the masked pixels in a band is small enough that deviating from the
+published recipe would cost more (comparability with every SimMIM number)
+than it buys. `pixel` stays implemented and documented as the control for
+the leak — run it if a reviewer asks how much of the reconstruction the band
+explains — not as an arm of the main ladder.
 
 ---
 
@@ -162,19 +166,42 @@ python train.py --recipe downstream --dataset eurosat --data-dir /data/eurosat_a
 
 Every command above passes `--dry-run` (`tests/test_cli_ssl.py`).
 
-### Mask tokens and the router (path 2) — a result, not a bug
+### Decision: the load-balancing loss counts the masked positions (path 2)
 
 No token is ever dropped, so in a MoE'd stage **every token is routed,
 whether its patch was masked or not, and the load-balancing loss is computed
 over all of them** — at ratio 0.6 the masked positions are ~60 % of what the
-aux loss balances. `pvt_moe.ssl.diagnostics.mask_token_routing` splits each
-MoE block's routing by masked / visible position and reports per-expert
-shares, routing entropies, the `mask_token_concentration` (largest expert
-share among masked-position tokens) and the `share_gap` (total-variation
-distance between the two share vectors: 0 = the router treats both alike,
-1 = disjoint experts). `results.json` carries it every epoch under
-`mask_routing`; the notebook prints it in the sanity cell. What the numbers
-mean is for the thesis to say; the code does not correct them.
+aux loss balances. That means the router is being load-balanced partly over
+tokens that carry no image content of their own: at stage 4 a masked-position
+token is whatever attention and the earlier stages assembled from the mask
+token and its visible neighbours, not a patch of the image.
+
+This is a **deliberate choice, not an implementation detail**, and it is left
+uncorrected on purpose:
+
+- It is the objective as SimMIM defines it: the reference encoder processes
+  the full token sequence with the mask tokens in place, so a routed layer
+  inside it sees exactly this token population. Restricting the aux loss to
+  visible positions would be a new method, not SimMIM with MoE.
+- The fine-tune sees no mask tokens at all, so the question the ablation
+  asks — does routing learned under the SSL loss transfer — is only
+  answerable if the router was trained on what pretraining actually shows it.
+- The alternative (masking the aux loss to visible tokens, or routing the
+  masked positions to a fixed expert) would have to be justified by a
+  measured pathology, and the measurement comes first.
+
+What is measured instead: `pvt_moe.ssl.diagnostics.mask_token_routing`
+splits each MoE block's routing by masked / visible position and reports
+per-expert shares, routing entropies, the `mask_token_concentration`
+(largest expert share among masked-position tokens; 1/E = balanced, 1.0 =
+one expert takes them all) and the `share_gap` (total-variation distance
+between the two share vectors: 0 = the router treats both populations
+alike, 1 = disjoint experts). `results.json` carries it every epoch under
+`mask_routing`; the notebook prints it in the sanity cell. If the numbers
+show the router spending an expert on "is this a masked position" — a high
+concentration with a large gap — that is a finding about MoE under masked
+image modelling, to be reported as such, and only then a reason to consider
+a visible-only aux loss as a separate, named arm.
 
 ---
 
