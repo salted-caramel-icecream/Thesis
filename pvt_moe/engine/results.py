@@ -50,6 +50,15 @@ _METRIC_KEYS = (
     "ssl_loss", "recon_loss", "mask_ratio", "target_std", "pred_std", "ema_momentum",
 )
 
+AUX_NOTE = ("train_aux is a poor balance metric: aux = E*sum_i f_i*p_i is identically "
+            "1 + E*<f - 1/E, p - 1/E>, a product of two deviations. It is therefore SECOND "
+            "ORDER in the imbalance (a 26% worst-expert share reads ~1.0004; ~37% is needed "
+            "for 1.03), and it reads exactly 1.0 whenever the mean gate probability p is "
+            "uniform however skewed the token share f is — while the aux gradient itself "
+            "drives p toward uniform. Read moe.routing.*.drop_rate (first order, no floor), "
+            ".share, and .gate_entropy (near log E = an undecided router, which is exactly "
+            "when aux is pinned) instead.")
+
 MIM_PROBE_NOTE = ("Linear-probe / k-NN accuracy is EXPECTED to be low for a masked-image-"
                   "modelling encoder (SimMIM, MAE, BEiT all report weak probes and strong "
                   "fine-tuning); here they are collapse detectors. The headline number of a "
@@ -188,6 +197,14 @@ class ResultsWriter(pl.Callback):
         if not (abl["use_moe"] and any(abl["moe_placement"])):
             return None
         block = {"aux_weight": cfg["loss"]["aux_weight"]}
+        # Per-epoch training-time routing stats (RoutingMonitor), and the
+        # warning that goes with the aux number so a reader of this file
+        # cannot mistake a pinned 1.0 for a healthy router.
+        monitor = next((cb for cb in getattr(trainer, "callbacks", [])
+                        if type(cb).__name__ == "RoutingMonitor"), None)
+        if monitor is not None and getattr(monitor, "last_stats", None):
+            block["routing"] = monitor.last_stats
+            block["aux_note"] = AUX_NOTE
         model = getattr(pl_module, "model", None)
         loader = getattr(trainer, "val_dataloaders", None)
         if model is not None and loader is not None and self.utilization_batches > 0:

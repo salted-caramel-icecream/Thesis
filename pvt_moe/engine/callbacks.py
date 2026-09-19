@@ -158,6 +158,176 @@ class RopeFreqSnapshot(pl.Callback):
             self._write(self._freqs(pl_module), self.FINAL)
 
 
+class RoutingMonitor(pl.Callback):
+    """Per-epoch routing statistics for every MoE block, measured during TRAINING.
+
+    This exists because ``train_aux`` cannot do the job. Both backends compute
+    ``aux = E * sum_i f_i * p_i`` (token share x mean gate probability), which
+    is identically ``1 + E * <f - 1/E, p - 1/E>``: it reads 1.0 whenever the
+    mean gate probability is uniform, however skewed the assignment is, and the
+    loss's own gradient pushes the probabilities toward uniform. A router that
+    sends 96% of its tokens to one expert can log ``train_aux = 1.0000``. See
+    ``pvt_moe.utils.diagnostics`` for the derivation and the worked case.
+
+    What this logs instead, per epoch, averaged over every training token:
+
+    ``train_drop_rate``      fraction of tokens over capacity — they receive
+                             NOTHING from the routed branch. At
+                             ``capacity_factor 1.0`` this is the total-variation
+                             distance from uniform routing: 0 when balanced,
+                             ``1 - 1/E`` at full collapse. Linear, no floor.
+    ``train_moe_imbalance``  the same quantity computed from the shares alone
+                             (identical at cf 1.0; they part company otherwise).
+    ``train_route_entropy``  entropy of the token share, max ``log E``.
+    ``train_gate_entropy``   mean per-token entropy of the gate softmax. Near
+                             ``log E`` means the router is undecided — exactly
+                             the regime where ``train_aux`` is pinned at 1.
+
+    Cost: one ``(tokens, dim) x (dim, E)`` matmul per MoE block per step under
+    ``no_grad``, with the counters kept on-device and synced ONCE per epoch.
+    The router decision is recomputed WITHOUT the backend's gate noise, so this
+    measures the policy rather than the realised noisy sample; with the native
+    backend the reconstructed drop count matches the layer's own
+    ``dropped_tokens`` exactly at ``gate_noise 0``
+    (``tests/test_routing_diagnostics.py``).
+
+    A failure inside the hook disables the monitor for the rest of the run with
+    a warning: a diagnostic must never take a training run down with it.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        moe = cfg["model"]["moe"]
+        self.capacity_factor = moe["capacity_factor"]
+        self.top_k = moe["top_k"]
+        self.dropless = moe["backend"] == "megablocks"   # dMoE never drops
+        self.last_stats: dict = {}
+        self._acc: dict = {}
+        self._handles: list = []
+        self._active = False
+        self._failed = False
+
+    # -- accumulation ---------------------------------------------------------
+
+    def _hook(self, name: str, module):
+        @torch.no_grad()
+        def hook(mod, args):
+            if not self._active or self._failed:
+                return
+            try:
+                # Imported per call (a sys.modules lookup next to a matmul) so a
+                # test can substitute it, and so an import error here cannot
+                # take the run down at setup.
+                from pvt_moe.utils.diagnostics import capacity_of, gate_logits
+
+                x = args[0]
+                flat = x.reshape(-1, x.shape[-1])
+                logits = gate_logits(mod, flat).float()
+                tokens, experts = logits.shape
+                counts = torch.bincount(logits.argmax(dim=-1), minlength=experts)
+                probs = logits.softmax(dim=-1)
+                acc = self._acc.setdefault(name, {
+                    "counts": torch.zeros(experts, dtype=torch.double, device=logits.device),
+                    "prob_sum": torch.zeros(experts, dtype=torch.double, device=logits.device),
+                    "entropy_sum": torch.zeros((), dtype=torch.double, device=logits.device),
+                    "dropped": torch.zeros((), dtype=torch.double, device=logits.device),
+                    "tokens": 0,
+                })
+                acc["counts"] += counts.double()
+                acc["prob_sum"] += probs.sum(dim=0).double()
+                acc["entropy_sum"] += -(probs.clamp_min(1e-12).log() * probs).sum().double()
+                if not self.dropless:
+                    cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
+                    acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
+                acc["tokens"] += int(tokens)
+            except Exception as e:  # noqa: BLE001 — never kill a run for a diagnostic
+                self._failed = True
+                print(f"[routing] monitor disabled after an error in {name}: "
+                      f"{type(e).__name__}: {e}")
+
+        return hook
+
+    def setup(self, trainer, pl_module, stage=None):
+        if self._handles or self._failed:
+            return
+        from pvt_moe.models.ffn import MoEMlp
+
+        root = getattr(pl_module, "model", None) or getattr(pl_module, "encoder", None) \
+            or getattr(pl_module, "context", None) or pl_module
+        for name, module in root.named_modules():
+            if isinstance(module, MoEMlp):
+                self._handles.append(module.register_forward_pre_hook(self._hook(name, module)))
+        if self._handles:
+            print(f"[routing] monitoring {len(self._handles)} MoE block(s) per epoch: "
+                  f"drop rate, share, routing entropy, gate entropy "
+                  f"(train_aux cannot show these — see docs/HPARAMS.md)")
+
+    def teardown(self, trainer, pl_module, stage=None):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    # -- epoch boundaries ------------------------------------------------------
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._acc = {}
+        self._active = True
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        pass
+
+    def on_validation_start(self, trainer, pl_module):
+        self._active = False          # only training tokens count
+
+    def on_validation_end(self, trainer, pl_module):
+        self._active = not trainer.sanity_checking and trainer.training
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self._active = False
+        if trainer.sanity_checking or not self._acc:
+            return
+        import math
+
+        stats = {}
+        for name, acc in self._acc.items():
+            tokens = max(1, acc["tokens"])
+            counts = acc["counts"].cpu()            # the ONE sync per epoch
+            share = counts / counts.sum().clamp(min=1)
+            mean_p = (acc["prob_sum"].cpu() / tokens)
+            experts = int(counts.numel())
+            imbalance = float((share - 1.0 / experts).clamp(min=0).sum())
+
+            def _h(q):
+                q = q[q > 0]
+                return float(-(q * q.log()).sum()) if q.numel() else 0.0
+
+            stats[name] = {
+                "tokens": int(tokens),
+                "num_experts": experts,
+                "share": [round(float(v), 6) for v in share],
+                "mean_gate_prob": [round(float(v), 6) for v in mean_p],
+                "imbalance": round(imbalance, 6),
+                "drop_rate": round(float(acc["dropped"].cpu()) / tokens, 6),
+                "dropless": self.dropless,
+                "route_entropy": round(_h(share), 6),
+                "gate_entropy": round(float(acc["entropy_sum"].cpu()) / tokens, 6),
+                "max_entropy": round(math.log(experts), 6),
+                "aux_recomputed": round(float(experts * (share * mean_p).sum()), 8),
+            }
+        self.last_stats = stats
+        n = len(stats)
+        for key in ("drop_rate", "imbalance", "route_entropy", "gate_entropy"):
+            value = sum(s[key] for s in stats.values()) / n
+            pl_module.log(f"train_{'moe_imbalance' if key == 'imbalance' else key}",
+                          torch.tensor(float(value)), on_step=False, on_epoch=True)
+        for name, s in stats.items():
+            print(f"[routing] {name}: share {[f'{v:.3f}' for v in s['share']]} | "
+                  f"drops {s['drop_rate']:.1%} | imbalance {s['imbalance']:.3f} | "
+                  f"H(route) {s['route_entropy']:.2f}/{s['max_entropy']:.2f} | "
+                  f"H(gate) {s['gate_entropy']:.2f}/{s['max_entropy']:.2f} | "
+                  f"aux {s['aux_recomputed']:.4f}")
+
+
 class PrintEpochMetrics(pl.Callback):
     """One human-readable line per epoch (the CSV/W&B logs stay canonical)."""
 
@@ -198,6 +368,13 @@ class PrintEpochMetrics(pl.Callback):
             return v.item() if isinstance(v, torch.Tensor) else (v or 0.0)
 
         print(f"Test | acc: {_get('test_acc'):.1%} | loss: {_get('test_loss'):.4f}")
+
+
+def _routing_monitor_wanted(cfg: dict) -> bool:
+    """MoE actually placed somewhere, and the monitor not switched off."""
+    abl = cfg["model"]["ablation"]
+    return bool(cfg["model"]["moe"].get("routing_monitor", True)
+                and abl["use_moe"] and any(abl["moe_placement"]))
 
 
 def build_loggers(cfg: dict) -> list:
@@ -256,9 +433,12 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         RopeFreqSnapshot(ckpt_dir),
         LearningRateMonitor(logging_interval="epoch"),
         PrintEpochMetrics(),
-        # results.json / results.md in the run directory, every epoch.
-        ResultsWriter(cfg, ckpt_dir),
     ]
+    if _routing_monitor_wanted(cfg):
+        # Before ResultsWriter, so results.json picks up THIS epoch's routing.
+        callbacks.append(RoutingMonitor(cfg))
+    # results.json / results.md in the run directory, every epoch.
+    callbacks.append(ResultsWriter(cfg, ckpt_dir))
     if cfg.get("milestones"):
         callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
     if extra_callbacks:
@@ -303,7 +483,10 @@ def build_ssl_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trai
         filename="epoch{epoch:03d}-loss{ssl_loss:.4f}",
     )
     callbacks = [checkpoint_cb, RollingCheckpoint(ckpt_dir), RopeFreqSnapshot(ckpt_dir),
-                 LearningRateMonitor(logging_interval="step"), ResultsWriter(cfg, ckpt_dir)]
+                 LearningRateMonitor(logging_interval="step")]
+    if _routing_monitor_wanted(cfg):
+        callbacks.append(RoutingMonitor(cfg))
+    callbacks.append(ResultsWriter(cfg, ckpt_dir))
     if cfg.get("milestones"):
         callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
     if extra_callbacks:

@@ -70,8 +70,22 @@ class Top1Router(nn.Module):
     def forward(self, x: torch.Tensor):
         """Returns ``(expert_index, gate_value, aux_loss)`` for each token."""
         # Gate in fp32 regardless of autocast: an 8-way softmax in bf16 has
-        # ~3 decimal digits, and the routing decision is discrete.
-        logits = self.wg(x.float())
+        # ~3 decimal digits, the routing decision is discrete, and the
+        # load-balancing loss lives within ~1% of 1.0 where bf16's spacing is
+        # 2^-8 = 0.0039 — quantising it to exactly 1.0.
+        #
+        # LOAD-BEARING: ``x.float()`` alone does NOT do this. torch.autocast
+        # intercepts nn.Linear and casts the LAYER as well as the input, so
+        # under bf16-mixed ``self.wg(x.float())`` returns bf16. Autocast has to
+        # be turned off around the call. Tutel does the same thing around its
+        # whole routing block (tutel/impls/moe_layer.py, `with
+        # torch.amp.autocast('cuda', enabled=False): routing()`), which is why
+        # its l_aux is fp32; this keeps the two backends comparable.
+        if x.device.type in ("cpu", "cuda", "xpu"):
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                logits = self.wg(x.float())
+        else:                                     # a device autocast does not know
+            logits = self.wg(x.float())
 
         if self.training and self.gate_noise > 0:
             logits = logits + self.gate_noise * torch.randn_like(logits) / self.num_experts
