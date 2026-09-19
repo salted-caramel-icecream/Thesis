@@ -248,7 +248,7 @@ the first step: the run name printed at start-up begins `sv1_b2_`.
 | 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
 | 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
 | 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
-| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1+sh_rope-s3b5+s4b2_ln_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_ln_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -264,17 +264,18 @@ COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
 CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
 CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
 CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
-CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert $COMMON
 ```
 
 `drop_path` resolves to 0.1 on all four (the variant's official rate). All four
 run names are distinct, so no two arms can share a checkpoint directory.
 
-**GPU 2 vs GPU 3 moves two variables, not one.** `scratch_08` places MoE in
-stages 3 *and* 4 **and** turns the shared expert on (`+sh` in its run name),
-while GPUs 1–2 have none. So that pair is not a clean placement ablation: read
-it as "wider MoE with a shared expert" against "stage-4-only without one".
-GPU 1 vs GPU 2 remains the clean expert-count comparison.
+**No shared expert in any arm** — `scratch_08` ships with it on, so GPU 3
+passes `--no-shared-expert` to match GPUs 1–2 (the run name carries no `+sh`).
+That keeps both comparisons single-variable: GPU 1 vs GPU 2 prices **expert
+count** at fixed stage-4 placement, GPU 2 vs GPU 3 prices **placement** at
+fixed E=8. It also means no routed block has a DWConv anywhere in the wave,
+since `moe_block_dwconv` feeds only the shared-expert branch.
 
 **The SSL pair — a later wave, not this one.** The SimMIM arms are
 `--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
