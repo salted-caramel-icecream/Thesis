@@ -48,6 +48,11 @@ _METRIC_KEYS = (
     "train_loss", "train_ce", "train_aux", "train_acc_mixed",
     "val_loss", "val_acc", "val_acc_top5", "val_precision_macro", "val_recall_macro",
     "ssl_loss", "recon_loss", "mask_ratio", "target_std", "pred_std", "ema_momentum",
+    # Routing (RoutingMonitor). These belong in the per-epoch history, not just
+    # in the latest snapshot: collapse is something you watch DEVELOP, and
+    # train_aux cannot show it (AUX_NOTE).
+    "train_drop_rate", "train_drop_rate_realised", "train_moe_imbalance",
+    "train_route_entropy", "train_gate_entropy",
 )
 
 AUX_NOTE = ("train_aux is a poor balance metric: aux = E*sum_i f_i*p_i is identically "
@@ -397,9 +402,25 @@ def render_markdown(rec: dict) -> str:
     if moe:
         lines += ["", "## MoE", "", f"aux weight {moe.get('aux_weight')} | train_aux "
                   f"{_fmt(acc.get('train_aux') if 'train_aux' in acc else (rec['history'][-1].get('train_aux') if rec.get('history') else None), nd=4)}"]
+        routing = moe.get("routing") or {}
+        if routing:
+            lines += ["", "Training-token routing (RoutingMonitor) — the metrics `train_aux` "
+                      "cannot show:", "",
+                      "| block | token share per expert | drop rate | imbalance | H(route) | H(gate) / max |",
+                      "|---|---|---|---|---|---|"]
+            for name, r in routing.items():
+                drop = f"{r['drop_rate']:.1%}"
+                if "drop_rate_realised" in r:
+                    drop += f" ({r['drop_rate_realised']:.1%} realised)"
+                lines.append(f"| {name} | {[round(v, 3) for v in r['share']]} | {drop} | "
+                             f"{r['imbalance']:.3f} | {r['route_entropy']:.2f} | "
+                             f"{r['gate_entropy']:.2f} / {r['max_entropy']:.2f} |")
+            lines += ["", f"> {moe.get('aux_note', AUX_NOTE)}"]
         util = moe.get("expert_utilization") or {}
         if util and "error" not in util:
-            lines += ["", "| block | token share per expert | entropy / max |", "|---|---|---|"]
+            lines += ["", "Validation-batch utilisation (`expert_utilization`, eval mode, "
+                      "noiseless logits — a different population from the row above):", "",
+                      "| block | token share per expert | entropy / max |", "|---|---|---|"]
             for name, u in util.items():
                 lines.append(f"| {name} | {u['share']} | {u['entropy']:.2f} / {u['max_entropy']:.2f} |")
     mr = rec.get("mask_routing")

@@ -261,11 +261,107 @@ def test_one_epoch_logs_the_routing_metrics_and_writes_them_to_results_json():
         assert 0.0 <= float(m["train_gate_entropy"]) <= math.log(E) + 1e-6
 
         rec = read_results(os.path.join(d, cfg["run_name"]))
+        # the routing metrics must be in the per-epoch HISTORY, not just the
+        # latest snapshot: collapse is something you watch develop
+        assert "train_drop_rate" in rec["history"][-1], sorted(rec["history"][-1])
+        assert "train_gate_entropy" in rec["history"][-1]
+        md = open(os.path.join(d, cfg["run_name"], "results.md")).read()
+        assert "Training-token routing" in md and "drop rate" in md and "H(gate)" in md
         routing = rec["moe"]["routing"]["block4.1.mlp"]
         assert routing["num_experts"] == E and routing["tokens"] > 0
         assert len(routing["share"]) == E and abs(sum(routing["share"]) - 1) < 1e-4
         assert "drop_rate" in routing and "gate_entropy" in routing
         assert rec["moe"]["aux_note"] == AUX_NOTE and "poor balance metric" in AUX_NOTE.lower()
+
+
+def _run_monitor(moe, x, cfg=None):
+    """Drive a RoutingMonitor over one module for one epoch; return its stats."""
+    monitor = RoutingMonitor(cfg or _moe_cfg())
+
+    class _Lit:
+        def __init__(self, model):
+            self.model = model
+            self.logged = {}
+        def log(self, name, value, **k):
+            self.logged[name] = float(value)
+
+    class _Trainer:
+        sanity_checking = False
+        training = True
+        callbacks = []
+
+    lit, trainer = _Lit(nn.ModuleDict({"m": moe})), _Trainer()
+    with contextlib.redirect_stdout(io.StringIO()):
+        monitor.setup(trainer, lit)
+        monitor.on_train_epoch_start(trainer, lit)
+        moe(x, int(x.shape[1] ** 0.5), int(x.shape[1] ** 0.5))
+        monitor.on_train_epoch_end(trainer, lit)
+        monitor.teardown(trainer, lit)
+    return monitor.last_stats, lit.logged
+
+
+def test_the_monitor_records_the_realised_drops_not_only_the_noiseless_policy():
+    """The share and entropies describe the router's policy; the drop rate is
+    reported both ways, because gate noise moves tokens across the capacity
+    line and only the realised figure says how many actually got nothing."""
+    torch.manual_seed(0)
+    undo = install_fake_tutel_backend()
+    try:
+        moe = MoEMlp(DIM, 8, moe_cfg={"backend": "native", "num_experts": E, "top_k": 1,
+                                      "capacity_factor": 1.0, "gate_noise": 2.0,
+                                      "shared_expert": True, "moe_block_dwconv": True})
+    finally:
+        undo()
+    moe.train()
+    x = torch.randn(4, 64, DIM)
+    stats, logged = _run_monitor(moe, x)
+    (name, s), = stats.items()
+    assert "drop_rate_realised" in s and "train_drop_rate_realised" in logged
+    # the layer's own count for the last forward is a device tensor, no sync
+    assert isinstance(moe.moe_layer._dropped, torch.Tensor)
+    assert moe.moe_layer.dropped_tokens == int(moe.moe_layer._dropped)
+    # with noise on, the realised figure need not equal the policy figure
+    assert 0.0 <= s["drop_rate_realised"] <= 1 - 1 / E
+    assert 0.0 <= s["drop_rate"] <= 1 - 1 / E
+
+    # with noise OFF the two must agree exactly
+    moe.moe_layer.gates[0].gate_noise = 0.0
+    stats0, _ = _run_monitor(moe, x)
+    (_, s0), = stats0.items()
+    assert abs(s0["drop_rate"] - s0["drop_rate_realised"]) < 1e-9, s0
+
+
+def test_the_realised_count_is_read_from_tutels_dispatch_count_when_present():
+    """Tutel stores per-expert pre-capacity counts on every forward; the monitor
+    turns them into a drop count with the same capacity formula."""
+    from pvt_moe.utils.diagnostics import capacity_of
+
+    torch.manual_seed(0)
+    undo = install_fake_tutel_backend()
+    try:
+        moe = MoEMlp(DIM, 8, moe_cfg={"backend": "tutel", "num_experts": E, "top_k": 1,
+                                      "capacity_factor": 1.0, "gate_noise": 0.0,
+                                      "shared_expert": True, "moe_block_dwconv": True})
+    finally:
+        undo()
+    tokens = 4 * 64
+    counts = torch.tensor([tokens - 30, 10, 10, 10], dtype=torch.float)
+    assert int(counts.sum()) == tokens
+    # the fake layer has no dispatch_count; give it tutel's, as tutel would
+    moe.moe_layer.dispatch_count = counts
+    moe.train()
+    stats, logged = _run_monitor(moe, torch.randn(4, 64, DIM))
+    (_, s), = stats.items()
+    cap = capacity_of(tokens, E, 1.0, 1)
+    expected = float((counts - cap).clamp(min=0).sum()) / tokens
+    # the stats dict rounds to 6 dp
+    assert abs(s["drop_rate_realised"] - expected) < 1e-6, (s, expected)
+    assert abs(logged["train_drop_rate_realised"] - expected) < 1e-6
+    # a backend exposing neither simply reports no realised figure
+    del moe.moe_layer.dispatch_count
+    stats2, logged2 = _run_monitor(moe, torch.randn(4, 64, DIM))
+    assert "drop_rate_realised" not in list(stats2.values())[0]
+    assert "train_drop_rate_realised" not in logged2
 
 
 def test_a_broken_gate_disables_the_monitor_instead_of_killing_the_run():

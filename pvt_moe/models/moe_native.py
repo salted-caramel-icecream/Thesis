@@ -186,6 +186,7 @@ class NativeMoEFFN(nn.Module):
         self.top_k = top_k
         self.capacity_factor = capacity_factor
 
+        self._dropped = None                  # realised overflow of the last forward
         self.experts = BatchedExperts(
             model_dim, hidden_size_per_expert, num_experts,
             activation_fn if activation_fn is not None else nn.GELU())
@@ -214,7 +215,11 @@ class NativeMoEFFN(nn.Module):
         one_hot = F.one_hot(index, self.num_experts)
         rank = (one_hot.cumsum(dim=0) - 1).gather(1, index[:, None]).squeeze(1)
         kept = rank < capacity
-        self.dropped_tokens = int((~kept).sum())  # diagnostic, not used in the graph
+        # Realised overflow, kept as a DEVICE TENSOR: `int(...)` here would be a
+        # host-device sync on every routed forward for a number most steps never
+        # read. `dropped_tokens` below materialises it on demand; RoutingMonitor
+        # accumulates the tensor and syncs once per epoch.
+        self._dropped = (~kept).sum()
 
         out = torch.zeros_like(x)
         for e in range(self.num_experts):
@@ -227,6 +232,11 @@ class NativeMoEFFN(nn.Module):
             # see tutel/impls/fast_dispatch.py::extract_critical).
             out[sel] = y * gate[sel, None]
         return out, aux
+
+    @property
+    def dropped_tokens(self) -> int:
+        """Tokens the last forward dropped for overflow (syncs on access)."""
+        return 0 if self._dropped is None else int(self._dropped)
 
     def extra_repr(self) -> str:
         return (f"model_dim={self.model_dim}, hidden={self.hidden}, "

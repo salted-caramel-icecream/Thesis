@@ -234,7 +234,8 @@ every training token, and `results.json` carries the per-block detail under
 
 | metric | means |
 |---|---|
-| `train_drop_rate` | fraction of tokens over capacity — they get **nothing** from the routed branch (the shared expert still fires). At `capacity_factor 1.0` this equals the total-variation distance from uniform routing: **first order** in the imbalance, 0 when balanced, 1 − 1/E at collapse. This is the number to watch. |
+| `train_drop_rate` | fraction of tokens over capacity — they get **nothing** from the routed branch (the shared expert still fires). At `capacity_factor 1.0` this equals the total-variation distance from uniform routing: **first order** in the imbalance, 0 when balanced, 1 − 1/E at collapse. This is the number to watch. Computed from the *noiseless* gate logits, so it describes the router's policy. |
+| `train_drop_rate_realised` | what the layer actually dropped once `gate_noise` was added — read from `NativeMoEFFN._dropped` or Tutel's `moe_layer.dispatch_count`. Equals the policy figure exactly at `gate_noise 0`; the gap between them is how much the noise moves tokens across the capacity line. |
 | `train_moe_imbalance` | the same quantity from the shares alone (they coincide at cf 1.0). |
 | `train_route_entropy` | entropy of the token share, max `log E`. |
 | `train_gate_entropy` | mean per-token entropy of the gate softmax. **Near `log E` means the router is undecided — precisely the regime where `aux` is pinned at 1.0**, so a low `aux` is only meaningful when this is well below `log E`. |

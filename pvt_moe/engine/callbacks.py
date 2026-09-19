@@ -185,11 +185,16 @@ class RoutingMonitor(pl.Callback):
 
     Cost: one ``(tokens, dim) x (dim, E)`` matmul per MoE block per step under
     ``no_grad``, with the counters kept on-device and synced ONCE per epoch.
-    The router decision is recomputed WITHOUT the backend's gate noise, so this
-    measures the policy rather than the realised noisy sample; with the native
-    backend the reconstructed drop count matches the layer's own
-    ``dropped_tokens`` exactly at ``gate_noise 0``
-    (``tests/test_routing_diagnostics.py``).
+    The share and the entropies are recomputed from the gate logits WITHOUT the
+    backend's gate noise, so they describe the router's POLICY. The drop rate is
+    reported both ways: ``train_drop_rate`` is the policy figure, and
+    ``train_drop_rate_realised`` is what the layer actually did once the noise
+    was added — read from ``NativeMoEFFN._dropped`` or, on Tutel, from
+    ``moe_layer.dispatch_count`` (the per-expert pre-capacity counts Tutel
+    stores on every forward). The two differ by however much the noise moves
+    tokens across the capacity line. Both are accumulated on-device and synced
+    once per epoch; the realised figure is simply absent for a backend that
+    exposes neither.
 
     A failure inside the hook disables the monitor for the rest of the run with
     a warning: a diagnostic must never take a training run down with it.
@@ -247,6 +252,34 @@ class RoutingMonitor(pl.Callback):
 
         return hook
 
+    def _post_hook(self, name: str):
+        """Realised overflow, after the layer has actually routed."""
+        from pvt_moe.utils.diagnostics import capacity_of
+
+        @torch.no_grad()
+        def hook(mod, args, output):
+            if not self._active or self._failed or self.dropless:
+                return
+            layer = getattr(mod, "moe_layer", None)
+            acc = self._acc.get(name)
+            if layer is None or acc is None:
+                return
+            dropped = getattr(layer, "_dropped", None)          # native backend
+            if dropped is None:
+                counts = getattr(layer, "dispatch_count", None)  # tutel: per-expert counts
+                if counts is None:
+                    return
+                counts = torch.as_tensor(counts)
+                cap = capacity_of(int(counts.sum()), int(counts.numel()),
+                                  self.capacity_factor, self.top_k)
+                dropped = (counts - cap).clamp(min=0).sum()
+            acc.setdefault("realised", torch.zeros((), dtype=torch.double,
+                                                   device=torch.as_tensor(dropped).device))
+            acc["realised"] += torch.as_tensor(dropped).double()
+            acc["realised_seen"] = acc.get("realised_seen", 0) + 1
+
+        return hook
+
     def setup(self, trainer, pl_module, stage=None):
         if self._handles or self._failed:
             return
@@ -254,11 +287,16 @@ class RoutingMonitor(pl.Callback):
 
         root = getattr(pl_module, "model", None) or getattr(pl_module, "encoder", None) \
             or getattr(pl_module, "context", None) or pl_module
+        blocks = 0
         for name, module in root.named_modules():
             if isinstance(module, MoEMlp):
+                # two hooks per block: the pre-hook reads the policy off the gate
+                # logits, the post-hook the realised overflow off the layer.
                 self._handles.append(module.register_forward_pre_hook(self._hook(name, module)))
-        if self._handles:
-            print(f"[routing] monitoring {len(self._handles)} MoE block(s) per epoch: "
+                self._handles.append(module.register_forward_hook(self._post_hook(name)))
+                blocks += 1
+        if blocks:
+            print(f"[routing] monitoring {blocks} MoE block(s) per epoch: "
                   f"drop rate, share, routing entropy, gate entropy "
                   f"(train_aux cannot show these — see docs/HPARAMS.md)")
 
@@ -314,15 +352,24 @@ class RoutingMonitor(pl.Callback):
                 "max_entropy": round(math.log(experts), 6),
                 "aux_recomputed": round(float(experts * (share * mean_p).sum()), 8),
             }
+            if acc.get("realised_seen"):
+                stats[name]["drop_rate_realised"] = round(
+                    float(acc["realised"].cpu()) / tokens, 6)
         self.last_stats = stats
         n = len(stats)
-        for key in ("drop_rate", "imbalance", "route_entropy", "gate_entropy"):
-            value = sum(s[key] for s in stats.values()) / n
+        for key in ("drop_rate", "imbalance", "route_entropy", "gate_entropy",
+                    "drop_rate_realised"):
+            present = [s[key] for s in stats.values() if key in s]
+            if not present:
+                continue
             pl_module.log(f"train_{'moe_imbalance' if key == 'imbalance' else key}",
-                          torch.tensor(float(value)), on_step=False, on_epoch=True)
+                          torch.tensor(sum(present) / len(present)),
+                          on_step=False, on_epoch=True)
         for name, s in stats.items():
+            realised = (f" (realised {s['drop_rate_realised']:.1%})"
+                        if "drop_rate_realised" in s else "")
             print(f"[routing] {name}: share {[f'{v:.3f}' for v in s['share']]} | "
-                  f"drops {s['drop_rate']:.1%} | imbalance {s['imbalance']:.3f} | "
+                  f"drops {s['drop_rate']:.1%}{realised} | imbalance {s['imbalance']:.3f} | "
                   f"H(route) {s['route_entropy']:.2f}/{s['max_entropy']:.2f} | "
                   f"H(gate) {s['gate_entropy']:.2f}/{s['max_entropy']:.2f} | "
                   f"aux {s['aux_recomputed']:.4f}")
