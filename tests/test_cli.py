@@ -59,9 +59,10 @@ def test_flags_override_the_recipe():
     assert c["epochs"] == 40
 
 
-def test_epoch_budget_drives_drop_path():
+def test_drop_path_comes_from_the_variant_not_the_budget():
     assert _cfg("--epochs", "90")["model"]["drop_path_rate"] == 0.1
-    assert _cfg("--epochs", "300")["model"]["drop_path_rate"] == 0.15
+    assert _cfg("--epochs", "300")["model"]["drop_path_rate"] == 0.1       # was 0.15
+    assert _cfg("--variant", "b3", "--epochs", "90")["model"]["drop_path_rate"] == 0.3
     assert _cfg("--epochs", "300", "--drop-path", "0.3")["model"]["drop_path_rate"] == 0.3
 
 
@@ -401,14 +402,38 @@ def test_local_config_files_are_excluded_from_the_shipped_sweep():
         assert not is_local_config("configs/scratch_04_moe_shared.yaml")
         assert str(local) not in shipped_config_files()
         assert "configs/scratch_04_moe_shared.yaml" in shipped_config_files()
+        # (every machine-local file is excluded, not just this fixture: a
+        # developer's own my_paths.local.yaml must not fail the gate)
         assert shipped_config_files() == sorted(
             str(f) for f in pathlib.Path("configs").glob("*.yaml")
-            if f.name != local.name)
+            if not is_local_config(f))
         # ... and both sweeps must still pass with it present.
         test_every_shipped_config_file_resolves()
         test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
     finally:
         local.unlink()
+
+
+def test_run_suffix_marks_a_repeat_without_touching_the_derived_name():
+    """--run-suffix appends a repeat marker so the same arm can be rerun into
+    its own checkpoint directory; unset, every derived name is unchanged."""
+    base = ("--recipe", "scratch", "--variant", "b2", "--no-moe", "--no-rope")
+    plain = _cfg(*base)["run_name"]
+    assert plain == "sv1_b2_in1k_r224_dense_norope_ln_scratch90", plain
+    assert _cfg(*base, "--run-suffix", "v2")["run_name"] == plain + "_v2"
+    assert _cfg(*base, "--run-suffix", "seed7")["run_name"] == plain + "_seed7"
+    # an SSL run gets it too (the tag is last in both branches of build_run_tag)
+    assert _cfg("--task", "ssl", "--dataset", "pass", "--run-suffix", "v3")["run_name"].endswith("_v3")
+    # an explicit --run-name replaces the derived name entirely, suffix included
+    assert _cfg(*base, "--run-name", "explicit", "--run-suffix", "v2")["run_name"] == "explicit"
+    # it becomes a directory name, so anything path-unsafe is refused
+    for bad in ("../evil", "a b", "v2/x", "", "."):
+        try:
+            _cfg(*base, "--run-suffix", bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"run_suffix {bad!r} must be refused")
 
 
 def test_missing_config_file_is_a_clean_error():

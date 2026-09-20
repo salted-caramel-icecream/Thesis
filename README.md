@@ -235,7 +235,70 @@ Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
 weeks, not days — see `docs/HPARAMS.md` §5.
 
----
+### 9. Wave 1: expert count at fixed placement, plus the SSL pair
+
+Four arms, B2 throughout, all from scratch on the shipped 90-epoch ladder
+budget (90 matches ScMoE's comparison budget). No dedicated config files —
+each supervised arm is a shipped ladder row plus `--variant b2`, resolving
+byte-for-byte to what a pinned file would give. The size is visible before
+the first step: the run name printed at start-up begins `sv1_b2_`.
+
+| GPU | arm | command | run name |
+|---|---|---|---|
+| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
+| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
+| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_ln_scratch90` |
+
+Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
+also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
+shared-expert branch, and the routed experts never carry one (an
+`ARCHITECTURE.md` invariant). The 15 dense blocks keep their conv untouched.
+The two differ **only** in expert count, so the pair prices E at fixed
+placement.
+
+```bash
+COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
+        --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
+
+CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
+CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
+CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert $COMMON
+```
+
+`drop_path` resolves to 0.1 on all four (the variant's official rate). All four
+run names are distinct, so no two arms can share a checkpoint directory.
+
+**No shared expert in any arm** — `scratch_08` ships with it on, so GPU 3
+passes `--no-shared-expert` to match GPUs 1–2 (the run name carries no `+sh`).
+That keeps both comparisons single-variable: GPU 1 vs GPU 2 prices **expert
+count** at fixed stage-4 placement, GPU 2 vs GPU 3 prices **placement** at
+fixed E=8. It also means no routed block has a DWConv anywhere in the wave,
+since `moe_block_dwconv` feeds only the shared-expert branch.
+
+**The SSL pair — a later wave, not this one.** The SimMIM arms are
+`--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
+(`sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100`) and the same command with
+`--dataset pass --data-dir /data/pass_arrow`. Running
+ImageNet first gives the PASS arm a reference it otherwise has none of — no
+third-party MIM result on PASS is known — and the pair then isolates the
+pretraining corpus with everything else fixed. MoE is **off on both**: adding
+experts would confound the dataset comparison and put untested parameters into
+a path that has never completed an epoch. `mask_token_routing` therefore emits
+nothing on these arms (it requires `--moe`); it belongs to a later arm, once
+SimMIM is known to work.
+
+**Scope of the RoPE claim.** RoPE is on in both MoE arms and is not varied in
+Wave 1. It is tested later by re-running the winning MoE configuration with
+`--no-rope`, which measures RoPE's contribution **inside the MoE setting
+only** — it does not measure RoPE's effect on a dense model. Any statement
+about RoPE from this ladder has to carry that scope.
+
+Budget: the scratch recipe's 90 epochs. For the 300-epoch cosine stopped
+early, use the `_300ep_stop100` sibling of the same file, or add
+`--epochs 300 --stop-at N --milestones "[...]"`. Repeat an arm without sharing
+its checkpoint directory or W&B name: `--run-suffix v2`.
 
 ## Or use a notebook
 
@@ -244,7 +307,7 @@ Three, for different purposes:
 | | |
 |---|---|
 | `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the 262 tests. Prefer this. |
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** — self-contained, keeps the familiar cell layout, does not import `pvt_moe`. For when you want the old notebook to just work. |
 
 The patched v10 carries these fixes into its own class definitions
@@ -347,7 +410,7 @@ cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "
 | Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) | same |
 | Warmup epochs | 5 | 3 | 20 | 5 |
 | Layer-wise LR decay | — | — | 0.9 | 0.9 |
-| Stochastic depth | 0.1, → 0.15 at 300 ep (derived) | 0.1 ("as pretraining") | 0.1 | 0.1 |
+| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 | 0.1 |
 | Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 | 1.0 |
 | Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical | identical |
 
@@ -377,7 +440,7 @@ directly, and prints the equivalent command line.
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
-| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16). GQA is available as an ablation via `model.num_kv_heads` |
+| 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16) — one kv head per query head, no head-count knob |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
 | 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
@@ -396,16 +459,17 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-└─────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
-│   └─────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
-│   │  └──────────────────────────────────────────── dataset
-│   │  │        └─────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
-│   │  │        │    └────────────────────────────── 4 experts, top-1
-│   │  │        │    │   └────────────────────────── shared expert
-│   │  │        │    │   │   └────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
-│   │  │        │    │   │   │         └──────────── norm
-│   │  │        │    │   │   │         │  └───────── recipe + epoch budget
+sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+└─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | pass | fmnist | eurosat | path)
+│   │  │    └─────────────────────────────────────────────── input resolution (dataset.img_size; 224 = default)
+│   │  │    │        └────────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │    │        │    └───────────────────────────────── 4 experts, top-1
+│   │  │    │        │    │   └───────────────────────────── shared expert
+│   │  │    │        │    │   │   └───────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
+│   │  │    │        │    │   │   │         └─────────────── norm
+│   │  │    │        │    │   │   │         │  └──────────── recipe + epoch budget
 ```
 
 Further markers appear only when they apply: `-nat`/`-mb` (backend),

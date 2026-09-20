@@ -183,7 +183,7 @@ def load_hf_pretrained(
                 filtered[custom_key] = fused
                 stats["kv_fused"] += 1
             else:
-                stats["kv_skipped"] += 1  # kv-head mismatch: only under a GQA ablation
+                stats["kv_skipped"] += 1  # fused kv shape mismatch (a non-official head layout)
 
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     stats["loaded"] = len(filtered)
@@ -196,7 +196,7 @@ def load_hf_pretrained(
     if verbose:
         print(
             f"[HF pretrained] loaded={stats['loaded']} kv_fused={stats['kv_fused']} "
-            f"kv_skipped_gqa={stats['kv_skipped']} moe_mlp_skipped={stats['skipped_moe_mlp']} "
+            f"kv_skipped={stats['kv_skipped']} moe_mlp_skipped={stats['skipped_moe_mlp']} "
             f"shape_skipped={stats['skipped_shape']} no_target={stats['dropped_no_target']} "
             f"seeded_moe_blocks={stats['seeded_moe_blocks']} "
             f"seeded_shared={stats['seeded_shared_experts']} "
@@ -210,7 +210,7 @@ def load_hf_pretrained(
             print(f"  unmapped HF keys ({len(stats['unmapped'])}): {stats['unmapped'][:5]} ...")
         if stats["missing"]:
             print(f"  missing model keys ({len(stats['missing'])}, expected for MoE experts, "
-                  f"GQA kv and RoPE-Mixed freqs, which stay at init): "
+                  f"and RoPE-Mixed freqs, which stay at init): "
                   f"{stats['missing'][:6]} ...")
     return stats
 

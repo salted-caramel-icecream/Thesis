@@ -234,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--precision")
     g.add_argument("--seed", type=int)
     g.add_argument("--run-name", help="default: derived from the ablation flags")
+    g.add_argument("--run-suffix", dest="run_suffix", metavar="TAG",
+                   help="append a repeat marker to the DERIVED run name, e.g. "
+                        "--run-suffix v2 -> ..._scratch90_v2 — rerun one arm "
+                        "without sharing its checkpoint directory or W&B name "
+                        "(letters, digits, '-' and '.')")
     g.add_argument("--checkpoint-root", dest="checkpoint_root", metavar="DIR",
                    help="where run directories (checkpoints) are written")
     g.add_argument("--checkpoint-dir", dest="checkpoint_root",
@@ -400,6 +405,7 @@ _FLAG_PATHS = {
     "precision": "precision",
     "seed": "seed",
     "run_name": "run_name",
+    "run_suffix": "run_suffix",
     "checkpoint_root": "checkpoint_root",
     "log_root": "log_root",
     "use_wandb": "use_wandb",
@@ -480,12 +486,10 @@ def build_config(args, verbose: bool = True) -> dict:
         # Dense is the pretraining default (paths 1 and 3 of the three-path
         # ablation); path 2 asks for it with --moe. Anything explicit — the
         # flag, a config file, --set — wins.
-        files = args.config or []
-        files = [files] if isinstance(files, str) else files
         explicit = (args.use_moe is not None
                     or any(o.split("=")[0].strip() == "model.ablation.use_moe" for o in args.overrides)
                     or any("use_moe" in load_config_file(f).get("model", {}).get("ablation", {})
-                           for f in files))
+                           for f in config_files))
         if not explicit:
             cfg["model"]["ablation"]["use_moe"] = False
             if verbose:
@@ -552,10 +556,13 @@ def describe(cfg: dict) -> str:
                  f"{' ' + abl['rope_mode'] + ' theta ' + str(abl['rope_theta']) if abl['use_rope'] else ''} "
                  f"| aug {aug}")
     if cfg.get("milestones") or cfg.get("stop_at_epoch"):
-        stop = cfg.get("stop_at_epoch") or cfg["epochs"]
+        # An SSL run's schedule is built for ssl.epochs, not the supervised
+        # `epochs` the recipe left behind (build_ssl_trainer, validate_config).
+        total = cfg["ssl"]["epochs"] if cfg["task"] == "ssl" else cfg["epochs"]
+        stop = cfg.get("stop_at_epoch") or total
         lines.append(
-            f"  schedule: cosine over {cfg['epochs']} ep, running to epoch "
-            f"{stop}{' then stopping' if stop < cfg['epochs'] else ''} "
+            f"  schedule: cosine over {total} ep, running to epoch "
+            f"{stop}{' then stopping' if stop < total else ''} "
             f"| milestones {cfg.get('milestones') or 'none'}"
         )
     if cfg["mode"] == "resume":
@@ -792,12 +799,26 @@ def _exportable(cfg: dict) -> dict:
     """
     from pvt_moe.config import ROPE_THETA_DEFAULT, build_run_tag
 
+    from pvt_moe.config import resolve_lr
+
     out = copy.deepcopy({k: v for k, v in cfg.items() if not k.startswith("_")})
     if out.get("run_name") == build_run_tag(cfg):
         out["run_name"] = None
     abl = out["model"]["ablation"]
     if abl.get("rope_theta") == ROPE_THETA_DEFAULT.get(abl.get("rope_mode")):
         abl["rope_theta"] = None
+    # The SSL LRs are scaled from their *_base by the effective batch. Written
+    # back as numbers they would be treated as explicit on reload and would NOT
+    # rescale, so `--config saved.json --batch-size X` would keep the old
+    # machine's LRs. Null the ones that are exactly the derivation.
+    ssl = out.get("ssl") or {}
+    eff = cfg.get("effective_batch_size")
+    ref = ssl.get("lr_reference_batch")
+    if eff and ref:
+        for key, base_key in (("lr", "base_lr"), ("warmup_lr", "warmup_lr_base"),
+                              ("final_lr", "final_lr_base")):
+            if ssl.get(base_key) is not None and ssl.get(key) == resolve_lr(ssl[base_key], eff, ref):
+                ssl[key] = None
     return out
 
 

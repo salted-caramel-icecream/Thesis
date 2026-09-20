@@ -117,11 +117,23 @@ def run_identity(cfg: dict) -> dict:
         "effective_batch_size": cfg.get("effective_batch_size"),
         "precision": cfg.get("precision"),
         "norm": m["norm_type"], "dense_dwconv": m.get("dense_dwconv", True),
+        # Stochastic depth leaves NO trace in the checkpoint (DropPath holds no
+        # parameters and no buffers) and none in the run name, so this record
+        # is the only place a resume can check it against — see
+        # assert_resume_identity.
+        "drop_path_rate": m["drop_path_rate"],
         "rope": ({"mode": abl["rope_mode"], "placement": abl["rope_placement"],
                   "theta": abl["rope_theta"]} if abl["use_rope"] else None),
+        # capacity_factor and gate_noise change what the router does and are in
+        # neither the run name nor the state dict: a finished run that does not
+        # record them cannot say whether an arm underperformed from capacity
+        # starvation or from expert count.
         "moe": ({"placement": abl["moe_placement"], "num_experts": moe["num_experts"],
                  "top_k": moe["top_k"], "shared_expert": moe["shared_expert"],
-                 "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init")}
+                 "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init"),
+                 "capacity_factor": moe.get("capacity_factor"),
+                 "gate_noise": moe.get("gate_noise"),
+                 "aux_weight": (cfg.get("loss") or {}).get("aux_weight")}
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
@@ -129,12 +141,12 @@ def run_identity(cfg: dict) -> dict:
         s = cfg["ssl"]
         ident["ssl"] = {"method": s["method"], "lr": s["lr"], "base_lr": s["base_lr"],
                         "mask_patch_size": s["mask_patch_size"], "mask_ratio": s["mask_ratio"],
-                        "mask_space": s["mask_space"]}
+                        "mask_space": s["mask_space"], "grad_clip": s.get("grad_clip")}
     else:
         o = cfg["optim"]
         ident["optim"] = {"lr": o["lr"], "base_lr": o.get("base_lr"),
                           "layer_decay": o.get("layer_decay"), "warmup_epochs": o["warmup_epochs"],
-                          "weight_decay": o["weight_decay"]}
+                          "weight_decay": o["weight_decay"], "grad_clip": o.get("grad_clip")}
     return ident
 
 
@@ -201,7 +213,10 @@ class ResultsWriter(pl.Callback):
         abl = cfg["model"]["ablation"]
         if not (abl["use_moe"] and any(abl["moe_placement"])):
             return None
-        block = {"aux_weight": cfg["loss"]["aux_weight"]}
+        moe_cfg = cfg["model"]["moe"]
+        block = {"aux_weight": cfg["loss"]["aux_weight"],
+                 "capacity_factor": moe_cfg.get("capacity_factor"),
+                 "gate_noise": moe_cfg.get("gate_noise")}
         # Per-epoch training-time routing stats (RoutingMonitor), and the
         # warning that goes with the aux number so a reader of this file
         # cannot mistake a pinned 1.0 for a healthy router.
@@ -214,23 +229,31 @@ class ResultsWriter(pl.Callback):
         loader = getattr(trainer, "val_dataloaders", None)
         if model is not None and loader is not None and self.utilization_batches > 0:
             try:
-                from pvt_moe.utils.diagnostics import expert_utilization
+                from pvt_moe.utils.diagnostics import routing_stats
                 import contextlib
                 import io
                 import math
 
                 with contextlib.redirect_stdout(io.StringIO()):
-                    counts = expert_utilization(model, loader, num_batches=self.utilization_batches)
-                util = {}
-                for name, c in counts.items():
-                    c = c.float()
+                    stats = routing_stats(model, loader, num_batches=self.utilization_batches)
+                util, drops = {}, {}
+                for name, st in stats.items():
+                    c = st["counts"].float()
                     share = c / c.sum().clamp(min=1)
                     p = share[share > 0]
                     util[name] = {"share": [round(float(v), 4) for v in share],
                                   "entropy": round(float(-(p * p.log()).sum()), 4),
                                   "max_entropy": round(math.log(c.numel()), 4),
                                   "tokens": int(c.sum())}
+                    # The direct measurement: what fraction of the routed
+                    # tokens capacity threw away. Separates "MoE did not help"
+                    # from "the tokens never reached an expert".
+                    drops[name] = {"drop_fraction": st["drop_fraction"],
+                                   "dropped": st["dropped"], "routed": st["routed"],
+                                   "capacity": st["capacity"],
+                                   "tokens_per_forward": st["tokens_per_forward"]}
                 block["expert_utilization"] = util
+                block["token_drops"] = drops
                 block["utilization_batches"] = self.utilization_batches
             except Exception as e:  # noqa: BLE001 — diagnostics never kill a run
                 block["expert_utilization"] = {"error": f"{type(e).__name__}: {e}"[:200]}
@@ -343,6 +366,147 @@ def read_results(dirpath: str) -> dict | None:
         return None
 
 
+#: ``(config path, identity path)`` for every resolved value that CHANGES
+#: TRAINING, leaves no trace in the checkpoint, and is absent from the run
+#: name — so a resume could silently continue one run under two settings.
+#: Each is compared against the identity block results.json recorded for the
+#: run being resumed; a side that is absent or None is skipped, which is what
+#: makes the MoE-only and SSL-only entries no-ops elsewhere.
+#:
+#: Deliberately NOT here: optim.layer_decay. Changing it between 1.0 and a
+#: decay changes the optimizer's param-group COUNT, which makes
+#: ``load_state_dict`` raise on its own; changing it between two decays is a
+#: silent NO-OP, because the restored base_lrs win. Guarding a no-op is worse
+#: than not guarding it. What a resume silently IGNORES is reported instead,
+#: by ``resume_provenance``.
+RESUME_IDENTITY_FIELDS = (
+    ("model.drop_path_rate", "drop_path_rate"),
+    ("effective_batch_size", "effective_batch_size"),
+    ("model.moe.capacity_factor", "moe.capacity_factor"),
+    ("model.moe.gate_noise", "moe.gate_noise"),
+    ("loss.aux_weight", "moe.aux_weight"),
+    ("optim.grad_clip", "optim.grad_clip"),
+    ("ssl.grad_clip", "ssl.grad_clip"),
+    ("ssl.mask_ratio", "ssl.mask_ratio"),
+)
+
+
+def _dig(node, dotted: str):
+    """``_dig(cfg, "model.moe.gate_noise")`` -> the value, or None if any hop
+    is missing or not a dict (an SSL field on a supervised run, say)."""
+    for part in dotted.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def resume_identity_mismatches(cfg: dict, ckpt_path: str) -> list:
+    """Compare this run against the results.json beside ``ckpt_path``.
+
+    Returns a list of human-readable mismatches; empty means consistent, or
+    that there is nothing to compare against (a run from before results.json
+    existed, or a checkpoint moved out of its run directory — a resume is
+    still allowed then, it just cannot be verified).
+    """
+    rec = read_results(os.path.dirname(os.path.abspath(ckpt_path))) or {}
+    ident = rec.get("identity") or {}
+    out = []
+    for cfg_path, ident_path in RESUME_IDENTITY_FIELDS:
+        have, want = _dig(ident, ident_path), _dig(cfg, cfg_path)
+        if have is None or want is None or have == want:
+            continue
+        out.append(f"{cfg_path}: the run being resumed trained at {have}, "
+                   f"this command resolves {want}")
+    return out
+
+
+def resume_provenance(cfg: dict, ckpt_path: str) -> list:
+    """What a resume takes FROM THE CHECKPOINT rather than the command line.
+
+    Lightning restores the optimizer's ``initial_lr`` and the scheduler's
+    ``base_lrs``, so a changed ``--lr`` on a resume is silently ignored: the
+    run continues on the original schedule. That wastes a run rather than
+    corrupting one, which is precisely why it is easy to miss — so it is
+    printed, with the two values side by side, whether or not they differ.
+
+    Returns display lines; empty when the checkpoint cannot be read (never a
+    reason to stop a resume).
+    """
+    import torch
+
+    try:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as e:                       # noqa: BLE001 — never block a resume
+        return [f"  (could not read {ckpt_path} to report it: {type(e).__name__}: {e})"]
+    if not isinstance(ck, dict):
+        return []
+
+    lines = []
+    epoch, step = ck.get("epoch"), ck.get("global_step")
+    if epoch is not None:
+        lines.append(f"  loop state: resuming after epoch {epoch} (0-based), global step {step}")
+
+    # base_lrs is the number the scheduler rebuilds every LR from. SequentialLR
+    # nests its children, which is the shape LitClassifier already handles.
+    base_lrs = []
+    for sched in ck.get("lr_schedulers") or []:
+        if isinstance(sched, dict):
+            if "_schedulers" in sched:
+                for sub in sched["_schedulers"]:
+                    base_lrs += list((sub or {}).get("base_lrs") or [])
+            base_lrs += list(sched.get("base_lrs") or [])
+    if base_lrs:
+        ckpt_lr = max(base_lrs)
+        asked = (cfg["ssl"]["lr"] if cfg.get("task") == "ssl" else cfg["optim"]["lr"])
+        key = "ssl.lr" if cfg.get("task") == "ssl" else "optim.lr"
+        same = asked is not None and abs(ckpt_lr - asked) <= 1e-12 * max(1.0, abs(asked))
+        lines.append(
+            f"  {key}: this command resolves {asked:.3e}, the checkpoint restores "
+            f"{ckpt_lr:.3e}" + ("  (same)" if same else "  <-- the checkpoint WINS; "
+                                "your value is ignored"))
+    opt_states = ck.get("optimizer_states") or []
+    if opt_states and isinstance(opt_states[0], dict):
+        groups = opt_states[0].get("param_groups") or []
+        wds = {g.get("weight_decay") for g in groups if isinstance(g, dict)}
+        wds.discard(None)
+        asked_wd = (cfg["ssl"] if cfg.get("task") == "ssl" else cfg["optim"]).get("weight_decay")
+        if wds and asked_wd is not None and asked_wd not in wds:
+            lines.append(f"  weight_decay: this command resolves {asked_wd}, the checkpoint "
+                         f"restores {sorted(wds)}  <-- the checkpoint WINS")
+        lines.append(f"  optimizer: {len(groups)} param group(s) restored "
+                     f"(momentum/variance included)")
+    return lines
+
+
+def assert_resume_identity(cfg: dict) -> list:
+    """Raise if a resume would silently change one of those fields.
+
+    Called by ``build_trainer`` / ``build_ssl_trainer`` (so the CLI and the
+    notebooks are both covered) before any compute. Same shape as the
+    ``ssl_init`` architecture guard: it names the fix and can be switched off
+    with ``model.resume_check_identity: false`` when the change is deliberate.
+    """
+    if cfg.get("mode") != "resume" or not cfg.get("ckpt_path"):
+        return []
+    problems = resume_identity_mismatches(cfg, cfg["ckpt_path"])
+    provenance = resume_provenance(cfg, cfg["ckpt_path"])
+    if provenance:
+        print(f"[resume] {cfg['ckpt_path']} — what comes from the checkpoint, "
+              f"not the command line:")
+        for line in provenance:
+            print(line)
+    if problems and cfg["model"].get("resume_check_identity", True):
+        text = "\n  - ".join(problems)
+        raise ValueError(
+            f"resuming {cfg['ckpt_path']} would change settings the checkpoint cannot "
+            f"carry:\n  - {text}\nHalf the run would train at each value. Pass the "
+            f"recorded value explicitly (e.g. --drop-path <recorded>), or set "
+            f"model.resume_check_identity: false if the change is deliberate."
+        )
+    return problems
+
+
 def write_results(dirpath: str, rec: dict) -> str:
     """Atomically write results.json and the markdown rendering next to it."""
     os.makedirs(dirpath, exist_ok=True)
@@ -387,7 +551,9 @@ def render_markdown(rec: dict) -> str:
         s = rec["ssl"]
         lines += ["", "## SSL pretraining", "",
                   f"ssl_loss {_fmt(s.get('ssl_loss'), nd=4)} | recon {_fmt(s.get('recon_loss'), nd=4)} | "
-                  f"mask ratio {_fmt(s.get('mask_ratio'), nd=3)}"
+                  f"mask ratio {_fmt(s.get('mask_ratio'), nd=3)} measured"
+                  + (f" / {_fmt(s.get('mask_ratio_configured'), nd=3)} configured"
+                     if s.get("mask_ratio_configured") is not None else "")
                   + (f" | target_std {_fmt(s.get('target_std'), nd=3)}" if s.get("target_std") is not None else ""),
                   "", f"> {s.get('note', MIM_PROBE_NOTE)}"]
     params, gfl = eff.get("params") or {}, eff.get("gflops") or {}
@@ -402,6 +568,8 @@ def render_markdown(rec: dict) -> str:
     if moe:
         lines += ["", "## MoE", "", f"aux weight {moe.get('aux_weight')} | train_aux "
                   f"{_fmt(acc.get('train_aux') if 'train_aux' in acc else (rec['history'][-1].get('train_aux') if rec.get('history') else None), nd=4)}"]
+        lines[-1] += (f" | capacity_factor {moe.get('capacity_factor')} "
+                      f"| gate_noise {moe.get('gate_noise')}")
         routing = moe.get("routing") or {}
         if routing:
             lines += ["", "Training-token routing (RoutingMonitor) — the metrics `train_aux` "
@@ -417,12 +585,20 @@ def render_markdown(rec: dict) -> str:
                              f"{r['gate_entropy']:.2f} / {r['max_entropy']:.2f} |")
             lines += ["", f"> {moe.get('aux_note', AUX_NOTE)}"]
         util = moe.get("expert_utilization") or {}
+        drops = moe.get("token_drops") or {}
         if util and "error" not in util:
             lines += ["", "Validation-batch utilisation (`expert_utilization`, eval mode, "
                       "noiseless logits — a different population from the row above):", "",
-                      "| block | token share per expert | entropy / max |", "|---|---|---|"]
+                      "| block | token share per expert | entropy / max | tokens dropped |",
+                      "|---|---|---|---|"]
             for name, u in util.items():
-                lines.append(f"| {name} | {u['share']} | {u['entropy']:.2f} / {u['max_entropy']:.2f} |")
+                d = drops.get(name) or {}
+                cap = d.get("capacity")
+                dropped = ("n/a (no cap)" if cap is None and d
+                           else f"{d['drop_fraction'] * 100:.2f}% ({d['dropped']}/{d['routed']}, "
+                                f"cap {cap}/expert per fwd)" if d else "not measured")
+                lines.append(f"| {name} | {u['share']} | "
+                             f"{u['entropy']:.2f} / {u['max_entropy']:.2f} | {dropped} |")
     mr = rec.get("mask_routing")
     if mr and "error" not in mr:
         lines += ["", "## Mask-token vs visible-token routing (MoE pretraining)", "",

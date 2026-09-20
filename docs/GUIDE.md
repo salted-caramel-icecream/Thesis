@@ -224,22 +224,41 @@ re-downloading 160 GB.
 |---|---|
 | what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
 | licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
-| HF id | `yukimasano/pass` — single `train` split, no validation/test |
+| source | **not the Hub.** `yukimasano/pass` ships a loading script (`pass.py`), `datasets` removed loading-script support in 5.0.0, and the repo has no `refs/convert/parquet` branch to fall back on (at ~167 GB it is past the Hub's auto-conversion limit). The images come from Zenodo (record 6615455) via the dataset's own `download.sh`; this repo converts the extracted folder. Single `train` split, no validation/test |
 | `arrow_dirs` key | `pass` |
-| disk | ~166 GB snapshot; **~333 GB free while building** (the staged build holds the Arrow cache and the snapshot at once; a naive build would peak near 500 GB) |
+| disk | ~166 GB snapshot, and **~333 GB while building**: the extracted JPEGs (~167 GB) and the snapshot (~166 GB) must coexist, because `save_to_disk` reads the JPEGs to embed them. `imagefolder`'s own Arrow cache holds file *paths*, not pixels, so it costs kilobytes. Delete the JPEGs once the build prints `done` and you are back to ~166 GB |
 | usable with | `task: "ssl"` only — `train.py --task ssl --dataset pass` or `notebooks/03_ssl_pretrain.ipynb` (SimMIM by default, `--ssl-method jepa`). Every supervised recipe refuses it at validate time: the corpus has no labels |
 | validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is `evaluate.py` (k-NN, linear probe) plus the intermediate fine-tune on a labelled set (`docs/SIMMIM_GUIDE.md` §6) |
 
+Two steps. First fetch and extract the tars with the dataset's own script —
+delete each tar as it extracts if space is tight, since the tars and the
+extracted JPEGs are each ~167 GB and never need to coexist:
+
 ```bash
-python download_data.py --dataset pass --out /data/pass_arrow                       # Linux / macOS / WSL2
-python download_data.py --dataset pass --out D:/data/pass_arrow --hf-cache E:/hf     # Windows; cache on another drive
+git clone https://github.com/yukimasano/PASS
+cd PASS && bash download.sh /data/pass_jpg
 ```
 
-The script downloads, converts to Arrow, **deletes only PASS's raw download
-under the HF hub cache** (logged as `[cleanup] removing the raw download of
-yukimasano/pass only`), then writes the snapshot. It prints the snapshot's
-feature names when the conversion finishes; the loader itself finds the image
-column by feature type and never reads the creator, date or GPS columns.
+Then convert that folder into the snapshot this repo reads:
+
+```bash
+python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
+rm -rf /data/pass_jpg      # only after it prints `done` — reclaims ~167 GB
+```
+
+`--dataset pass` **without** `--from-images` exits 2 with that route spelled
+out, rather than a traceback from inside `datasets`.
+
+The conversion passes `drop_labels=True` deliberately: `download.sh` extracts
+into numbered subfolders, and `imagefolder` would otherwise read those
+directory names as a `ClassLabel` and hand an unlabelled corpus a fabricated
+ground truth. The snapshot ends up with one `image` column, which is what the
+loader expects — it finds the image column by feature type and never reads the
+creator, date or GPS columns. The build also checks the row count against
+PASS's own 1,439,588 and warns loudly if the extraction came up short.
+
+Because `save_to_disk` embeds the image bytes, the finished snapshot is
+self-contained: the JPEG folder and the `imagefolder` cache can both go.
 
 ### Small downstream sets (`--recipe downstream`)
 
@@ -311,7 +330,7 @@ key nothing reads.
 | peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) | same |
 | warmup | 5 | 3 | 20 | 5 |
 | layer-wise LR decay | — | — | 0.9 | 0.9 |
-| stochastic depth | 0.1 (0.15 at 300 ep) | 0.1 | 0.1 | 0.1 |
+| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 | 0.1 |
 | everything else | identical (batch, aug, MoE, weight decay, clipping) | | | |
 
 Self-supervised pretraining is not a recipe but a task: `--task ssl`
@@ -430,9 +449,10 @@ python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
 The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
 `[100, 150, 200, 300]`, so a resume needs no edit. Two consequences:
 
-- Stochastic depth is **0.15**, not the 0.1 of the 90-epoch rows
-  (`scratch_drop_path` derives it from the budget). A 300-epoch arm is
-  comparable to other 300-epoch arms, never to a 90-epoch row.
+- Stochastic depth is **unchanged by the budget**: it is the variant's
+  official rate (0.1 for b0–b2), the same as the 90-epoch rows, so the budget
+  is the only thing that differs between them. It was derived from the epoch
+  count until that rule was replaced — `docs/HPARAMS.md` section 1 records why.
 - Run names end in `_scratch300` rather than `_scratch90`, so the two budgets
   never share a checkpoint directory or a W&B name.
 
@@ -568,8 +588,24 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_moe-s4b2-…`), so logs stay
+same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
+
+The `r224` field is the input resolution (`dataset.img_size`). It arrived with
+the SSL chain, so a run directory created before that merge is named without
+it: `sv1_b1_in1k_dense_norope_ln_scratch300`, where the same config now derives
+`sv1_b1_in1k_r224_dense_norope_ln_scratch300`. `--resume-from` keeps the derived
+name, so a bare resume would load the old `last.ckpt` but write every later
+checkpoint, `results.json` and W&B row into the new directory. Keep the old one
+by passing its name explicitly:
+
+```bash
+python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml \
+    --run-name sv1_b1_in1k_dense_norope_ln_scratch300 \
+    --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_ln_scratch300/last.ckpt
+```
+
+Check with `--dry-run` first: the printed `run:` line must show the old name.
 
 Watch for these lines:
 

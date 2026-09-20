@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,8 +32,10 @@ import json
 #: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
 #: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
 #: refused by every supervised recipe at validate time. PASS (Asano et al.,
-#: NeurIPS Datasets & Benchmarks 2021; HF ``yukimasano/pass``): 1,439,588
-#: images, CC-BY 4.0, no people, a single ``train`` split, no labels.
+#: NeurIPS Datasets & Benchmarks 2021): 1,439,588 images, CC-BY 4.0, no people,
+#: a single ``train`` split, no labels. Its ``hf_id`` is None because the Hub
+#: cannot serve it (loading script, no parquet branch); it is built from the
+#: Zenodo tars with ``download_data.py --from-images`` — docs/GUIDE.md section 2.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
 #: ``finetune_epochs`` is a FIXED budget per small dataset: open-ended runs on
@@ -47,7 +50,8 @@ DATASETS = {
                      "hf_id": "timm/imagenet-22k-wds", "gated": True, "finetune_epochs": None,
                      "licence": "ImageNet terms of access; gated on HF"},
     "pass": {"num_classes": 0, "labelled": False, "tag": "pass",
-             "hf_id": "yukimasano/pass", "gated": False, "finetune_epochs": None,
+             "hf_id": None, "gated": False, "finetune_epochs": None,
+             "hf_id_hint": "yukimasano/pass (loading script — not loadable; use Zenodo)",
              "licence": "CC-BY 4.0 (images and dataset)"},
     # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
     # Native resolutions are far below 224; dataset.img_size (224) upsamples
@@ -195,13 +199,25 @@ LR_REFERENCE_BATCH = 1024
 WARMUP_START_LR = 1e-6
 
 
-def scratch_drop_path(epochs: int) -> float:
-    """Stochastic depth for a from-scratch run of ``epochs`` epochs.
+def variant_drop_path(variant: str) -> float:
+    """Stochastic depth for a from-scratch run of this variant.
 
-    DeiT-3 raises the drop rate by 0.05 every 200 epochs to fight overfitting
-    on long schedules. Anchored to the spec: 90 ep -> 0.1, 300 ep -> 0.15.
+    PVT v2 sets drop path per SIZE, not per schedule length: 0.1 for b0/b1/b2
+    and 0.3 for b3/b4/b5 (``VARIANTS``, from
+    ``classification/configs/pvt_v2/pvt_v2_b*.py``). Training a size at its
+    published rate is what makes this repo's top-1 comparable to the paper's
+    (B2: 82.0%).
+
+    REVERSAL, recorded in docs/HPARAMS.md section 1: until this changed, the
+    rate was derived from the epoch budget instead (DeiT-3's +0.05 per 200
+    epochs: 90 ep -> 0.1, 300 ep -> 0.15), a deliberate choice that made a
+    300-epoch B2 run train at 0.15 and so not directly comparable to the
+    published number. ``--drop-path`` still overrides, per run.
+
+    ``"custom"`` has no official recipe and falls back to B1's rate, the same
+    fallback ``apply_variant`` uses for its architecture fields.
     """
-    return round(0.1 + 0.05 * (epochs // 200), 4)
+    return VARIANTS["b1" if variant == "custom" else variant]["drop_path"]
 
 
 #: Recipe presets. Every value here is a DEFAULT: anything set explicitly in
@@ -219,7 +235,7 @@ RECIPES = {
             # a higher rate than any other stage when nothing is pretrained.
             "stage4_lr_multiplier": 1.0,
         },
-        # model.drop_path_rate is derived from epochs by scratch_drop_path().
+        # model.drop_path_rate: the variant's official rate (variant_drop_path).
     },
     # Intermediate stage: SSL checkpoint -> supervised ImageNet-1k.
     # Values from microsoft/SimMIM @ d3e29bc,
@@ -233,7 +249,11 @@ RECIPES = {
             "base_lr": 1.25e-3,
             "lr_reference_batch": 512,
             "lr": None,                    # DERIVED by the linear scaling rule
-            "warmup_epochs": 20,
+            # SimMIM section 4.1's ablation protocol: "100-epoch training, and a
+            # cosine learning rate scheduler with 10-epoch warm-up". The
+            # reference yaml's WARMUP_EPOCHS 20 belongs to the 800-epoch
+            # scaling config, which is not the setting this chain reproduces.
+            "warmup_epochs": 10,
             "stage4_lr_multiplier": 1.0,
             # Layer-wise decay compounding from the head down. SimMIM §4.3
             # uses 0.9 for a 100-epoch pretrain and lowers it with model size
@@ -315,10 +335,10 @@ VALID_MASK_SPACES = ("token", "pixel")
 #: jepa:   I-JEPA-style values this repo shipped before SimMIM was added.
 SSL_METHOD_DEFAULTS = {
     "simmim": {"epochs": 200, "base_lr": 2e-4, "lr_reference_batch": 512,
-               "warmup_epochs": 10, "warmup_lr": 1e-6, "final_lr": 1e-5,
+               "warmup_epochs": 10, "warmup_lr_base": 1e-6, "final_lr_base": 1e-5,
                "weight_decay": 0.05, "betas": [0.9, 0.999], "grad_clip": 5.0},
     "jepa": {"epochs": 100, "base_lr": 1.5e-3, "lr_reference_batch": 2048,
-             "warmup_epochs": 15, "warmup_lr": 0.0, "final_lr": 1e-6,
+             "warmup_epochs": 15, "warmup_lr_base": 0.0, "final_lr_base": 1e-6,
              "weight_decay": 0.04, "betas": [0.9, 0.95], "grad_clip": 3.0},
 }
 
@@ -330,8 +350,16 @@ SSL_DEFAULTS = {
     "lr_reference_batch": None,   # simmim 512, jepa 2048
     "lr": None,                   # DERIVED; set explicitly to bypass the rule
     "warmup_epochs": None,
-    "warmup_lr": None,            # DERIVED from warmup_lr_base by the same rule
-    "final_lr": None,             # DERIVED likewise
+    # The three LRs are DERIVED from the three *_base fields, which the
+    # resolution never writes to. Deriving warmup_lr/final_lr IN PLACE (reading
+    # the field the scaled value is then stored in) made them non-idempotent:
+    # every re-validate multiplied them by batch/reference again, so a config
+    # round-tripped through --save-config, or a checkpoint's config re-read by
+    # evaluate.py, silently doubled both.
+    "warmup_lr_base": None,       # simmim 1e-6, jepa 0.0
+    "final_lr_base": None,        # simmim 1e-5, jepa 1e-6
+    "warmup_lr": None,            # DERIVED from warmup_lr_base
+    "final_lr": None,             # DERIVED from final_lr_base
     "weight_decay": None,
     "betas": None,
     "grad_clip": None,
@@ -386,6 +414,12 @@ _DEFAULT: dict = {
     "chain": [],
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
+    # Appended to the DERIVED run name, e.g. run_suffix "v2" ->
+    # sv1_b2_in1k_r224_dense_norope_ln_scratch90_v2. For repeats of one arm
+    # (a rerun, another seed, a second attempt) that must not share a
+    # checkpoint directory or a W&B name with the first. Ignored when
+    # run_name is set explicitly, which replaces the derived name entirely.
+    "run_suffix": None,
     "experiment_group": "ablations",
     "seed": 42,
     # True => bit-reproducible (cudnn deterministic, benchmark off) but slower.
@@ -420,7 +454,7 @@ _DEFAULT: dict = {
 
     # None => recipe default (scratch: 90, pretrained: 100). For from-scratch
     # ablations pick one of config.SCRATCH_EPOCH_CHOICES == (90, 150, 300);
-    # stochastic depth follows automatically (scratch_drop_path).
+    # stochastic depth comes from the variant (variant_drop_path).
     "epochs": None,
     "precision": "bf16-mixed",
     # MICRO-batch: what actually fits in VRAM in one forward/backward.
@@ -491,12 +525,6 @@ _DEFAULT: dict = {
         "variant": "b1",
         "embed_dims": None,               # b1: [64, 128, 320, 512]
         "num_heads": None,                # b1: [1, 2, 5, 8]
-        # kv heads per stage. None => equal to num_heads: standard multi-head
-        # attention, which takes the plain SDPA call and is eligible for the
-        # flash kernel under bf16 (attention.py). Set fewer kv heads per stage
-        # for grouped-query attention (the v9 lineage ran [1, 1, 1, 2]); that
-        # is an ablation, not the default, and not part of the variant table.
-        "num_kv_heads": None,
         "mlp_ratios": None,               # b1: [8, 8, 4, 4]
         "depths": None,                   # b1: [2, 2, 2, 2]
         "sr_ratios": None,                # b1: [8, 4, 2, 1]
@@ -504,9 +532,9 @@ _DEFAULT: dict = {
         "qkv_bias": True,
         "drop_rate": 0.0,
         "attn_drop_rate": 0.0,
-        # None => recipe default. scratch: 0.1, +0.05 per 200 epochs
-        # (DeiT-3), so 90/150 ep -> 0.1 and 300 ep -> 0.15. pretrained: 0.1
-        # ("as pretraining").
+        # None => derived. scratch: the VARIANT's official rate at any epoch
+        # budget (variant_drop_path; b0-b2 0.1, b3-b5 0.3). pretrained /
+        # ssl_finetune / downstream: 0.1 from the recipe. task ssl: 0.0.
         "drop_path_rate": None,
         # Stages (1-based) to run under gradient checkpointing while training:
         # recompute activations in the backward pass instead of storing them.
@@ -557,7 +585,6 @@ _DEFAULT: dict = {
             # every RoPE'd block, weight-decay excluded, snapshotted at step 0
             # (rope_freqs_init.pt) for the drift plot (tools/plot_rope_freqs.py).
             # "axial": fixed frequencies, no parameters (the v10 behaviour).
-            # Mixed needs num_kv_heads == num_heads in the RoPE'd stages.
             "rope_mode": "mixed",
             # None => ROPE_THETA_DEFAULT[rope_mode] (mixed 10.0, axial 50.0).
             # For mixed it only sets the INITIAL magnitude ladder.
@@ -629,6 +656,12 @@ _DEFAULT: dict = {
         # differs from this run instead of loading what fits and leaving the
         # rest at random init. False downgrades the refusal to a warning.
         "ssl_init_check_arch": True,
+        # Resuming (--resume-from) refuses to silently change a setting the
+        # checkpoint cannot carry — drop_path_rate today
+        # (engine.results.RESUME_IDENTITY_FIELDS), compared against the
+        # identity block in the run directory's results.json. false loads
+        # anyway, for a change you mean to make.
+        "resume_check_identity": True,
         "num_frozen_stages": 0,
     },
 
@@ -808,7 +841,7 @@ def parent_tag(ckpt_path: str | None) -> str | None:
 def build_run_tag(cfg: dict) -> str:
     """Derive a self-documenting run name from the ablation flags.
 
-    Example: ``sv1_b1_in1k_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+    Example: ``sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
 
     The variant sits right after the version: two sizes in one W&B project
     are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
@@ -880,20 +913,22 @@ def build_run_tag(cfg: dict) -> str:
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
     budget = {"scratch": "scratch", "pretrained": "ft", "ssl_finetune": "sslft",
               "downstream": "dstr"}.get(cfg.get("recipe"), "run")
+    # Repeat marker: last, so the arm is still readable left to right.
+    suffix = f"_{cfg['run_suffix']}" if cfg.get("run_suffix") else ""
     if cfg.get("task") == "ssl":
         # An SSL run is identified by its method and pretraining length; the
         # mask space changes what the encoder sees, so it is tagged too.
         ssl = cfg["ssl"]
         px = "-px" if ssl.get("mask_space") == "pixel" else ""
         return (f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_"
-                f"{ssl['method']}{ssl['epochs']}{px}")
+                f"{ssl['method']}{ssl['epochs']}{px}{suffix}")
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
     # A warm start from an SSL / fine-tuned checkpoint is named after its
     # parent too (parent_tag), so paths 2 and 3 never share a directory.
     parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "ssl_init" else None
     parent = f"_{parent}" if parent else ""
-    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}"
+    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -1081,11 +1116,13 @@ def apply_ssl_method(cfg: dict) -> list:
     eff = (cfg.get("effective_batch_size")
            or cfg["batch_size"] * (cfg.get("accumulate_grad_batches") or 1))
     ref = ssl["lr_reference_batch"]
-    for key, base in (("lr", ssl["base_lr"]), ("warmup_lr", ssl["warmup_lr"]),
-                      ("final_lr", ssl["final_lr"])):
-        if key == "lr" and ssl.get("lr") is not None:
-            continue
-        ssl[key] = resolve_lr(base, eff, ref)
+    # Derive from the *_base fields, never from the field being written: an
+    # already-resolved value must survive a second validate_config unchanged.
+    for key, base_key in (("lr", "base_lr"), ("warmup_lr", "warmup_lr_base"),
+                          ("final_lr", "final_lr_base")):
+        if ssl.get(key) is not None:
+            continue                 # explicit, or resolved on an earlier pass
+        ssl[key] = resolve_lr(ssl[base_key], eff, ref)
         filled.append(f"ssl.{key}")
     if method == "simmim" and cfg.get("task") == "ssl":
         img = cfg["dataset"]["img_size"]
@@ -1165,10 +1202,6 @@ def apply_variant(cfg: dict) -> list:
                 f"hand-tune the architecture (no official checkpoint then)."
             )
 
-    if model.get("num_kv_heads") is None:          # MHA unless asked otherwise
-        model["num_kv_heads"] = list(model["num_heads"])
-        filled.append("model.num_kv_heads")
-
     hf_id = model.get("pretrained_hf_id")
     if variant == "custom":
         pass                                  # never filled; yours to set
@@ -1210,8 +1243,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
 
     1. recipe presets fill mode / epochs / lr / warmup_epochs /
        stage4_lr_multiplier / drop_path_rate / upcycling init flags;
-    2. from-scratch ``drop_path_rate`` follows the epoch budget
-       (``scratch_drop_path``) when still unset;
+    2. from-scratch ``drop_path_rate`` takes the variant's official rate
+       (``variant_drop_path``) when still unset;
     3. ``warmup_start_factor`` is derived so warmup begins at an absolute
        ``WARMUP_START_LR`` (1e-6) whatever the peak LR is.
 
@@ -1276,8 +1309,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         )
 
     # Stochastic depth for from-scratch runs scales with the epoch budget.
-    # The derivation is anchored on B1's official 0.1 (identical for B0-B2);
-    # B3-B5 were officially trained at 0.3, which this rule does not know.
+    # From scratch: the variant's OFFICIAL rate, whatever the epoch budget
+    # (variant_drop_path; the epoch-based rule it replaced is recorded there).
     # SSL PRETRAINING uses none: SimMIM's pretrain config sets DROP_PATH_RATE
     # 0.0 (microsoft/SimMIM configs/swin_base__100ep/simmim_pretrain_*.yaml;
     # 0.1 is its FINE-TUNE value, carried by the ssl_finetune recipe), and
@@ -1286,14 +1319,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         cfg["model"]["drop_path_rate"] = 0.0
         filled.append("model.drop_path_rate")
     if cfg["model"].get("drop_path_rate") is None:
-        cfg["model"]["drop_path_rate"] = scratch_drop_path(cfg["epochs"])
+        cfg["model"]["drop_path_rate"] = variant_drop_path(cfg["model"]["variant"])
         filled.append("model.drop_path_rate")
-        official = VARIANTS.get(cfg["model"]["variant"], {}).get("drop_path")
-        if official is not None and official != VARIANTS["b1"]["drop_path"]:
-            print(f"[config] model.drop_path_rate derived as "
-                  f"{cfg['model']['drop_path_rate']} (B1-anchored rule); the "
-                  f"official PVT v2 {cfg['model']['variant']} recipe used "
-                  f"{official}. Pass --drop-path {official} to match it.")
 
     # Warmup starts at an absolute 1e-6, not at lr * 1e-6.
     optim = cfg["optim"]
@@ -1354,6 +1381,43 @@ def _suggest(unknown: str, known: set) -> str:
     return ""
 
 
+def drop_removed_keys(cfg: dict) -> list:
+    """Drop config keys this package no longer has, so an OLD config resolves.
+
+    Every checkpoint stores the config it was trained with
+    (``hyper_parameters["cfg"]``), and ``evaluate.py`` / ``--config saved.json``
+    feed it straight back into ``validate_config``, where an unknown key is a
+    hard error. A key that was removed because its only admissible value became
+    the sole behaviour is therefore dropped here instead — but only when it
+    carries that value, so no old run is silently reinterpreted.
+
+    ``model.num_kv_heads`` (grouped-query attention) is the one such key:
+    attention is plain multi-head now, so a config that set it equal to
+    ``num_heads`` (every shipped arm, and the default) loses nothing, while a
+    genuine GQA config is refused — loading it would build a different model.
+
+    Returns the list of dropped key paths. Called first by ``validate_config``.
+    """
+    dropped = []
+    model = cfg.get("model")
+    if isinstance(model, dict) and "num_kv_heads" in model:
+        kv = model.pop("num_kv_heads")
+        dropped.append("model.num_kv_heads")
+        heads = model.get("num_heads")
+        if heads is None:                     # not resolved yet: the variant's
+            variant = model.get("variant")    # table has the value it will get
+            spec = VARIANTS.get("b1" if variant == "custom" else variant)
+            heads = spec["num_heads"] if spec else None
+        if kv is not None and heads is not None and list(kv) != list(heads):
+            raise ValueError(
+                f"model.num_kv_heads {list(kv)} asks for grouped-query attention, which "
+                f"this version does not have: attention is plain multi-head "
+                f"(num_kv_heads == num_heads == {list(heads)}). Drop the key to run the "
+                f"same architecture as MHA; a GQA run needs the version that had it."
+            )
+    return dropped
+
+
 def assert_known_keys(cfg: dict) -> None:
     """Reject config keys that do not exist in ``default_config()``.
 
@@ -1404,6 +1468,8 @@ def assert_json_safe(cfg: dict) -> None:
 def validate_config(cfg: dict) -> dict:
     """Validate and normalize a config in place (returns it for chaining).
 
+    - drops keys removed in a later version of this package
+      (``drop_removed_keys``), so a config saved by an older one still resolves
     - rejects unknown keys (``assert_known_keys``) — a typo must not silently
       become a new key that nothing reads
     - resolves ``model.variant`` into depths / dims / heads / ratios /
@@ -1415,6 +1481,7 @@ def validate_config(cfg: dict) -> dict:
     - derives run_name when unset
     - asserts JSON-serializability
     """
+    drop_removed_keys(cfg)
     assert_known_keys(cfg)
     apply_variant(cfg)
     apply_recipe(cfg)
@@ -1450,17 +1517,24 @@ def validate_config(cfg: dict) -> dict:
         )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
-    budget = cfg["epochs"]
+    # An SSL run's budget is ssl.epochs (--epochs sets it and leaves the
+    # supervised `epochs` to the recipe, where it means nothing); that is what
+    # build_ssl_trainer runs to, so it is what these two must be measured
+    # against. Checking the supervised field instead would refuse a milestone
+    # inside the pretraining budget and accept one the run never reaches.
+    ssl_run = cfg.get("task") == "ssl"
+    budget = cfg["ssl"]["epochs"] if ssl_run else cfg["epochs"]
+    field = "ssl.epochs" if ssl_run else "epochs"
     stop_at = cfg.get("stop_at_epoch")
     if stop_at is not None and not 1 <= stop_at <= budget:
         raise ValueError(
-            f"stop_at_epoch must be in [1, epochs={budget}], got {stop_at}. "
+            f"stop_at_epoch must be in [1, {field}={budget}], got {stop_at}. "
             "It truncates the run; it never extends it."
         )
     late = [m for m in cfg.get("milestones") or [] if not 1 <= m <= budget]
     if late:
         raise ValueError(
-            f"milestones must be within [1, epochs={budget}], got {late}"
+            f"milestones must be within [1, {field}={budget}], got {late}"
         )
     cfg["milestones"] = sorted(set(cfg.get("milestones") or []))
 
@@ -1472,12 +1546,9 @@ def validate_config(cfg: dict) -> dict:
             f"model.grad_checkpointing must contain 1-based stage numbers in "
             f"[1, {n}], got {bad}"
         )
-    for key in ("embed_dims", "num_heads", "num_kv_heads", "mlp_ratios", "sr_ratios"):
+    for key in ("embed_dims", "num_heads", "mlp_ratios", "sr_ratios"):
         if len(model[key]) != n:
             raise ValueError(f"model.{key} must have {n} entries, got {len(model[key])}")
-    for heads, kv in zip(model["num_heads"], model["num_kv_heads"]):
-        if heads % kv != 0:
-            raise ValueError(f"num_heads {heads} must be divisible by num_kv_heads {kv}")
 
     moe = model["moe"]
     if moe["upcycle_init"] not in VALID_UPCYCLE_INITS:
@@ -1516,8 +1587,7 @@ def validate_config(cfg: dict) -> dict:
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
 
-    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled;
-    # mixed needs one kv head per query head in every RoPE'd stage.
+    # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled.
     if abl.get("rope_mode") not in VALID_ROPE_MODES:
         raise ValueError(
             f"model.ablation.rope_mode must be one of {VALID_ROPE_MODES}, "
@@ -1538,13 +1608,6 @@ def validate_config(cfg: dict) -> dict:
                 raise ValueError(
                     f"RoPE enabled in stage {i + 1} but head_dim={head_dim} is not divisible by 4"
                 )
-            if abl["rope_mode"] == "mixed" and model["num_kv_heads"][i] != model["num_heads"][i]:
-                raise ValueError(
-                    f"rope_mode 'mixed' in stage {i + 1} needs num_kv_heads == num_heads "
-                    f"({model['num_kv_heads'][i]} != {model['num_heads'][i]}): the learnable "
-                    f"frequencies are per query head. Use rope_mode 'axial' with GQA, or "
-                    f"drop the GQA override for that stage."
-                )
 
     # The recipe's LR is calibrated for a specific effective batch; say so
     # rather than silently rescaling, which would make runs incomparable.
@@ -1564,6 +1627,13 @@ def validate_config(cfg: dict) -> dict:
     if not cfg.get("chain"):
         cfg["chain"] = [stage_tag(cfg)]
 
+    suffix = cfg.get("run_suffix")
+    if suffix is not None:
+        if not isinstance(suffix, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", suffix):
+            raise ValueError(
+                f"run_suffix must be a short filename-safe tag such as 'v2' or 'seed7' "
+                f"(letters, digits, '-' and '.', starting alphanumeric), got {suffix!r}. "
+                "It becomes part of the checkpoint directory name.")
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)
         if cfg["mode"] == "ssl_init" and parent_tag(cfg.get("ckpt_path")) is None:

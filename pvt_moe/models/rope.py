@@ -164,7 +164,7 @@ class RotaryEmbedding2D(nn.Module):
     scale 1 the axial cache is bit-identical to the unscaled (v9) one.
     """
 
-    def __init__(self, head_dim: int, theta: float = 100.0, mode: str = "axial",
+    def __init__(self, head_dim: int, theta: float = 10.0, mode: str = "mixed",
                  num_heads: int | None = None):
         super().__init__()
         if head_dim % 4 != 0:

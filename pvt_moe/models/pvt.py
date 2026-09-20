@@ -3,7 +3,7 @@
 A 4-stage pyramid vision transformer (Wang et al., "PVT v2: Improved
 Baselines with Pyramid Vision Transformer") extended with:
 
-- grouped-query SRA attention (``pvt_moe.models.attention.GQAttention``)
+- SRA multi-head attention (``pvt_moe.models.attention.SRAttention``)
 - per-block Mixture-of-Experts FFN (``pvt_moe.models.ffn.MoEMlp``)
 - per-block 2D RoPE, mixed (learnable per-head frequencies, default) or
   axial (``pvt_moe.models.rope``)
@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 
-from pvt_moe.models.attention import GQAttention
+from pvt_moe.models.attention import SRAttention
 from pvt_moe.models.ffn import Mlp, MoEMlp
 from pvt_moe.models.norms import RMSNorm, build_norm_layers
 
@@ -83,7 +83,7 @@ class OverlapPatchEmbed(nn.Module):
 
 
 class Block(nn.Module):
-    """Pre-norm transformer block: SRA/GQA attention + (dense | MoE) FFN.
+    """Pre-norm transformer block: SRA attention + (dense | MoE) FFN.
 
     ``forward`` returns a tensor for dense blocks and ``(tensor, aux_loss)``
     for MoE blocks.
@@ -93,7 +93,6 @@ class Block(nn.Module):
         self,
         dim: int,
         num_heads: int,
-        num_kv_heads: int,
         mlp_ratio: float,
         qkv_bias: bool,
         drop: float,
@@ -106,17 +105,16 @@ class Block(nn.Module):
         use_moe: bool = False,
         moe_cfg: dict | None = None,
         use_rope: bool = False,
-        rope_theta: float = 100.0,
-        rope_mode: str = "axial",
+        rope_theta: float = 10.0,
+        rope_mode: str = "mixed",
         dense_dwconv: bool = True,
     ):
         super().__init__()
         self.use_moe = use_moe
         self.norm1 = norm_layer(dim)
-        self.attn = GQAttention(
+        self.attn = SRAttention(
             dim,
             num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
@@ -160,7 +158,6 @@ class PyramidVisionTransformerV2(nn.Module):
         num_classes: int = 1000,
         embed_dims=(64, 128, 320, 512),
         num_heads=(1, 2, 5, 8),
-        num_kv_heads=(1, 2, 5, 8),
         mlp_ratios=(8, 8, 4, 4),
         depths=(2, 2, 2, 2),
         sr_ratios=(8, 4, 2, 1),
@@ -174,8 +171,8 @@ class PyramidVisionTransformerV2(nn.Module):
         moe_placement=None,
         rope_placement=None,
         moe_cfg: dict | None = None,
-        rope_theta: float = 100.0,
-        rope_mode: str = "axial",
+        rope_theta: float = 10.0,
+        rope_mode: str = "mixed",
         act_layer=nn.GELU,
         dense_dwconv: bool = True,
         grad_checkpointing=(),
@@ -211,7 +208,6 @@ class PyramidVisionTransformerV2(nn.Module):
                     Block(
                         dim=embed_dims[i],
                         num_heads=num_heads[i],
-                        num_kv_heads=num_kv_heads[i],
                         mlp_ratio=mlp_ratios[i],
                         qkv_bias=qkv_bias,
                         drop=drop_rate,
@@ -399,7 +395,6 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         num_classes=cfg["dataset"]["num_classes"],
         embed_dims=m["embed_dims"],
         num_heads=m["num_heads"],
-        num_kv_heads=m["num_kv_heads"],
         mlp_ratios=m["mlp_ratios"],
         depths=m["depths"],
         sr_ratios=m["sr_ratios"],

@@ -9,7 +9,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import Checkpoint, LearningRateMonitor, ModelCheckpoint
 
-from pvt_moe.engine.results import ResultsWriter
+from pvt_moe.engine.results import ResultsWriter, assert_resume_identity
 
 
 class MilestoneCheckpoint(pl.Callback):
@@ -459,6 +459,9 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
     monitored ``MulticlassAccuracy/val`` and the ``/`` in the filename template
     silently created nested directories).
     """
+    # A resume must not silently change what the checkpoint cannot carry.
+    # Here, not in the CLI: the notebooks call these factories directly.
+    assert_resume_identity(cfg)
     ckpt_dir = os.path.join(cfg["checkpoint_root"], cfg["run_name"])
     # The schedule is always built for cfg["epochs"]; stop_at_epoch only ends
     # the run early, so a resumed run picks up the same cosine.
@@ -519,6 +522,9 @@ def build_ssl_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trai
     """Trainer for SSL pretraining (SimMIM / JEPA): monitors ``ssl_loss``, no
     val loop. Same checkpoint files as the supervised trainer (``last.ckpt``,
     milestones, RoPE frequency snapshots, results.json)."""
+    # A resume must not silently change what the checkpoint cannot carry.
+    # Here, not in the CLI: the notebooks call these factories directly.
+    assert_resume_identity(cfg)
     ckpt_dir = os.path.join(cfg["checkpoint_root"], cfg["run_name"])
     checkpoint_cb = ModelCheckpoint(
         dirpath=ckpt_dir,

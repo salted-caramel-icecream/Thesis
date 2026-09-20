@@ -8,13 +8,13 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 - `pvt_moe/config.py` — plain-dict config: `_DEFAULT`, recipes, variants, ladders, `build_run_tag`, `validate_config`, `assert_known_keys`
 - `pvt_moe/cli.py` — argparse front end; `train.py` at the root is a shim over it
-- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA + GQA + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `norms.py`, `pretrained.py` (HF remap), `moe_native.py`
+- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA multi-head + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `norms.py`, `pretrained.py` (HF remap), `moe_native.py`
 - `pvt_moe/engine/` — `classifier.py` (LitClassifier, optimizer groups, layer-wise LR decay, chain provenance at warm start), `callbacks.py` (checkpoints, `RopeFreqSnapshot`, `build_trainer`, `build_ssl_trainer`), `results.py` (`ResultsWriter`: results.json / results.md every epoch), `env.py`
 - `pvt_moe/data/` — ImageNet / PASS / small-set Arrow pipeline; `pvt_moe/utils/` — FLOPs, expert diagnostics
 - `pvt_moe/ssl/` — `simmim.py` (`LitSimMIM`, the default method), `jepa.py` (`LitJEPA`, dense only), `backbone.py` (`build_ssl_backbone`, honours `use_moe`), `diagnostics.py` (`mask_token_routing`), `masking.py`, `predictor.py`; `build_ssl_module(cfg)` dispatches on `ssl.method`
 - `pvt_moe/eval/` — `runner.py` (`evaluate`: validation top-1, k-NN, linear probe → results.json), `knn.py`, `probe.py` (`LitProbe`), `features.py`, `lowshot.py` (seeded class-balanced subsets; torch-free, also `python -m pvt_moe.eval.lowshot`); root `evaluate.py` is the front end
 - `tests/` — plain `test_*` functions in `test_*.py`; `tests/helpers.py` gives `tiny_config(**overrides)` and `install_fake_tutel_backend()` (returns an undo fn; needed around `build_model` / `LitClassifier` / `LitSimMIM` whenever `use_moe` is on)
-- `tools/` — standalone scripts: `plot_rope_freqs.py` (CPU), `verify_upcycling.py` (function preservation on the REAL MoE backend — the suite only covers fake Tutel + native), `compare_runs.py` (table / CSV / PDF over results.json files), `probe_checkpoint.py` (forensics on a checkpoint ALONE — config, the LR actually in effect vs the reconstructed schedule, head collapse, Adam moments; never builds the model, so a config mismatch cannot corrupt the reading); `configs/` — one YAML per ablation arm
+- `tools/` — standalone scripts: `plot_rope_freqs.py` (CPU), `verify_upcycling.py` (function preservation on the REAL MoE backend — the suite only covers fake Tutel + native), `compare_runs.py` (table / CSV / PDF over results.json files), `concurrent_worker_sweep.py` (per-arm and aggregate loader throughput under concurrent load; needs data + GPUs, see its header), `probe_checkpoint.py` (forensics on a checkpoint ALONE — config, the LR actually in effect vs the reconstructed schedule, head collapse, Adam moments; never builds the model, so a config mismatch cannot corrupt the reading); `configs/` — one YAML per ablation arm
 - `docs/` — `GUIDE.md` (how to run, datasets, evaluation), `HPARAMS.md` (recipes, the SSL chain, ladders), `ARCHITECTURE.md` (invariants), `SIMMIM_GUIDE.md` (SSL recipe, the stem leak, three pretraining paths, evaluation protocol), `JEPA_GUIDE.md`, `NOTEBOOK_TO_PACKAGE.md`
 - `notebooks/` — `v11_train.ipynb` is the supervised launcher, `03_ssl_pretrain.ipynb` the SSL one (edit only their CONFIG cells, via json load/dump); `archive/` — v9 provenance, unmaintained
 - `figures/` — thesis figures, vector PDF only
@@ -29,7 +29,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 ## Config rules
 
-- Plain nested dicts, JSON-serialisable by construction. A recipe (`scratch` | `pretrained`) fills only the fields left as `None`; anything set explicitly wins.
+- Plain nested dicts, JSON-serialisable by construction. A recipe (`scratch` | `pretrained` | `ssl_finetune` | `downstream`) fills only the fields left as `None`; anything set explicitly wins.
 - `assert_known_keys` rejects unknown keys — a typo must never silently create a dead key.
 - Precedence, lowest to highest: `default_config()` < `--config file` (repeatable; files merge in order, later wins) < `--ladder N` < named flags < `--set a.b=v`. A machine-local `configs/*.local.{yaml,yml,json}` is gitignored, skipped by the config sweep, and composed with an arm file, never run alone.
 - `model.variant` (b0…b5) sets depths / dims / heads / ratios / HF id as one set and rejects a disagreeing explicit value; `custom` hand-tunes them.
@@ -44,6 +44,13 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 `sv1_{variant}_{in1k|in22k|pass|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{ln|rms}_{scratch90|ft100|sslft100|dstr50|eval|simmim200[-px]|jepa100}[_from-{dense|moe}-{parent budget}]`,
 e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`,
 `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_sslft100_from-dense-simmim200`.
+`r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived
+with the SSL chain, so a run directory created before that has no `_r224_`.
+`--resume-from` keeps the derived name, so resume such a run with
+`--run-name <its old name>` to stay in its directory. `run_suffix`
+(`--run-suffix v2`) appends a repeat marker to the DERIVED name so one arm
+can be rerun without sharing a checkpoint directory or a W&B name; an
+explicit `run_name` replaces the derived name entirely instead.
 The `sv1` prefix (`config.py` `"version"`) is bumped on every architecture
 change so old and new runs never share a W&B name or a checkpoint directory.
 Two configs that differ in anything that changes the model must give
@@ -83,4 +90,4 @@ implementation of the style.
 - Never change training defaults, hyperparameters or the ablation ladder without saying so explicitly; `docs/HPARAMS.md` and `tests/test_recipes.py::test_spec_*` are the source of truth.
 - Keep tests CPU-only and fast: tiny configs from `tests/helpers.py`, the fake Tutel backend whenever `use_moe` is on, no network.
 - Do not commit tokens, credentials or the paths of a specific machine (`D:` and `/data/runs` in the docs are examples only).
-- `tools/` scripts must run with torch + matplotlib alone — no dataset, no GPU, no Tutel.
+- `tools/` scripts must run with torch + matplotlib alone — no dataset, no GPU, no Tutel. The one exception is `tools/concurrent_worker_sweep.py`, which measures loader throughput under four concurrent arms and therefore needs the data stack, built snapshots and the GPUs; its `--self-test` runs anywhere on synthetic data.

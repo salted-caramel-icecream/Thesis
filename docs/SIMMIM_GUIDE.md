@@ -20,6 +20,13 @@ through the same front ends: `train.py --task ssl` and
 (2111.09886) never reached this machine, so the cross-check of §1 against the
 paper's §4.1 / appendix is still open; the yaml values are quoted verbatim
 with their file names so that check takes minutes once the PDF is in `docs/`.
+**One exception, flagged where it appears:** the UM-MAE figure in §9 is cited
+from that paper's table, not derived from any code that ran here.
+
+One §1 value HAS since been settled against the paper: the intermediate
+fine-tune's warmup is 10 epochs, per SimMIM §4.1's ablation protocol, not the
+reference yaml's 20 (which belongs to the 800-epoch scaling config) —
+`docs/HPARAMS.md` §3b records both settings and which is in force.
 
 ---
 
@@ -287,10 +294,41 @@ resolution, seed, the **chain** of stages that produced the weights, the
 parent checkpoint, git commit, config hash), accuracy (latest / best
 validation top-1 & top-5, macro precision / recall, losses), measured
 efficiency (seconds per epoch, images per second, peak VRAM, parameters,
-GFLOPs when fvcore is installed), MoE diagnostics (aux loss, expert token
-shares and routing entropy on validation batches; the mask-routing split for
-path 2), the environment, a per-epoch history, and whatever `evaluate.py`
-merged under `eval`.
+GFLOPs when fvcore is installed), MoE diagnostics (aux loss, `capacity_factor`
+and `gate_noise`, expert token shares and routing entropy on validation
+batches, the **token-drop fraction** capacity cost that epoch, and the
+mask-routing split for path 2), the environment, a per-epoch history, and
+whatever `evaluate.py` merged under `eval`.
+
+**Watching a pretraining run early.** `ssl_loss`, `recon_loss` and
+`mask_ratio` are logged **per step** (every `log_every_n_steps`, 50 by
+default) as well as per epoch, because an ImageNet epoch at B2/224 is 85–170
+minutes and epoch-end-only logging meant the two numbers that can expose a
+broken masker did not exist until then. `results.json` records the **measured**
+mask ratio under `ssl.mask_ratio` and the **configured** one under
+`ssl.mask_ratio_configured`; `results.md` prints both, labelled. They are not
+expected to be equal: the mask count is `ceil(patches x ratio)`, so at 224 px
+with 32-px patches it is `ceil(49 x 0.6) = 30`, i.e. 30/49 = **0.612 measured
+against 0.600 configured**. A measured value far from that — 0.0, 1.0, or
+drifting between steps — is the masker, not the schedule. (Until this was
+fixed, `results.md` printed the configured value whatever the masker did,
+because `results_extra` overwrote the measured one.)
+
+**Token drops (`moe.token_drops`).** An expert takes at most
+`capacity_factor x ceil(tokens / E)` tokens per forward (`top_k` x that when
+routing k-way) and everything past that receives exactly zero from the routed
+branch. A collapsed router and a starved capacity look the same in the loss
+and have opposite fixes, so the measurement is recorded next to the shares:
+`drop_fraction`, the raw `dropped` / `routed` counts, the `capacity` enforced
+and the `tokens_per_forward` it was computed from. Capacity applies to the
+whole flattened micro-batch, not per image — at B=256 on B2's 7x7 stage-4 map
+that is 12,544 tokens and, with E=8 at `capacity_factor` 1.0, 1,568 per
+expert, so a token is only lost to genuine router imbalance, not to
+small-sample noise. Measured from the router's own decisions
+(`pvt_moe.utils.diagnostics.routing_stats`): exact at `top_k` 1, which every
+shipped arm uses, and cross-checked against `NativeMoEFFN.dropped_tokens`, the
+counter of the layer that does the dropping. It is not measured on SSL runs,
+which have no validation loader.
 
 ---
 
@@ -309,6 +347,9 @@ pretraining starts to pay. The three-path comparison (§4) is then the
 interesting part — whether routing learned without labels differs from
 routing upcycled after supervised training — and it does not need the SSL
 arm to beat the supervised one to be informative.
+
+For an absolute magnitude to sanity-check the ImageNet SimMIM arm against
+(cited, not verified here), see §9.
 
 ---
 
@@ -341,6 +382,41 @@ map to whole tokens at every stage, which the 32-px unit does here
 resolution avoids the RoPE-grid change a 192 → 224 switch would cause for
 RoPE-Mixed frequencies (§2 table). SimMIM at 224 satisfies both without
 token dropping, which PVT v2's conv stems, SRA and DWConv could not survive.
+
+**The one number kept from it — a sanity anchor, CITED not verified.** UM-MAE
+Table 3 reports **79.28 top-1** on ImageNet-1k for **PVT-S** pretrained with
+**SimMIM for 200 epochs and fine-tuned for 100**. Provenance, stated plainly
+because it is the only figure in this file that did not come from code that
+ran here: it is read from the paper's table (confirmed by the author of this
+repo against a local copy of arXiv 2205.10063), *not* reproduced from a
+reference implementation, which could not be reached from this environment.
+Treat it accordingly — a magnitude to sanity-check against, not a baseline to
+claim parity with.
+
+Two differences make it an anchor rather than a comparison:
+
+| | UM-MAE Table 3 | the ImageNet SimMIM arm here |
+|---|---|---|
+| architecture | PVT-**S** | PVT v2 **B2** — a different family, not a size of the same one |
+| pretrain budget | 200 ep | 100 ep (SimMIM §4.1's ablation protocol) |
+| fine-tune | 100 ep | 100 ep (`recipe: ssl_finetune`) |
+| masking | UM-MAE's uniform masking | SimMIM 32-px, ratio 0.6, `mask_space: token` |
+
+So a result some points either side of 79.28 says nothing on its own. What it
+is good for is catching an order-of-magnitude failure: an ImageNet SimMIM →
+fine-tune chain that lands near 70, or near 82, means something in the chain
+is wrong before any ablation conclusion is drawn from it.
+
+**Why the ImageNet arm exists at all.** PASS has no reference number — the
+PASS authors validated MoCo-v2, SwAV and DINO, all contrastive or
+self-distillation, and no third-party masked-image-modelling result on PASS
+is known to this repo (a negative claim about the literature, scoped to what
+was checked: the PASS paper's own experiments). Running SimMIM on ImageNet-1k
+first supplies the reference the PASS arm otherwise lacks, and the pair then
+isolates the pretraining corpus with architecture, schedule, masking and
+fine-tune all fixed. The clean-provenance argument for PASS covers
+**pretraining only**: the evaluation stage fine-tunes and measures on
+ImageNet-1k, so the pipeline as a whole is not ImageNet-free.
 
 ---
 

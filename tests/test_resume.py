@@ -9,6 +9,7 @@ says it is.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
@@ -18,6 +19,7 @@ import torch
 from helpers import install_fake_tutel_backend, tiny_config
 from pvt_moe.engine.callbacks import MilestoneCheckpoint, build_trainer
 from pvt_moe.engine.classifier import LitClassifier
+from pvt_moe.engine.results import assert_resume_identity
 
 
 class _RecordLR(pl.Callback):
@@ -223,3 +225,160 @@ def test_stop_at_beyond_the_budget_is_rejected():
         assert "stop_at_epoch" in str(e)
         return
     raise AssertionError("stop_at_epoch > epochs must raise")
+
+
+def test_resume_refuses_a_silent_drop_path_change():
+    """A drop_path change leaves NO trace anywhere a resume would notice:
+    DropPath has no parameters or buffers (identical state-dict keys), the
+    rate is not in the run name, and the checkpoint does not carry the config
+    the trainer is built from. results.json records it, so a resume is
+    compared against that; half a run at each rate is not a run.
+    """
+    from pvt_moe.engine.results import JSON_NAME, run_identity
+
+    # Same state dict at either rate: nothing else can catch this.
+    undo = install_fake_tutel_backend()
+    try:
+        keys = {}
+        for rate in (0.1, 0.15):
+            c = tiny_config(model={"drop_path_rate": rate})
+            keys[rate] = sorted(LitClassifier(c).state_dict())
+    finally:
+        undo()
+    assert keys[0.1] == keys[0.15]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        trained = _cfg(tmp, model={"drop_path_rate": 0.15})
+        run_dir = os.path.join(tmp, trained["run_name"])
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, JSON_NAME), "w") as fh:
+            json.dump({"schema": 1, "identity": run_identity(trained)}, fh)
+        assert run_identity(trained)["drop_path_rate"] == 0.15      # in the identity block
+        ckpt = os.path.join(run_dir, "milestone-epoch002.ckpt")
+        open(ckpt, "w").close()
+
+        def resuming(**over):
+            return _cfg(tmp, mode="resume", ckpt_path=ckpt, **over)
+
+        # Resuming it at a different rate is refused, by build_trainer itself
+        # (so the notebooks, which never touch the CLI, are covered too).
+        undo = install_fake_tutel_backend()
+        try:
+            build_trainer(resuming(model={"drop_path_rate": 0.1}))
+        except ValueError as e:
+            assert "drop_path_rate" in str(e) and "0.15" in str(e), e
+        else:
+            raise AssertionError("a resume that changes drop_path must be refused")
+        finally:
+            undo()
+
+        # The recorded value resumes; the documented override loads anyway.
+        assert assert_resume_identity(resuming(model={"drop_path_rate": 0.15})) == []
+        loud = resuming(model={"drop_path_rate": 0.1, "resume_check_identity": False})
+        assert assert_resume_identity(loud), "reports the mismatch without raising"
+
+        # A fresh run is never checked, and neither is a checkpoint with no
+        # results.json beside it (runs from before it existed still resume).
+        assert assert_resume_identity(_cfg(tmp, model={"drop_path_rate": 0.1})) == []
+        lone = os.path.join(tmp, "moved.ckpt")
+        open(lone, "w").close()
+        assert assert_resume_identity(_cfg(tmp, mode="resume", ckpt_path=lone)) == []
+
+
+def test_resume_guards_every_field_that_changes_training_invisibly():
+    """Each of these changes training, leaves no trace in the checkpoint and is
+    absent from the run name, so a resume could otherwise continue one run
+    under two settings. layer_decay is deliberately NOT guarded: 1.0 <-> decay
+    raises on its own (param-group count), and decay <-> decay is a silent
+    no-op because the restored base_lrs win.
+    """
+    import copy
+
+    from pvt_moe.engine.results import (JSON_NAME, RESUME_IDENTITY_FIELDS,
+                                        resume_provenance, run_identity)
+
+    guarded = {c for c, _ in RESUME_IDENTITY_FIELDS}
+    for expected in ("model.drop_path_rate", "effective_batch_size", "loss.aux_weight",
+                     "model.moe.capacity_factor", "model.moe.gate_noise",
+                     "optim.grad_clip", "ssl.grad_clip", "ssl.mask_ratio"):
+        assert expected in guarded, expected
+    assert not any("layer_decay" in c for c in guarded), "guarding a no-op is worse than not"
+
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            trained = _cfg(tmp, model={"ablation": {"use_moe": True,
+                                                    "moe_placement": [[], [], [], [-1]]}})
+            run_dir = os.path.join(tmp, trained["run_name"])
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, JSON_NAME), "w") as fh:
+                json.dump({"schema": 1, "identity": run_identity(trained)}, fh)
+            ckpt = os.path.join(run_dir, "milestone-epoch001.ckpt")
+            open(ckpt, "w").close()
+
+            def resuming(path, value):
+                c = copy.deepcopy(trained)
+                c["mode"], c["ckpt_path"] = "resume", ckpt
+                node = c
+                *head, leaf = path.split(".")
+                for h in head:
+                    node = node[h]
+                node[leaf] = value
+                return c
+
+            for path, value in (("model.drop_path_rate", 0.42),
+                                ("effective_batch_size", trained["effective_batch_size"] * 2),
+                                ("loss.aux_weight", 0.5),
+                                ("model.moe.capacity_factor", 0.25),
+                                ("model.moe.gate_noise", 0.0),
+                                ("optim.grad_clip", 1.0)):
+                try:
+                    assert_resume_identity(resuming(path, value))
+                except ValueError as e:
+                    assert path in str(e), (path, str(e))
+                else:
+                    raise AssertionError(f"a resume that changes {path} must be refused")
+
+            # an unchanged resume is clean, and the override still loads anyway
+            same = copy.deepcopy(trained)
+            same["mode"], same["ckpt_path"] = "resume", ckpt
+            assert assert_resume_identity(same) == []
+            loud = resuming("model.drop_path_rate", 0.42)
+            loud["model"]["resume_check_identity"] = False
+            assert assert_resume_identity(loud), "reports without raising"
+
+            # a checkpoint it cannot read never blocks the resume
+            assert resume_provenance(same, ckpt)[0].startswith("  (could not read")
+    finally:
+        undo()
+
+
+def test_resume_reports_what_the_checkpoint_overrides():
+    """A changed --lr on a resume is silently ignored: Lightning restores the
+    optimizer's initial_lr and the scheduler's base_lrs. That wastes a run
+    rather than corrupting one, so it is printed rather than refused.
+    """
+    import copy
+
+    from pvt_moe.engine.results import resume_provenance
+
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, epochs=2, milestones=[1])
+            _run(cfg)
+            ckpt = os.path.join(tmp, cfg["run_name"], "last.ckpt")
+            assert os.path.exists(ckpt)
+
+            asked = copy.deepcopy(cfg)
+            asked["mode"], asked["ckpt_path"] = "resume", ckpt
+            asked["optim"]["lr"] = cfg["optim"]["lr"] / 2
+            lines = "\n".join(resume_provenance(asked, ckpt))
+            assert "optim.lr" in lines and "checkpoint WINS" in lines, lines
+            assert "loop state" in lines and "param group" in lines, lines
+
+            unchanged = copy.deepcopy(cfg)
+            unchanged["mode"], unchanged["ckpt_path"] = "resume", ckpt
+            assert "(same)" in "\n".join(resume_provenance(unchanged, ckpt))
+    finally:
+        undo()

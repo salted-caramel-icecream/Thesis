@@ -26,7 +26,7 @@ from pvt_moe.engine.classifier import LitClassifier
 from pvt_moe.engine.results import AUX_NOTE, read_results
 from pvt_moe.models.ffn import MoEMlp
 from pvt_moe.models.moe_native import NativeMoEFFN
-from pvt_moe.utils.diagnostics import capacity_of, routing_stats
+from pvt_moe.utils.diagnostics import capacity_of, logit_routing_stats
 
 E, DIM = 4, 16
 
@@ -51,7 +51,7 @@ def test_aux_is_exactly_one_plus_E_times_the_share_probability_covariance():
     torch.manual_seed(0)
     for scale in (0.0, 1e-4, 0.5, 4.0):
         lg = torch.randn(2048, E) * scale
-        s = routing_stats(lg)
+        s = logit_routing_stats(lg)
         f = torch.tensor(s["share"], dtype=torch.double)
         p = torch.tensor(s["mean_gate_prob"], dtype=torch.double)
         a, b = f - 1.0 / E, p - 1.0 / E
@@ -68,14 +68,14 @@ def test_aux_is_exactly_one_plus_E_times_the_share_probability_covariance():
     p = probs.mean(0)
     aux = float(E * (f * p).sum())
     assert abs(aux - (1.0 + E * float(((f - 1 / E) * (p - 1 / E)).sum()))) < 1e-12
-    assert abs(routing_stats(lg)["aux"] - aux) < 1e-7
+    assert abs(logit_routing_stats(lg)["aux"] - aux) < 1e-7
 
 
 def test_aux_reads_one_when_the_gate_probabilities_are_uniform_however_skewed_the_routing():
     """The blind spot, stated as a test: same shares, two confidences."""
     for shares in ([0.25] * 4, [0.6, 0.2, 0.1, 0.1], [1.0, 0.0, 0.0, 0.0]):
-        undecided = routing_stats(_logits_for(shares, margin=1e-5))
-        confident = routing_stats(_logits_for(shares, margin=8.0))
+        undecided = logit_routing_stats(_logits_for(shares, margin=1e-5))
+        confident = logit_routing_stats(_logits_for(shares, margin=8.0))
         assert undecided["share"] == confident["share"]                  # identical routing
         assert abs(undecided["aux"] - 1.0) < 1e-4, (shares, undecided["aux"])
         assert f"{undecided['aux']:.4f}" == "1.0000", undecided["aux"]
@@ -85,8 +85,8 @@ def test_aux_reads_one_when_the_gate_probabilities_are_uniform_however_skewed_th
         # the drop rate sees the imbalance in both cases, identically
         assert abs(undecided["drop_rate"] - confident["drop_rate"]) < 1e-6
     # the gate entropy is what tells the two apart
-    assert routing_stats(_logits_for([1.0, 0, 0, 0], margin=1e-5))["gate_entropy"] > math.log(E) - 1e-3
-    assert routing_stats(_logits_for([1.0, 0, 0, 0], margin=8.0))["gate_entropy"] < 0.02
+    assert logit_routing_stats(_logits_for([1.0, 0, 0, 0], margin=1e-5))["gate_entropy"] > math.log(E) - 1e-3
+    assert logit_routing_stats(_logits_for([1.0, 0, 0, 0], margin=8.0))["gate_entropy"] < 0.02
 
 
 def test_aux_is_not_floored_at_one_it_is_a_zero_correlation_crossing():
@@ -98,7 +98,7 @@ def test_aux_is_not_floored_at_one_it_is_a_zero_correlation_crossing():
     n0 = int(0.9 * T)
     lg[:n0, 0] = 1e-4                    # a hair
     lg[n0:, 1] = 6.0                     # confident
-    s = routing_stats(lg)
+    s = logit_routing_stats(lg)
     # genuinely argmax-consistent: every token's assignment IS its argmax
     want = torch.cat([torch.zeros(n0, dtype=torch.long), torch.ones(T - n0, dtype=torch.long)])
     assert (lg.argmax(-1) == want).all()
@@ -106,20 +106,20 @@ def test_aux_is_not_floored_at_one_it_is_a_zero_correlation_crossing():
     assert s["aux"] < 1.0, s["aux"]                      # BELOW the "balanced" value
     assert s["aux"] > E / (2 * (E - 1)) - 0.05           # and above the analytic minimum
     # a perfectly balanced, confident router sits exactly at 1.0
-    assert abs(routing_stats(_logits_for([0.25] * 4, margin=8.0))["aux"] - 1.0) < 1e-6
+    assert abs(logit_routing_stats(_logits_for([0.25] * 4, margin=8.0))["aux"] - 1.0) < 1e-6
 
 
 def test_drop_rate_is_the_total_variation_distance_from_uniform_at_capacity_one():
     for shares in ([0.25] * 4, [0.3, 0.25, 0.25, 0.2], [0.6, 0.2, 0.1, 0.1], [1.0, 0, 0, 0]):
-        s = routing_stats(_logits_for(shares, tokens=8192), capacity_factor=1.0)
+        s = logit_routing_stats(_logits_for(shares, tokens=8192), capacity_factor=1.0)
         tv = sum(max(0.0, x - 1.0 / E) for x in shares)
         assert abs(s["drop_rate"] - tv) < 2e-3, (shares, s["drop_rate"], tv)
         assert abs(s["imbalance"] - tv) < 2e-3
     # full collapse is the maximum: 1 - 1/E
-    assert abs(routing_stats(_logits_for([1.0, 0, 0, 0]))["drop_rate"] - (1 - 1 / E)) < 1e-6
+    assert abs(logit_routing_stats(_logits_for([1.0, 0, 0, 0]))["drop_rate"] - (1 - 1 / E)) < 1e-6
     # a larger capacity factor absorbs the overflow; a dropless backend reports none
-    assert routing_stats(_logits_for([0.6, 0.2, 0.1, 0.1]), capacity_factor=3.0)["drop_rate"] == 0.0
-    assert routing_stats(_logits_for([1.0, 0, 0, 0]), dropless=True)["drop_rate"] == 0.0
+    assert logit_routing_stats(_logits_for([0.6, 0.2, 0.1, 0.1]), capacity_factor=3.0)["drop_rate"] == 0.0
+    assert logit_routing_stats(_logits_for([1.0, 0, 0, 0]), dropless=True)["drop_rate"] == 0.0
     assert capacity_of(400, 4, 1.0) == 100 and capacity_of(400, 4, 0.0) == 400
 
 
@@ -136,14 +136,14 @@ def test_the_drop_rate_is_a_thresholded_tv_when_the_expert_count_does_not_divide
         return lg
 
     # production case: E divides T, so the two agree exactly
-    s = routing_stats(_lg([3000, 1500, 1000, 772]), capacity_factor=1.0)   # T = 6272
+    s = logit_routing_stats(_lg([3000, 1500, 1000, 772]), capacity_factor=1.0)   # T = 6272
     assert abs(s["drop_rate"] - s["imbalance"]) < 1e-6 and s["capacity"] == 1568
 
     # E does not divide T: a real dead zone — imbalance sees it, drops do not
-    s = routing_stats(_lg([1568, 1568, 1567, 1567]), capacity_factor=1.0)  # T = 6270
+    s = logit_routing_stats(_lg([1568, 1568, 1567, 1567]), capacity_factor=1.0)  # T = 6270
     assert s["drop_rate"] == 0.0 and s["imbalance"] > 0
     # and a coarse grid under-reads substantially
-    s = routing_stats(_lg([20, 12, 9, 8]), capacity_factor=1.0)            # T = 49
+    s = logit_routing_stats(_lg([20, 12, 9, 8]), capacity_factor=1.0)            # T = 49
     assert s["drop_rate"] < s["imbalance"] - 1e-2, s
 
 
@@ -159,7 +159,7 @@ def test_reconstructed_drop_count_matches_the_native_layers_own_count_exactly():
             with torch.no_grad():
                 moe(x)
                 logits = moe.gates[0].wg(x.float())
-            s = routing_stats(logits, capacity_factor=cf)
+            s = logit_routing_stats(logits, capacity_factor=cf)
             assert s["dropped_tokens"] == moe.dropped_tokens, (cf, s, moe.dropped_tokens)
             assert s["capacity"] == moe.capacity_for(257)
 
@@ -201,7 +201,7 @@ def test_a_real_moe_block_can_log_aux_one_while_dropping_most_of_its_tokens():
     out, aux = moe(x, 16, 16)
     with torch.no_grad():
         logits = moe.moe_layer.gates[0].wg(x.reshape(-1, DIM).float())
-    s = routing_stats(logits, capacity_factor=1.0)
+    s = logit_routing_stats(logits, capacity_factor=1.0)
 
     assert s["share"][0] == 1.0, s["share"]                       # total collapse
     assert abs(s["drop_rate"] - 0.75) < 1e-6                      # 3/4 of tokens get nothing
@@ -226,7 +226,7 @@ def test_the_gate_stays_fp32_under_autocast_so_the_aux_is_not_quantised():
         assert float(torch.tensor(v, dtype=torch.bfloat16)) == 1.0, v
     for v in (1 - 2 ** -8, 1.0040, 1 + 2 ** -7):
         assert float(torch.tensor(v, dtype=torch.bfloat16)) != 1.0, v
-    s = routing_stats(_logits_for([0.4, 0.3, 0.2, 0.1], margin=0.02))
+    s = logit_routing_stats(_logits_for([0.4, 0.3, 0.2, 0.1], margin=0.02))
     assert 1.0 < s["aux"] < 1.0019                                # visible in fp32...
     assert float(torch.tensor(s["aux"], dtype=torch.bfloat16)) == 1.0    # ...gone in bf16
     assert s["drop_rate"] > 0.14                                  # the drop rate is unaffected
