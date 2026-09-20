@@ -628,6 +628,15 @@ _DEFAULT: dict = {
             # Dense blocks elsewhere keep their official CFFN untouched — use
             # model.dense_dwconv for those.
             "moe_block_dwconv": True,
+            # Per-epoch routing diagnostics during training (drop rate, token
+            # share, routing entropy, gate entropy) — engine/callbacks.py
+            # RoutingMonitor. Purely observational: one extra gate matmul per
+            # MoE block per step under no_grad and ONE device sync per epoch,
+            # nothing written back into the model. On by default because the
+            # load-balancing loss cannot show any of it: `aux` is identically
+            # 1 + E*<share - 1/E, meanprob - 1/E>, so it reads 1.0 whenever the
+            # mean gate probability is uniform however skewed the routing is.
+            "routing_monitor": True,
             # Which branch starts at zero when upcycling a pretrained FFN:
             # "routed_zero" | "shared_zero" | "none" (VALID_UPCYCLE_INITS).
             # None => recipe default. Resolves to "none" whenever there is no

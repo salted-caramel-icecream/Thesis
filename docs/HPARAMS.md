@@ -185,6 +185,112 @@ Not applied automatically — pass --lr.
 0.5. The "linear + softmax" row is about the gate *function* (vs cosine / L2),
 not about noise. Tutel's own default is 0.0. Set it deliberately.
 
+Tutel adds **Gaussian** noise scaled by `gate_noise / num_experts`
+(`tutel/impls/moe_layer.py`: `logits + gate_noise * randn_like(logits) /
+num_global_experts`), i.e. σ = 0.125 at the defaults — *not* Gumbel, so there
+is no Gumbel-max "sampling from the softmax" interpretation. Against the
+measured stage-4 logit spread at init (std ≈ 0.44–0.58, median top-1/top-2 gap
+≈ 0.34) that flips only **11–13% of routing decisions**; uniform routing would
+flip 1 − 1/E = 75%, and you would need `gate_noise` ≈ 32 to get there. The
+noisy scores are used for the aux loss *and* for the combine weight, and at
+`top_k: 1` the combine weight is the raw unnormalised softmax probability
+(≈0.25–0.30 at init), so the routed branch is attenuated roughly 4× relative
+to the shared expert early on. `pvt_moe/models/moe_native.py` mirrors all of
+this exactly.
+
+### Reading the MoE diagnostics — `train_aux` is not the balance metric
+
+Both backends compute `aux = E · Σᵢ fᵢ pᵢ` (token share × mean gate
+probability). Writing `f = 1/E + a` and `p = 1/E + b`, that is **exactly**
+
+```
+aux = 1 + E · ⟨a, b⟩
+```
+
+so **1.0 is the normalised perfectly-balanced value**, E-independent — which
+is why every MoE arm reads the same number, and why a dense arm reads 0 (no
+MoE block ran, so the model returns `aux=None` and the trainer substitutes 0).
+It is not an unnormalised coincidence.
+
+It is also **not a floor**. `⟨a, b⟩` is a correlation and the argmax constraint
+does not force it positive: a router where 90% of tokens pick one expert by a
+hair and the other 10% pick another confidently has the share anti-correlated
+with the mean probability and reads **`aux = 0.94`** (built and measured in
+`tests/test_routing_diagnostics.py`). The attainable range is about
+`[E/(2(E−1)), E]` — `[0.67, 4]` at E=4 — with 1.0 the point where the
+correlation crosses zero. The departure from it is a *product of two
+deviations*, which has two consequences:
+
+| worst-expert share | `aux` | drop rate at cf 1.0 |
+|---|---|---|
+| 0.250 (balanced) | 1.0000 | 0.0% |
+| 0.264 | 1.0004 | 1.4% |
+| 0.301 | 1.0057 | 5.1% |
+| 0.375 | 1.0321 | 12.5% |
+| 0.510 | 1.1354 | 26.0% |
+| 1.000 (collapsed) | 3.9960 | 75.0% |
+
+1. **Second order ⇒ low resolution.** Most of the interesting range of
+   imbalance lives in the fourth decimal place. A run printing `1.0000` at
+   3 dp (the Lightning progress bar) is consistent with anything up to about a
+   30% worst-expert share.
+2. **A genuine blind spot.** `aux` reads exactly 1.0 whenever `p` is uniform,
+   *however collapsed* `f` is: a router that argmaxes every token onto one
+   expert with a near-flat softmax reads 1.0000 while dropping 75% of its
+   tokens (`tests/test_routing_diagnostics.py` builds exactly that). And the
+   aux gradient — `(E/T)·pⱼ·(fⱼ − ⟨f,p⟩)` per logit — drives `p` toward
+   uniform, so a *working* balancer walks into the blind spot. The gradient
+   still sees the imbalance (it vanishes exactly when `f` is uniform); only
+   the reported number collapses.
+
+**How tight is 1.0000 in practice?** The blind spot needs the gate's logit
+spread to collapse toward zero. Measured on a real B1 stage-4 gate, it does
+not: logit std ≈ 0.44, mean top-1/top-2 gap ≈ 0.33, ‖p̄ − u‖₂ ≈ 0.0098 —
+about ten times larger than the blind spot requires. At that confidence a
+sweep of genuine per-expert bias gives `aux` 1.0064 at a 32% worst-expert
+share and 1.17 at 58%, so a **4-decimal** `1.0000` does bound the worst expert
+to roughly 25–26%. A **3-decimal** `1.000` (the progress bar) bounds it only
+to about 30%. Two forces push toward the blind spot over a long run, though:
+the aux gradient flows only through `p`, and `wg.weight` is 2-D so it *is*
+weight-decayed — both shrink the logits. `train_gate_entropy` approaching
+`log E` is the warning sign.
+
+Dtype is not part of the story on the default backend, but only just: Tutel
+runs its whole routing block with autocast **disabled**, so `l_aux` is fp32
+under `bf16-mixed`. In bfloat16, round-to-nearest absorbs
+`[1 − 2⁻⁹, 1 + 2⁻⁸] = [0.998047, 1.003906]` into exactly 1.0 (asymmetric —
+spacing is 2⁻⁸ below 1.0 and 2⁻⁷ above, and the upper endpoint is an exact tie
+that rounds to even), which would quantise this table's
+first three rows away. The native backend now disables autocast around its
+gate for the same reason — `x.float()` alone does **not** do it, because
+autocast casts the `nn.Linear` itself.
+
+**What to read instead.** `RoutingMonitor`
+(`pvt_moe/engine/callbacks.py`, on by default wherever MoE is placed,
+`model.moe.routing_monitor: false` to disable) logs these every epoch over
+every training token, and `results.json` carries the per-block detail under
+`moe.routing`:
+
+| metric | means |
+|---|---|
+| `train_drop_rate` | fraction of tokens over capacity — they get **nothing** from the routed branch (the shared expert still fires). At `capacity_factor 1.0` this equals the total-variation distance from uniform routing: **first order** in the imbalance, 0 when balanced, 1 − 1/E at collapse. This is the number to watch. Computed from the *noiseless* gate logits, so it describes the router's policy. |
+| `train_drop_rate_realised` | what the layer actually dropped once `gate_noise` was added — read from `NativeMoEFFN._dropped` or Tutel's `moe_layer.dispatch_count`. Equals the policy figure exactly at `gate_noise 0`; the gap between them is how much the noise moves tokens across the capacity line. |
+| `train_moe_imbalance` | `Σᵢ max(0, fᵢ − 1/E)`, the un-thresholded total variation. **The cleanest balance measure**: no capacity dependence, no dead zone. It coincides with the drop rate exactly when E divides the token count (the production case, 6272/4); otherwise `capacity = ceil(T/E) > T/E` makes the drop rate a *thresholded* TV that under-reads near balance. Use the drop rate for cost, this for balance. |
+| `train_route_entropy` | entropy of the token share, max `log E`. |
+| `train_gate_entropy` | mean per-token entropy of the gate softmax. **Near `log E` means the router is undecided — precisely the regime where `aux` is pinned at 1.0**, so a low `aux` is only meaningful when this is well below `log E`. |
+
+At `capacity_factor 1.0` and `top_k 1` the capacity is `ceil(T/E)` with **zero
+slack**, so any imbalance at all drops tokens — at the measured init imbalance
+that is already 0.7–1.7% of every batch.
+
+To check a run that predates the monitor, read the unrounded value rather than
+the progress bar: `jq '.history[].train_aux' <run>/results.json`, or the
+`train_aux` column of `<log_root>/<run_name>/version_0/metrics.csv`. A value
+like 1.00038 that drifts between epochs is a near-balanced router seen through
+a low-resolution metric; a literal, bit-identical `1.0` every epoch is not, and
+the next thing to check is that `force_tutel_gates_train`
+(`pvt_moe/models/ffn.py`) is really keeping the gates in train mode.
+
 ### Positional encoding in the MoE'd block
 
 `model.moe.moe_block_dwconv` controls whether the converted block keeps PVT

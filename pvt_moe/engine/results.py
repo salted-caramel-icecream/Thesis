@@ -48,7 +48,21 @@ _METRIC_KEYS = (
     "train_loss", "train_ce", "train_aux", "train_acc_mixed",
     "val_loss", "val_acc", "val_acc_top5", "val_precision_macro", "val_recall_macro",
     "ssl_loss", "recon_loss", "mask_ratio", "target_std", "pred_std", "ema_momentum",
+    # Routing (RoutingMonitor). These belong in the per-epoch history, not just
+    # in the latest snapshot: collapse is something you watch DEVELOP, and
+    # train_aux cannot show it (AUX_NOTE).
+    "train_drop_rate", "train_drop_rate_realised", "train_moe_imbalance",
+    "train_route_entropy", "train_gate_entropy",
 )
+
+AUX_NOTE = ("train_aux is a poor balance metric: aux = E*sum_i f_i*p_i is identically "
+            "1 + E*<f - 1/E, p - 1/E>, a product of two deviations. It is therefore SECOND "
+            "ORDER in the imbalance (a 26% worst-expert share reads ~1.0004; ~37% is needed "
+            "for 1.03), and it reads exactly 1.0 whenever the mean gate probability p is "
+            "uniform however skewed the token share f is — while the aux gradient itself "
+            "drives p toward uniform. Read moe.routing.*.drop_rate (first order, no floor), "
+            ".share, and .gate_entropy (near log E = an undecided router, which is exactly "
+            "when aux is pinned) instead.")
 
 MIM_PROBE_NOTE = ("Linear-probe / k-NN accuracy is EXPECTED to be low for a masked-image-"
                   "modelling encoder (SimMIM, MAE, BEiT all report weak probes and strong "
@@ -203,6 +217,14 @@ class ResultsWriter(pl.Callback):
         block = {"aux_weight": cfg["loss"]["aux_weight"],
                  "capacity_factor": moe_cfg.get("capacity_factor"),
                  "gate_noise": moe_cfg.get("gate_noise")}
+        # Per-epoch training-time routing stats (RoutingMonitor), and the
+        # warning that goes with the aux number so a reader of this file
+        # cannot mistake a pinned 1.0 for a healthy router.
+        monitor = next((cb for cb in getattr(trainer, "callbacks", [])
+                        if type(cb).__name__ == "RoutingMonitor"), None)
+        if monitor is not None and getattr(monitor, "last_stats", None):
+            block["routing"] = monitor.last_stats
+            block["aux_note"] = AUX_NOTE
         model = getattr(pl_module, "model", None)
         loader = getattr(trainer, "val_dataloaders", None)
         if model is not None and loader is not None and self.utilization_batches > 0:
@@ -548,10 +570,26 @@ def render_markdown(rec: dict) -> str:
                   f"{_fmt(acc.get('train_aux') if 'train_aux' in acc else (rec['history'][-1].get('train_aux') if rec.get('history') else None), nd=4)}"]
         lines[-1] += (f" | capacity_factor {moe.get('capacity_factor')} "
                       f"| gate_noise {moe.get('gate_noise')}")
+        routing = moe.get("routing") or {}
+        if routing:
+            lines += ["", "Training-token routing (RoutingMonitor) — the metrics `train_aux` "
+                      "cannot show:", "",
+                      "| block | token share per expert | drop rate | imbalance | H(route) | H(gate) / max |",
+                      "|---|---|---|---|---|---|"]
+            for name, r in routing.items():
+                drop = f"{r['drop_rate']:.1%}"
+                if "drop_rate_realised" in r:
+                    drop += f" ({r['drop_rate_realised']:.1%} realised)"
+                lines.append(f"| {name} | {[round(v, 3) for v in r['share']]} | {drop} | "
+                             f"{r['imbalance']:.3f} | {r['route_entropy']:.2f} | "
+                             f"{r['gate_entropy']:.2f} / {r['max_entropy']:.2f} |")
+            lines += ["", f"> {moe.get('aux_note', AUX_NOTE)}"]
         util = moe.get("expert_utilization") or {}
         drops = moe.get("token_drops") or {}
         if util and "error" not in util:
-            lines += ["", "| block | token share per expert | entropy / max | tokens dropped |",
+            lines += ["", "Validation-batch utilisation (`expert_utilization`, eval mode, "
+                      "noiseless logits — a different population from the row above):", "",
+                      "| block | token share per expert | entropy / max | tokens dropped |",
                       "|---|---|---|---|"]
             for name, u in util.items():
                 d = drops.get(name) or {}

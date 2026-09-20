@@ -70,8 +70,22 @@ class Top1Router(nn.Module):
     def forward(self, x: torch.Tensor):
         """Returns ``(expert_index, gate_value, aux_loss)`` for each token."""
         # Gate in fp32 regardless of autocast: an 8-way softmax in bf16 has
-        # ~3 decimal digits, and the routing decision is discrete.
-        logits = self.wg(x.float())
+        # ~3 decimal digits, the routing decision is discrete, and the
+        # load-balancing loss lives within ~1% of 1.0 where bf16's spacing is
+        # 2^-8 = 0.0039 — quantising it to exactly 1.0.
+        #
+        # LOAD-BEARING: ``x.float()`` alone does NOT do this. torch.autocast
+        # intercepts nn.Linear and casts the LAYER as well as the input, so
+        # under bf16-mixed ``self.wg(x.float())`` returns bf16. Autocast has to
+        # be turned off around the call. Tutel does the same thing around its
+        # whole routing block (tutel/impls/moe_layer.py, `with
+        # torch.amp.autocast('cuda', enabled=False): routing()`), which is why
+        # its l_aux is fp32; this keeps the two backends comparable.
+        if x.device.type in ("cpu", "cuda", "xpu"):
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                logits = self.wg(x.float())
+        else:                                     # a device autocast does not know
+            logits = self.wg(x.float())
 
         if self.training and self.gate_noise > 0:
             logits = logits + self.gate_noise * torch.randn_like(logits) / self.num_experts
@@ -172,6 +186,7 @@ class NativeMoEFFN(nn.Module):
         self.top_k = top_k
         self.capacity_factor = capacity_factor
 
+        self._dropped = None                  # realised overflow of the last forward
         self.experts = BatchedExperts(
             model_dim, hidden_size_per_expert, num_experts,
             activation_fn if activation_fn is not None else nn.GELU())
@@ -200,7 +215,11 @@ class NativeMoEFFN(nn.Module):
         one_hot = F.one_hot(index, self.num_experts)
         rank = (one_hot.cumsum(dim=0) - 1).gather(1, index[:, None]).squeeze(1)
         kept = rank < capacity
-        self.dropped_tokens = int((~kept).sum())  # diagnostic, not used in the graph
+        # Realised overflow, kept as a DEVICE TENSOR: `int(...)` here would be a
+        # host-device sync on every routed forward for a number most steps never
+        # read. `dropped_tokens` below materialises it on demand; RoutingMonitor
+        # accumulates the tensor and syncs once per epoch.
+        self._dropped = (~kept).sum()
 
         out = torch.zeros_like(x)
         for e in range(self.num_experts):
@@ -213,6 +232,11 @@ class NativeMoEFFN(nn.Module):
             # see tutel/impls/fast_dispatch.py::extract_critical).
             out[sel] = y * gate[sel, None]
         return out, aux
+
+    @property
+    def dropped_tokens(self) -> int:
+        """Tokens the last forward dropped for overflow (syncs on access)."""
+        return 0 if self._dropped is None else int(self._dropped)
 
     def extra_repr(self) -> str:
         return (f"model_dim={self.model_dim}, hidden={self.hidden}, "

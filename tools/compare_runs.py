@@ -28,7 +28,8 @@ COLUMNS = [
     ("run", "run"), ("variant", "variant"), ("dataset", "dataset"), ("chain", "chain"),
     ("epochs", "ep"), ("top1", "top-1"), ("best_top1", "best top-1 (ep)"), ("top5", "top-5"),
     ("params_m", "params M"), ("gflops", "GFLOPs"), ("img_s", "img/s"), ("vram_gib", "VRAM GiB"),
-    ("moe_entropy", "MoE H min/max"), ("knn", "k-NN"), ("probe", "probe"), ("test_top1", "test top-1"),
+    ("moe_entropy", "MoE H min/max"), ("moe_drop", "MoE drop%"), ("moe_gate_h", "MoE H(gate)"),
+    ("knn", "k-NN"), ("probe", "probe"), ("test_top1", "test top-1"),
     ("ssl_loss", "ssl loss"),
 ]
 
@@ -61,6 +62,10 @@ def summarize(rec: dict, path: str) -> dict:
     util = moe.get("expert_utilization") or {}
     ent = [u["entropy"] for u in util.values() if isinstance(u, dict) and "entropy" in u]
     ent_max = [u["max_entropy"] for u in util.values() if isinstance(u, dict) and "max_entropy" in u]
+    routing = moe.get("routing") or {}
+    drops = [r["drop_rate"] for r in routing.values() if isinstance(r, dict) and "drop_rate" in r]
+    gate_h = [r["gate_entropy"] for r in routing.values() if isinstance(r, dict) and "gate_entropy" in r]
+    max_h = [r["max_entropy"] for r in routing.values() if isinstance(r, dict) and "max_entropy" in r]
     params = eff.get("params") or {}
     gfl = eff.get("gflops") or {}
     knn = probe = test_top1 = None
@@ -88,6 +93,10 @@ def summarize(rec: dict, path: str) -> dict:
         "gflops": (round(gfl["total_gflops"], 2) if isinstance(gfl.get("total_gflops"), (int, float)) else None),
         "img_s": eff.get("images_per_second"), "vram_gib": eff.get("peak_vram_gib"),
         "moe_entropy": (f"{min(ent):.2f}/{max(ent_max):.2f}" if ent and ent_max else None),
+        # Drop rate is first order in the imbalance and has no floor, unlike the
+        # aux loss; H(gate) near max means an undecided router (see AUX_NOTE).
+        "moe_drop": (round(100 * max(drops), 2) if drops else None),
+        "moe_gate_h": (f"{max(gate_h):.2f}/{max(max_h):.2f}" if gate_h and max_h else None),
         "knn": knn, "probe": probe, "test_top1": test_top1,
         "ssl_loss": (round(rec["ssl"]["ssl_loss"], 4) if rec.get("ssl") and rec["ssl"].get("ssl_loss") is not None else None),
         "path": path,
@@ -105,7 +114,10 @@ def render_table(rows: list, columns=COLUMNS) -> str:
     lines.append("")
     lines.append("`*` = still running / killed before its budget. top-1/top-5/k-NN/probe in %, "
                  "validation split unless the column says test. Chain = the stages that produced "
-                 "the weights, oldest first.")
+                 "the weights, oldest first. MoE drop% = worst block's share of training tokens "
+                 "that overflowed capacity and got nothing from the routed branch (0 = balanced, "
+                 "100*(1-1/E) = collapsed); MoE H(gate) near its max = an undecided router, the "
+                 "regime where train_aux is pinned at 1.0 and tells you nothing.")
     del keys
     return "\n".join(lines)
 

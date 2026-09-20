@@ -1,4 +1,4 @@
-"""Diagnostics: MoE expert utilization and training-curve plots.
+"""Diagnostics: MoE routing statistics, expert utilization, training-curve plots.
 
 Expert utilization is THE first thing to check when an MoE run underperforms:
 top-1 routing can collapse onto a few experts, at which point the extra
@@ -12,6 +12,49 @@ routed branch. A collapsed router and a starved capacity look identical in
 the loss and opposite in the fix, so ``routing_stats`` measures both in one
 pass: "MoE did not help" and "the tokens never reached an expert" are
 different results.
+
+**Do not use the load-balancing loss (`train_aux`) as the balance metric.**
+Both backends compute ``aux = E * sum_i f_i * p_i`` where ``f`` is the token
+share per expert and ``p`` the mean gate probability. Writing ``f = 1/E + a``
+and ``p = 1/E + b`` (both deviations sum to zero) that is exactly::
+
+    aux = 1 + E * <a, b>
+
+so ``aux - 1`` is a product of TWO deviations — second order in the imbalance,
+and identically zero whenever either factor vanishes. Two consequences:
+
+* **Low resolution.** A router whose worst expert holds 26% of the tokens
+  reads about 1.0004; you need roughly 37% before it reaches 1.03. Most of the
+  interesting range of imbalance lives in the fourth decimal place.
+* **A blind spot.** It reads exactly 1.0 whenever the mean gate probability is
+  uniform, *no matter how skewed the assignment is* — a router that argmaxes
+  every token onto one expert with a near-flat softmax reads 1.0. And the
+  loss's own gradient, ``(E/T) * p_j * (f_j - <f, p>)`` per logit, drives ``p``
+  toward uniform, so a working balancer walks into its own blind spot. The
+  gradient still sees the imbalance ``a`` (it vanishes exactly when ``f`` is
+  uniform); only the reported *number* collapses to the correlation ``<a, b>``.
+
+Dtype is NOT part of the story on the default backend, though it is close:
+Tutel runs its whole routing block with autocast disabled
+(``tutel/impls/moe_layer.py``), so ``l_aux`` is fp32 even under bf16-mixed.
+The native backend has to turn autocast off explicitly to match — ``x.float()``
+alone does not, because autocast casts the ``nn.Linear`` itself
+(``moe_native.py``). Were the loss ever computed in bf16, round-to-nearest
+would absorb the whole interval ``[1 - 2^-9, 1 + 2^-8] = [0.998047, 1.003906]``
+into exactly 1.0 — asymmetric, because bf16's spacing is 2^-8 below 1.0 and
+2^-7 above it.
+
+One thing 1.0 is NOT: a floor. ``<a, b>`` is a correlation, and the argmax
+constraint does not force it positive. A router where 90% of tokens pick one
+expert by a hair while the remaining 10% pick another with confidence has the
+share and the mean probability ANTI-correlated, and reads ``aux = 0.94``
+(``tests/test_routing_diagnostics.py``). The attainable range is roughly
+``[E/(2(E-1)), E]``; 1.0 is where the correlation crosses zero, which is one
+more reason not to read health off the number.
+
+``logit_routing_stats`` below reports what the aux value cannot: the token share,
+the drop rate, and the two entropies that tell a confidently-balanced router
+apart from a uniformly-undecided one.
 """
 
 from __future__ import annotations
@@ -19,6 +62,103 @@ from __future__ import annotations
 import math
 
 import torch
+
+
+def capacity_of(num_tokens: int, num_experts: int, capacity_factor: float,
+                top_k: int = 1) -> int:
+    """Per-expert token cap — Tutel's formula, mirrored by the native backend.
+
+    ``capacity_factor <= 0`` means no cap (Tutel's dynamic capacity).
+    """
+    if capacity_factor <= 0:
+        return num_tokens
+    per_expert = math.ceil(num_tokens / num_experts)
+    return max(1, top_k * int(capacity_factor * per_expert))
+
+
+def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_k: int = 1,
+                  dropless: bool = False) -> dict:
+    """What top-1 routing actually did, from one MoE layer's gate logits.
+
+    ``logits`` is ``(tokens, num_experts)``. Everything is computed in fp64 so
+    the numbers are not themselves quantised (see the module docstring).
+
+    Returned keys, and why each one exists:
+
+    ``share``            token fraction per expert (``f``). The headline.
+    ``imbalance``        ``sum_i max(0, f_i - 1/E)`` — the total-variation
+                         distance between the routing distribution and uniform.
+                         0 = perfect balance, ``1 - 1/E`` = full collapse.
+    ``drop_rate``        fraction of tokens over capacity, i.e. tokens that get
+                         NOTHING from the routed branch. The metric with
+                         physical consequence. At ``capacity_factor == 1.0``
+                         it equals ``imbalance`` EXACTLY when E divides the
+                         token count (the production case: 6272 tokens over 4
+                         experts gives capacity 1568 = T/E). Otherwise
+                         ``capacity = ceil(T/E) > T/E`` and this is a
+                         THRESHOLDED total variation that under-reads, with a
+                         dead zone near balance — at T=49 (one image's stage-4
+                         grid) it reads 0.143 where ``imbalance`` reads 0.158,
+                         and at ``capacity_factor > 1`` the dead zone is large
+                         by design. Always 0 for a dropless backend
+                         (megablocks). Prefer ``imbalance`` as the balance
+                         measure and this as the cost measure.
+    ``route_entropy``    entropy of ``f`` in nats; ``max_entropy`` is ``log E``.
+    ``gate_entropy``     mean per-token entropy of the gate softmax. This is the
+                         one that separates the two cases a flat ``aux`` cannot:
+                         near ``log E`` means the router is undecided (and then
+                         ``aux`` is pinned at 1 whatever the share does), well
+                         below it means the router is confident.
+    ``mean_gate_prob``   ``p``. ``aux`` is blind to the share whenever this is
+                         uniform.
+    ``aux``              the load-balancing loss recomputed in fp64 from these
+                         same logits, so it can be compared against the logged
+                         ``train_aux``; ``aux_excess`` is ``aux - 1``.
+
+    The decision is recomputed from the logits the layer was given, WITHOUT
+    the gate noise the backend may have added: this measures the router's
+    policy, not the realised noisy sample. Both backends add zero-mean
+    GAUSSIAN noise scaled by ``gate_noise / num_experts`` (σ = 0.125 at the
+    defaults), so with ``gate_noise > 0`` the two differ by however much that
+    moves tokens across the capacity line — a few tenths of a percent at the
+    measured stage-4 logit spread. ``RoutingMonitor`` reports both.
+    """
+    if logits.ndim != 2:
+        raise ValueError(f"expected (tokens, experts) gate logits, got {tuple(logits.shape)}")
+    lg = logits.detach().double()
+    tokens, num_experts = lg.shape
+    probs = lg.softmax(dim=-1)
+    index = lg.argmax(dim=-1)
+    counts = torch.bincount(index, minlength=num_experts).double()
+    share = counts / max(1, tokens)
+    mean_p = probs.mean(dim=0)
+
+    capacity = capacity_of(tokens, num_experts, capacity_factor, top_k)
+    dropped = 0.0 if dropless else float((counts - capacity).clamp(min=0).sum())
+
+    def _entropy(q):
+        q = q[q > 0]
+        return float(-(q * q.log()).sum()) if q.numel() else 0.0
+
+    per_token_entropy = -(probs.clamp_min(1e-12).log() * probs).sum(dim=-1)
+    aux = float(num_experts * (share * mean_p).sum())
+    return {
+        "tokens": int(tokens),
+        "num_experts": int(num_experts),
+        "counts": [int(c) for c in counts],
+        "share": [round(float(v), 6) for v in share],
+        "imbalance": round(float((share - 1.0 / num_experts).clamp(min=0).sum()), 6),
+        "capacity": int(capacity),
+        "dropped_tokens": int(dropped),
+        "drop_rate": round(dropped / max(1, tokens), 6),
+        "dropless": bool(dropless),
+        "route_entropy": round(_entropy(share), 6),
+        "gate_entropy": round(float(per_token_entropy.mean()), 6),
+        "max_entropy": round(math.log(num_experts), 6),
+        "mean_gate_prob": [round(float(v), 6) for v in mean_p],
+        "aux": round(aux, 8),
+        "aux_excess": round(aux - 1.0, 8),
+    }
 
 
 def gate_logits(moe_mlp, x_flat: torch.Tensor) -> torch.Tensor:

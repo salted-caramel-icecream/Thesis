@@ -263,6 +263,15 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
                         "(value parsed as JSON, else kept as a string). Repeatable")
+    g.add_argument("--overfit-check", type=int, metavar="N", dest="overfit_check",
+                   help="BISECT A RUN THAT WILL NOT LEARN. Take ONE real training "
+                        "batch and run N optimizer steps on it through the real "
+                        "LitClassifier, with the stochastic augmentation and mixup "
+                        "turned off so the target is fixed. A model that cannot "
+                        "drive one batch's loss toward zero has a broken training "
+                        "path or broken data; one that can, does not — look at the "
+                        "recipe, the schedule or the label/image correspondence "
+                        "instead. 200 steps is usually decisive")
     g.add_argument("--check-env", action="store_true",
                    help="check torch/CUDA/GPU-arch/deps/credentials and exit. "
                         "Run this FIRST on a new machine — it catches a "
@@ -691,6 +700,101 @@ def check_environment(variant: str = "b1") -> int:
     return 0 if ok else 1
 
 
+def run_overfit_check(cfg: dict, steps: int) -> int:
+    """Drive ONE real batch for ``steps`` optimizer steps and report.
+
+    The question this answers is narrow and useful: is the failure in the
+    training path (model, loss, optimizer, Lightning wiring) or outside it
+    (recipe, schedule, data)? Mixup, RandAugment, random erasing and repeated
+    augmentation are switched off so the batch and its targets are FIXED —
+    with them on, the target changes every step and "overfitting" is not
+    defined. Everything else is the real thing.
+    """
+    import pytorch_lightning as pl
+    import torch
+
+    from pvt_moe.data import build_dataloaders
+    from pvt_moe.engine import LitClassifier, setup_environment
+
+    cfg = copy.deepcopy(cfg)
+    cfg["loss"].update(mixup_alpha=0.0, cutmix_alpha=0.0, mixup_prob=0.0, label_smoothing=0.0)
+    cfg["dataset"].update(randaugment=None, randaugment_ops=0, randaugment_magnitude=0,
+                          random_erasing=0.0, repeated_aug=1)
+    cfg["use_wandb"] = cfg["use_tensorboard"] = False
+    print(f"[overfit] {steps} steps on ONE batch of {cfg['batch_size']} real images from "
+          f"{cfg['dataset']['name']}; mixup/RandAugment/erasing/repeated-aug OFF, "
+          f"accumulation OFF, lr {cfg['optim']['lr']:.2e} held flat (no warmup/cosine)")
+
+    setup_environment(cfg)
+    train_loader, _ = build_dataloaders(cfg)
+    # The batch must be FIXED, and RandomResizedCrop + horizontal flip are still
+    # stochastic after mixup and RandAugment are off — with them on, the model
+    # sees a fresh crop of the same images every step and "overfit one batch"
+    # is not a well-posed question. Swap in the deterministic eval transform.
+    from pvt_moe.data.imagenet import build_transforms
+
+    base = train_loader.dataset
+    base = base.dataset if isinstance(base, torch.utils.data.Subset) else base
+    base.transform = build_transforms(cfg)[1]
+    print("[overfit] train transform replaced by the deterministic eval transform "
+          "(resize + center crop + normalize): the batch is now fixed")
+
+    model = LitClassifier(cfg)
+    # A flat LR: the point is whether the path can learn at all, not whether
+    # the schedule is right — the schedule is the NEXT thing to look at.
+    model.configure_optimizers = lambda: torch.optim.AdamW(
+        [p for p in model.model.parameters() if p.requires_grad],
+        lr=cfg["optim"]["lr"], betas=tuple(cfg["optim"]["betas"]),
+        weight_decay=cfg["optim"]["weight_decay"])
+
+    history = []
+
+    class _Report(pl.Callback):
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            history.append(float(outputs["loss"]))
+            n = len(history)
+            if n == 1 or n % max(1, steps // 10) == 0:
+                print(f"[overfit] step {n:>4}/{steps}  loss {history[-1]:.4f}")
+
+    trainer = pl.Trainer(
+        max_epochs=steps, overfit_batches=1, accumulate_grad_batches=1,
+        gradient_clip_val=cfg["optim"]["grad_clip"], num_sanity_val_steps=0,
+        accelerator="auto", devices=1, logger=False, enable_checkpointing=False,
+        enable_progress_bar=False, enable_model_summary=False,
+        precision=cfg["precision"] if torch.cuda.is_available() else 32,
+        callbacks=[_Report()])
+    trainer.fit(model, train_loader)
+
+    if not history:
+        print("[overfit] no steps ran — the dataloader produced nothing", file=sys.stderr)
+        return 2
+    import math
+
+    prior = math.log(max(2, cfg["dataset"]["num_classes"]))
+    first, best = history[0], min(history)
+    print(f"\n[overfit] first {first:.4f} | best {best:.4f} | last {history[-1]:.4f} | "
+          f"ln(num_classes) = {prior:.4f}")
+    if best < 0.25 * prior:
+        print("[overfit] PASS — one fixed batch can be memorised on this machine. What that "
+              "covers: the model's forward and backward, LitClassifier.training_step, the "
+              "loss, and a plain single-group AdamW under the configured precision. What it "
+              "does NOT cover, because this check deliberately bypasses them: the 4-group "
+              "optimizer and the warmup->cosine schedule, gradient accumulation, the "
+              "callbacks and the validation loop (build_trainer), the train transform, "
+              "mixup and the repeated-aug sampler — and it cannot tell a right kernel from "
+              "one whose forward is right and whose backward is wrong, since the conv paths "
+              "memorise a batch on their own. Next: tests/run_all.py on THIS machine "
+              "(test_learning.py and test_pipeline_learns.py run the pieces above under the "
+              "GPU's precision), tools/check_kernels.py at the run's shapes, and a look at a "
+              "few train images beside their label names.")
+        return 0
+    print("[overfit] FAIL — one fixed batch could not be fitted. The fault is in the "
+          "training path or in the batch itself. Check, in order: that the images in "
+          "this batch differ from one another, that their labels differ, and that the "
+          "model's logits differ across them.", file=sys.stderr)
+    return 1
+
+
 def _exportable(cfg: dict) -> dict:
     """The config as it should be written back to disk.
 
@@ -760,6 +864,9 @@ def main(argv=None) -> int:
     if args.dry_run:
         print("[dry-run] config resolved; nothing built, nothing trained.")
         return 0
+
+    if args.overfit_check:
+        return run_overfit_check(cfg, args.overfit_check)
 
     # Heavy imports live here so --help/--dry-run work without torch/lightning.
     from pvt_moe.data import build_dataloaders
