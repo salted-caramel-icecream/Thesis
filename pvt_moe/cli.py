@@ -775,11 +775,18 @@ def run_overfit_check(cfg: dict, steps: int) -> int:
     print(f"\n[overfit] first {first:.4f} | best {best:.4f} | last {history[-1]:.4f} | "
           f"ln(num_classes) = {prior:.4f}")
     if best < 0.25 * prior:
-        print("[overfit] PASS — the training path can fit data. The fault is NOT in "
-              "LitClassifier/the optimizer/Lightning. Look next at: the LR schedule over "
-              "real epochs, the augmentation strength, and whether each image is paired "
-              "with its OWN label in the snapshot (a label/image mismatch trains a model "
-              "to the class prior, which is exactly a loss of ln(num_classes)).")
+        print("[overfit] PASS — one fixed batch can be memorised on this machine. What that "
+              "covers: the model's forward and backward, LitClassifier.training_step, the "
+              "loss, and a plain single-group AdamW under the configured precision. What it "
+              "does NOT cover, because this check deliberately bypasses them: the 4-group "
+              "optimizer and the warmup->cosine schedule, gradient accumulation, the "
+              "callbacks and the validation loop (build_trainer), the train transform, "
+              "mixup and the repeated-aug sampler — and it cannot tell a right kernel from "
+              "one whose forward is right and whose backward is wrong, since the conv paths "
+              "memorise a batch on their own. Next: tests/run_all.py on THIS machine "
+              "(test_learning.py and test_pipeline_learns.py run the pieces above under the "
+              "GPU's precision), tools/check_kernels.py at the run's shapes, and a look at a "
+              "few train images beside their label names.")
         return 0
     print("[overfit] FAIL — one fixed batch could not be fitted. The fault is in the "
           "training path or in the batch itself. Check, in order: that the images in "

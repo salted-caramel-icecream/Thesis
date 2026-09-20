@@ -184,4 +184,6 @@ def test_overfit_check_fits_one_real_batch_and_reports_pass():
         assert rc == 0, out[-3000:]
         assert "[overfit] PASS" in out and "mixup/RandAugment/erasing/repeated-aug OFF" in out
         assert "the batch is now fixed" in out
-        assert "label/image mismatch" in out, "the PASS message must name the next suspect"
+        # PASS must say exactly what it cleared and what it deliberately bypassed
+        assert "does NOT cover" in out and "check_kernels" in out and "label names" in out, \
+            "the PASS message must state its coverage and name the next checks"
