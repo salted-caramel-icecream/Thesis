@@ -21,7 +21,9 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 ## Running things
 
-- Tests: `python3 tests/run_all.py` — no pytest, CPU only, must end in `N passed, 0 failed`. **This is the gate before any GPU run.**
+- Tests: `python3 tests/run_all.py` — no pytest, CPU only, must end in `N passed, 0 failed`. **This is the gate before any GPU run.** `tests/test_learning.py` is the one that TRAINS: it fits a real `LitClassifier` through `build_trainer` on separable data and fails if accuracy does not clear chance. Every other test is structural and would pass on a model that converges to the class prior.
+- `python train.py --overfit-check 200` bisects a run that will not learn: one real batch, the deterministic eval transform, no mixup/aug, a flat LR. PASS means the training path is sound and the fault is the recipe, the schedule or the label/image correspondence in the snapshot; FAIL means it is the path or the batch.
+- `PVT_Tutelmoe_v10_patched.ipynb` is NOT a from-scratch reference: its config resumes from a 72.27% checkpoint (`resuming: True`, `lr: 1e-4`, `warmup_epochs: 0`). Nothing in this repo has ever demonstrated the 90-epoch from-scratch recipe converging.
 - CLI: `python train.py --dry-run` resolves and prints the config without importing torch; `--print-config` / `--save-config FILE` dump the resolved JSON; `--check-env` reports the GPU/VRAM and suggests a batch. Every `train.py` command written into the docs must pass `--dry-run` from the repo root.
 - Never start a real training run from a session: there is no dataset, no GPU, and a run is days of compute.
 
