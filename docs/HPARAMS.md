@@ -191,9 +191,18 @@ probability). Writing `f = 1/E + a` and `p = 1/E + b`, that is **exactly**
 aux = 1 + E · ⟨a, b⟩
 ```
 
-so **1.0 is the normalised perfectly-balanced value** (range `[1, E]`, and
-E-independent — a dense arm reads 0 because no MoE block ran). It is not an
-unnormalised coincidence. But the departure from 1.0 is a *product of two
+so **1.0 is the normalised perfectly-balanced value**, E-independent — which
+is why every MoE arm reads the same number, and why a dense arm reads 0 (no
+MoE block ran, so the model returns `aux=None` and the trainer substitutes 0).
+It is not an unnormalised coincidence.
+
+It is also **not a floor**. `⟨a, b⟩` is a correlation and the argmax constraint
+does not force it positive: a router where 90% of tokens pick one expert by a
+hair and the other 10% pick another confidently has the share anti-correlated
+with the mean probability and reads **`aux = 0.94`** (built and measured in
+`tests/test_routing_diagnostics.py`). The attainable range is about
+`[E/(2(E−1)), E]` — `[0.67, 4]` at E=4 — with 1.0 the point where the
+correlation crosses zero. The departure from it is a *product of two
 deviations*, which has two consequences:
 
 | worst-expert share | `aux` | drop rate at cf 1.0 |
@@ -218,13 +227,27 @@ deviations*, which has two consequences:
    still sees the imbalance (it vanishes exactly when `f` is uniform); only
    the reported number collapses.
 
+**How tight is 1.0000 in practice?** The blind spot needs the gate's logit
+spread to collapse toward zero. Measured on a real B1 stage-4 gate, it does
+not: logit std ≈ 0.44, mean top-1/top-2 gap ≈ 0.33, ‖p̄ − u‖₂ ≈ 0.0098 —
+about ten times larger than the blind spot requires. At that confidence a
+sweep of genuine per-expert bias gives `aux` 1.0064 at a 32% worst-expert
+share and 1.17 at 58%, so a **4-decimal** `1.0000` does bound the worst expert
+to roughly 25–26%. A **3-decimal** `1.000` (the progress bar) bounds it only
+to about 30%. Two forces push toward the blind spot over a long run, though:
+the aux gradient flows only through `p`, and `wg.weight` is 2-D so it *is*
+weight-decayed — both shrink the logits. `train_gate_entropy` approaching
+`log E` is the warning sign.
+
 Dtype is not part of the story on the default backend, but only just: Tutel
 runs its whole routing block with autocast **disabled**, so `l_aux` is fp32
-under `bf16-mixed`. bfloat16's spacing at 1.0 is 2⁻⁸ = 0.0039, so a bf16 loss
-would quantise this entire table's first four rows to exactly 1.0. The native
-backend now disables autocast around its gate for the same reason —
-`x.float()` alone does **not** do it, because autocast casts the `nn.Linear`
-itself.
+under `bf16-mixed`. In bfloat16, round-to-nearest absorbs
+`[1 − 2⁻⁹, 1 + 2⁻⁸] = [0.998047, 1.003906]` into exactly 1.0 (asymmetric —
+spacing is 2⁻⁸ below 1.0 and 2⁻⁷ above, and the upper endpoint is an exact tie
+that rounds to even), which would quantise this table's
+first three rows away. The native backend now disables autocast around its
+gate for the same reason — `x.float()` alone does **not** do it, because
+autocast casts the `nn.Linear` itself.
 
 **What to read instead.** `RoutingMonitor`
 (`pvt_moe/engine/callbacks.py`, on by default wherever MoE is placed,
@@ -236,7 +259,7 @@ every training token, and `results.json` carries the per-block detail under
 |---|---|
 | `train_drop_rate` | fraction of tokens over capacity — they get **nothing** from the routed branch (the shared expert still fires). At `capacity_factor 1.0` this equals the total-variation distance from uniform routing: **first order** in the imbalance, 0 when balanced, 1 − 1/E at collapse. This is the number to watch. Computed from the *noiseless* gate logits, so it describes the router's policy. |
 | `train_drop_rate_realised` | what the layer actually dropped once `gate_noise` was added — read from `NativeMoEFFN._dropped` or Tutel's `moe_layer.dispatch_count`. Equals the policy figure exactly at `gate_noise 0`; the gap between them is how much the noise moves tokens across the capacity line. |
-| `train_moe_imbalance` | the same quantity from the shares alone (they coincide at cf 1.0). |
+| `train_moe_imbalance` | `Σᵢ max(0, fᵢ − 1/E)`, the un-thresholded total variation. **The cleanest balance measure**: no capacity dependence, no dead zone. It coincides with the drop rate exactly when E divides the token count (the production case, 6272/4); otherwise `capacity = ceil(T/E) > T/E` makes the drop rate a *thresholded* TV that under-reads near balance. Use the drop rate for cost, this for balance. |
 | `train_route_entropy` | entropy of the token share, max `log E`. |
 | `train_gate_entropy` | mean per-token entropy of the gate softmax. **Near `log E` means the router is undecided — precisely the regime where `aux` is pinned at 1.0**, so a low `aux` is only meaningful when this is well below `log E`. |
 

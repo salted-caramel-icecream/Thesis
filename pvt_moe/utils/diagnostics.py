@@ -31,8 +31,18 @@ Tutel runs its whole routing block with autocast disabled
 (``tutel/impls/moe_layer.py``), so ``l_aux`` is fp32 even under bf16-mixed.
 The native backend has to turn autocast off explicitly to match — ``x.float()``
 alone does not, because autocast casts the ``nn.Linear`` itself
-(``moe_native.py``). Were the loss ever computed in bf16, whose spacing near
-1.0 is 2^-8, every value within +-0.2% of 1.0 would read as exactly 1.0.
+(``moe_native.py``). Were the loss ever computed in bf16, round-to-nearest
+would absorb the whole interval ``[1 - 2^-9, 1 + 2^-8] = [0.998047, 1.003906]``
+into exactly 1.0 — asymmetric, because bf16's spacing is 2^-8 below 1.0 and
+2^-7 above it.
+
+One thing 1.0 is NOT: a floor. ``<a, b>`` is a correlation, and the argmax
+constraint does not force it positive. A router where 90% of tokens pick one
+expert by a hair while the remaining 10% pick another with confidence has the
+share and the mean probability ANTI-correlated, and reads ``aux = 0.94``
+(``tests/test_routing_diagnostics.py``). The attainable range is roughly
+``[E/(2(E-1)), E]``; 1.0 is where the correlation crosses zero, which is one
+more reason not to read health off the number.
 
 ``routing_stats`` below reports what the aux value cannot: the token share,
 the drop rate, and the two entropies that tell a confidently-balanced router
@@ -72,11 +82,19 @@ def routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_k: int
                          distance between the routing distribution and uniform.
                          0 = perfect balance, ``1 - 1/E`` = full collapse.
     ``drop_rate``        fraction of tokens over capacity, i.e. tokens that get
-                         NOTHING from the routed branch. At
-                         ``capacity_factor == 1.0`` this equals ``imbalance``
-                         up to the ``ceil(T/E)`` rounding term, which is why it
-                         is a faithful, linear, non-saturating balance metric.
-                         Always 0 for a dropless backend (megablocks).
+                         NOTHING from the routed branch. The metric with
+                         physical consequence. At ``capacity_factor == 1.0``
+                         it equals ``imbalance`` EXACTLY when E divides the
+                         token count (the production case: 6272 tokens over 4
+                         experts gives capacity 1568 = T/E). Otherwise
+                         ``capacity = ceil(T/E) > T/E`` and this is a
+                         THRESHOLDED total variation that under-reads, with a
+                         dead zone near balance — at T=49 (one image's stage-4
+                         grid) it reads 0.143 where ``imbalance`` reads 0.158,
+                         and at ``capacity_factor > 1`` the dead zone is large
+                         by design. Always 0 for a dropless backend
+                         (megablocks). Prefer ``imbalance`` as the balance
+                         measure and this as the cost measure.
     ``route_entropy``    entropy of ``f`` in nats; ``max_entropy`` is ``log E``.
     ``gate_entropy``     mean per-token entropy of the gate softmax. This is the
                          one that separates the two cases a flat ``aux`` cannot:
@@ -91,9 +109,11 @@ def routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_k: int
 
     The decision is recomputed from the logits the layer was given, WITHOUT
     the gate noise the backend may have added: this measures the router's
-    policy, not the realised noisy sample. With ``gate_noise > 0`` the two
-    differ (Gumbel noise of scale b makes top-1 a sample from
-    ``softmax(logits / b)``), and the policy is the thing worth monitoring.
+    policy, not the realised noisy sample. Both backends add zero-mean
+    GAUSSIAN noise scaled by ``gate_noise / num_experts`` (σ = 0.125 at the
+    defaults), so with ``gate_noise > 0`` the two differ by however much that
+    moves tokens across the capacity line — a few tenths of a percent at the
+    measured stage-4 logit spread. ``RoutingMonitor`` reports both.
     """
     if logits.ndim != 2:
         raise ValueError(f"expected (tokens, experts) gate logits, got {tuple(logits.shape)}")

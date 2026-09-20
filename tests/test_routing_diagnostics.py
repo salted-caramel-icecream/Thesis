@@ -89,6 +89,26 @@ def test_aux_reads_one_when_the_gate_probabilities_are_uniform_however_skewed_th
     assert routing_stats(_logits_for([1.0, 0, 0, 0], margin=8.0))["gate_entropy"] < 0.02
 
 
+def test_aux_is_not_floored_at_one_it_is_a_zero_correlation_crossing():
+    """aux - 1 = E*<a, b> is a CORRELATION, and argmax routing does not force it
+    positive. 90% of tokens picking one expert by a hair while 10% pick another
+    confidently leaves share and mean probability anti-correlated."""
+    T = 6272
+    lg = torch.zeros(T, E)
+    n0 = int(0.9 * T)
+    lg[:n0, 0] = 1e-4                    # a hair
+    lg[n0:, 1] = 6.0                     # confident
+    s = routing_stats(lg)
+    # genuinely argmax-consistent: every token's assignment IS its argmax
+    want = torch.cat([torch.zeros(n0, dtype=torch.long), torch.ones(T - n0, dtype=torch.long)])
+    assert (lg.argmax(-1) == want).all()
+    assert s["share"][0] > 0.89 and s["mean_gate_prob"][1] > s["mean_gate_prob"][0]
+    assert s["aux"] < 1.0, s["aux"]                      # BELOW the "balanced" value
+    assert s["aux"] > E / (2 * (E - 1)) - 0.05           # and above the analytic minimum
+    # a perfectly balanced, confident router sits exactly at 1.0
+    assert abs(routing_stats(_logits_for([0.25] * 4, margin=8.0))["aux"] - 1.0) < 1e-6
+
+
 def test_drop_rate_is_the_total_variation_distance_from_uniform_at_capacity_one():
     for shares in ([0.25] * 4, [0.3, 0.25, 0.25, 0.2], [0.6, 0.2, 0.1, 0.1], [1.0, 0, 0, 0]):
         s = routing_stats(_logits_for(shares, tokens=8192), capacity_factor=1.0)
@@ -101,6 +121,30 @@ def test_drop_rate_is_the_total_variation_distance_from_uniform_at_capacity_one(
     assert routing_stats(_logits_for([0.6, 0.2, 0.1, 0.1]), capacity_factor=3.0)["drop_rate"] == 0.0
     assert routing_stats(_logits_for([1.0, 0, 0, 0]), dropless=True)["drop_rate"] == 0.0
     assert capacity_of(400, 4, 1.0) == 100 and capacity_of(400, 4, 0.0) == 400
+
+
+def test_the_drop_rate_is_a_thresholded_tv_when_the_expert_count_does_not_divide_the_tokens():
+    """capacity = ceil(T/E) > T/E when E does not divide T, so the drop rate
+    under-reads and has a dead zone near balance. `imbalance` has neither,
+    which is why it is the balance metric and the drop rate is the cost one."""
+    def _lg(counts):
+        lg = torch.zeros(sum(counts), E)
+        off = 0
+        for i, c in enumerate(counts):
+            lg[off:off + c, i] = 6.0
+            off += c
+        return lg
+
+    # production case: E divides T, so the two agree exactly
+    s = routing_stats(_lg([3000, 1500, 1000, 772]), capacity_factor=1.0)   # T = 6272
+    assert abs(s["drop_rate"] - s["imbalance"]) < 1e-6 and s["capacity"] == 1568
+
+    # E does not divide T: a real dead zone — imbalance sees it, drops do not
+    s = routing_stats(_lg([1568, 1568, 1567, 1567]), capacity_factor=1.0)  # T = 6270
+    assert s["drop_rate"] == 0.0 and s["imbalance"] > 0
+    # and a coarse grid under-reads substantially
+    s = routing_stats(_lg([20, 12, 9, 8]), capacity_factor=1.0)            # T = 49
+    assert s["drop_rate"] < s["imbalance"] - 1e-2, s
 
 
 def test_reconstructed_drop_count_matches_the_native_layers_own_count_exactly():
@@ -175,10 +219,13 @@ def test_the_gate_stays_fp32_under_autocast_so_the_aux_is_not_quantised():
     exactly 1.0. Tutel avoids that by disabling autocast around its routing
     block; the native backend must do the same explicitly, because ``x.float()``
     does NOT protect an nn.Linear (autocast casts the layer too)."""
-    # the hazard, stated: everything within +-0.2% of 1.0 is the same bf16 number
-    assert float(torch.tensor(1.0019, dtype=torch.bfloat16)) == 1.0
-    assert float(torch.tensor(1.002, dtype=torch.bfloat16)) == 1.0
-    assert float(torch.tensor(1.004, dtype=torch.bfloat16)) > 1.0
+    # the hazard, stated exactly: bf16's spacing is 2^-8 below 1.0 and 2^-7 above,
+    # so round-to-nearest absorbs [1-2^-9, 1+2^-8] into 1.0 — asymmetric, and
+    # closed at the top because 1+2^-8 is an exact tie that goes to even (1.0).
+    for v in (1 - 2 ** -9, 0.9981, 1.0019, 1.002, 1.0035, 1.0039, 1 + 2 ** -8):
+        assert float(torch.tensor(v, dtype=torch.bfloat16)) == 1.0, v
+    for v in (1 - 2 ** -8, 1.0040, 1 + 2 ** -7):
+        assert float(torch.tensor(v, dtype=torch.bfloat16)) != 1.0, v
     s = routing_stats(_logits_for([0.4, 0.3, 0.2, 0.1], margin=0.02))
     assert 1.0 < s["aux"] < 1.0019                                # visible in fp32...
     assert float(torch.tensor(s["aux"], dtype=torch.bfloat16)) == 1.0    # ...gone in bf16
