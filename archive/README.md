@@ -18,6 +18,6 @@ ported and why.
 
 | | |
 |---|---|
-| `PVT_Tutelmoe_v10_patched.ipynb` (repo root) | the v9 notebook patched in place — still self-contained, with the upcycling, shared-expert, accumulation and resume fixes carried into its own class definitions |
+| `PVT_Tutelmoe_v10_patched.ipynb` (moved HERE from the repo root) | the v9 notebook patched in place (31 fixes: Tutel activation_fn, upcycling, shared expert, accumulation, milestones, resume) — frozen provenance. Superseded by the generated `PVT_Tutelmoe_v12_standalone.ipynb` at the root; still checked by `tests/verify_patched_notebook.py`. As committed it RESUMES from the 72.27% v7 checkpoint — it is not a from-scratch reference. |
 | `notebooks/v11_train.ipynb` | thin launcher over `pvt_moe/` — same results, no duplicated logic |
 | `train.py` | the terminal entry point |

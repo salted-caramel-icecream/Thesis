@@ -1,4 +1,4 @@
-"""Verify PVT_Tutelmoe_v10_patched.ipynb by RUNNING its model cells.
+"""Verify archive/PVT_Tutelmoe_v10_patched.ipynb by RUNNING its model cells.
 
     python tests/verify_patched_notebook.py
 
@@ -12,7 +12,8 @@ asserts the upcycled MoE block reproduces a dense FFN exactly at step 0 — the
 bar the original notebook failed, since it discarded the stage-4 dense FFN and
 put nothing in its place.
 """
-import json, sys, types, torch, torch.nn as nn, torch.nn.functional as F
+import json
+import os, sys, types, torch, torch.nn as nn, torch.nn.functional as F
 
 # ---- stand-in for tutel, matching build_moe_ffn_layer's call signature ----
 class _FakeMoELayer(nn.Module):
@@ -46,7 +47,8 @@ g = {"__name__": "nb", "tutel_moe": fake, "torch": torch, "nn": nn, "F": F,
      "DropPath": DropPath, "to_2tuple": to_2tuple, "trunc_normal_": trunc_normal_,
      "pl": pl, "RMSNorm": nn.RMSNorm}
 
-nb = json.load(open("/home/user/Thesis/PVT_Tutelmoe_v10_patched.ipynb"))
+nb = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                  "archive", "PVT_Tutelmoe_v10_patched.ipynb")))
 WANT = ("class OverlapPatchEmbed", "class DWConv", "class RMSNorm", "v10 PATCH: helpers",
         "class Mlp", "def _init_t_xy", "class GQAttention", "class Block",
         "class PyramidVisionTransformerV2")
