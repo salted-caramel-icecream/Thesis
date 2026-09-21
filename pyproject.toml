@@ -32,12 +32,11 @@ pvt-moe-train = "pvt_moe.cli:main"
 #   tutel:      pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
 extras = ["fvcore", "wandb", "tensorboard"]
 
-[tool.setuptools]
-packages = [
-    "pvt_moe",
-    "pvt_moe.models",
-    "pvt_moe.data",
-    "pvt_moe.engine",
-    "pvt_moe.ssl",
-    "pvt_moe.utils",
-]
+# Discovered, not listed. The hand-written list here omitted pvt_moe.eval,
+# which pvt_moe/ssl/__init__.py imports at module level -- so `import
+# pvt_moe.ssl` from a pip install raised ModuleNotFoundError and the whole SSL
+# package was dead from a wheel. Nothing imports pyproject.toml, so no test
+# could catch it. `find` reads the tree that is actually there.
+[tool.setuptools.packages.find]
+include = ["pvt_moe*"]
+namespaces = false

@@ -76,8 +76,8 @@ def capacity_of(num_tokens: int, num_experts: int, capacity_factor: float,
     return max(1, top_k * int(capacity_factor * per_expert))
 
 
-def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_k: int = 1,
-                  dropless: bool = False) -> dict:
+def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0,
+                        top_k: int = 1) -> dict:
     """What top-1 routing actually did, from one MoE layer's gate logits.
 
     ``logits`` is ``(tokens, num_experts)``. Everything is computed in fp64 so
@@ -100,9 +100,8 @@ def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_
                          dead zone near balance — at T=49 (one image's stage-4
                          grid) it reads 0.143 where ``imbalance`` reads 0.158,
                          and at ``capacity_factor > 1`` the dead zone is large
-                         by design. Always 0 for a dropless backend
-                         Prefer ``imbalance`` as the balance
-                         measure and this as the cost measure.
+                         by design. Prefer ``imbalance`` as the balance measure
+                         and this as the cost measure.
     ``route_entropy``    entropy of ``f`` in nats; ``max_entropy`` is ``log E``.
     ``gate_entropy``     mean per-token entropy of the gate softmax. This is the
                          one that separates the two cases a flat ``aux`` cannot:
@@ -134,7 +133,7 @@ def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_
     mean_p = probs.mean(dim=0)
 
     capacity = capacity_of(tokens, num_experts, capacity_factor, top_k)
-    dropped = 0.0 if dropless else float((counts - capacity).clamp(min=0).sum())
+    dropped = float((counts - capacity).clamp(min=0).sum())
 
     def _entropy(q):
         q = q[q > 0]
@@ -151,7 +150,6 @@ def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_
         "capacity": int(capacity),
         "dropped_tokens": int(dropped),
         "drop_rate": round(dropped / max(1, tokens), 6),
-        "dropless": bool(dropless),
         "route_entropy": round(_entropy(share), 6),
         "gate_entropy": round(float(per_token_entropy.mean()), 6),
         "max_entropy": round(math.log(num_experts), 6),
