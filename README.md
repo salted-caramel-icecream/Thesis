@@ -12,9 +12,8 @@ pvt_moe/        the package — ALL logic lives here
 archive/        the v9/v10 notebooks and the process documents that recorded
                 how they became the package; unmaintained, kept for provenance
 notebooks/      thin launchers — v11_train.ipynb trains from a checkout,
-                colab_train.ipynb from a pip install, 03_ssl_pretrain.ipynb is
-                quick_bench.ipynb times a few
-                epochs on this machine
+                colab_train.ipynb from a pip install, quick_bench.ipynb times
+                a few epochs on this machine
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
                 scratch_NN_*.yaml        the 90-epoch ladder rows
@@ -26,7 +25,7 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation
 train.py        terminal entry point (thin shim over pvt_moe/cli.py);
                 --recipe pretrained / downstream chain
 evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
-download_data.py  build the ImageNet / PASS / small-dataset Arrow snapshots
+download_data.py  build the ImageNet / small-dataset Arrow snapshots
 tools/          compare_runs.py (table over results.json files), plot_rope_freqs.py,
                 verify_upcycling.py
 ```
@@ -443,7 +442,7 @@ ablation, and no two arms can share a checkpoint directory (tests enforce it):
 sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
 └─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
 │   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
-│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | pass | fmnist | eurosat | path)
+│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | fmnist | eurosat | path)
 │   │  │    └─────────────────────────────────────────────── input resolution (dataset.img_size; 224 = default)
 │   │  │    │        └────────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
 │   │  │    │        │    └───────────────────────────────── 4 experts, top-1
@@ -606,10 +605,6 @@ with seeded validation / test carve-outs where the source has none;
 - ImageNet: Deng et al., "ImageNet: A large-scale hierarchical image
   database", CVPR 2009; Russakovsky et al., "ImageNet Large Scale Visual
   Recognition Challenge", IJCV 2015.
-- PASS: Asano, Vedaldi, Rupprecht et al., "PASS: An ImageNet replacement for
-  self-supervised pretraining without humans", NeurIPS Datasets and
-  Benchmarks 2021. <https://www.robots.ox.ac.uk/~vgg/research/pass/> —
-  images and dataset CC-BY 4.0; attribution required.
 - Fashion-MNIST: Xiao, Rasul, Vollgraf, "Fashion-MNIST: a Novel Image
   Dataset for Benchmarking Machine Learning Algorithms", arXiv 1708.07747,
   2017 — MIT licence.
