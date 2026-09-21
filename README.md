@@ -648,7 +648,7 @@ full training run that started from random weights (8.9% accuracy).
 
 ## Config management
 
-Plain nested dicts, no framework — see `pvt_moe/config.py`. The config is
+Plain nested dicts, no framework — see `pvt_moe/config/`. The config is
 JSON-serializable by construction (a test enforces it), so it is logged to
 W&B and checkpointed verbatim, and `validate_config` does the domain checks a
 schema library would not give you for free (placement bounds, `head_dim % 4`,

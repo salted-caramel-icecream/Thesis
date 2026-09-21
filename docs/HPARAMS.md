@@ -1,7 +1,7 @@
 # Hyperparameters
 
 Transcribed from `PVT_backbone_HParams.docx` and encoded in
-`pvt_moe/config.py`. `tests/test_recipes.py::test_spec_*` assert these values
+`pvt_moe/config/`. `tests/test_recipes.py::test_spec_*` assert these values
 literally — if a default drifts, a test fails by name.
 
 Pick a path with one key:

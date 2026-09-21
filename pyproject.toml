@@ -35,6 +35,7 @@ extras = ["fvcore", "wandb", "tensorboard"]
 [tool.setuptools]
 packages = [
     "pvt_moe",
+    "pvt_moe.config",
     "pvt_moe.models",
     "pvt_moe.data",
     "pvt_moe.engine",

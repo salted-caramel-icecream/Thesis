@@ -44,4 +44,4 @@ python train.py --task ssl --dataset pass --dry-run       # SimMIM pretraining
 
 The branches share history up to the cut, so `git merge` works normally. The
 SSL side will need `task`, `cfg["ssl"]` and the `ssl_finetune` recipe put back
-into `config.py`, and `mode: "ssl_init"` reconciled with `warm_start`.
+into `config/`, and `mode: "ssl_init"` reconciled with `warm_start`.
