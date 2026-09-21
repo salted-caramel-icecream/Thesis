@@ -339,7 +339,7 @@ An arm is a **command line**, not a file. `--ladder N` applies the row from
 
 ```bash
 python train.py --recipe scratch --ladder 4
-scripts/run_ladder.sh scratch                  # rows 1-9
+scripts/run_ladder.sh scratch                  # rows 1-4, 6-9 (5 is "best config")
 ```
 
 Every row gets a distinct run name, so none can overwrite another's
@@ -394,11 +394,11 @@ Two rules make this safe, both covered by `tests/test_resume.py`:
 Milestones count *completed* epochs: milestone 90 fires when the 90th epoch
 finishes, and the file is `milestone-epoch090.ckpt`.
 
-### Shipped 300-epoch arms
+### The same arm on a 300-epoch budget
 
-Every scratch arm ships twice: the ladder row at its documented 90-epoch
-budget, and a `_300ep_stop100` sibling that builds the cosine for 300 and
-stops at 100.
+Any ladder row runs at any budget: the row is the architecture, the budget is
+a flag. To build the cosine for 300 and stop at 100 — what the old
+`_300ep_stop100` config files did — pass it on the command line.
 
 ```bash
 python train.py --recipe scratch --ladder 1                          # 90 ep

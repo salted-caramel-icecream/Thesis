@@ -11,6 +11,29 @@ so a result, or a decision, can be traced back to the code that produced it.
 | `PVT_Tutelmoe_fixedaux_v9_FINALfullFTp2.ipynb` | the canonical v9 notebook — LayerNorm, the Tutel gate `.train()` fix, ConfusionMatrix. Resumes from the 72.27% @ epoch-53 checkpoint, so it is the later of the two branches. |
 | `PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook patched in place (31 fixes: Tutel activation_fn, upcycling, shared expert, accumulation, milestones, resume) — frozen provenance. As committed it RESUMES from the 72.27% v7 checkpoint, so it is **not** a from-scratch reference. |
 
+### The 31 v10 patches
+
+The patched v10 carries these into its own class definitions, each marked
+`v10 PATCH`. Every one of them is also in `pvt_moe/`:
+
+- `build_moe_ffn_layer` always passes `activation_fn`, working around Tutel's
+  missing `import torch.nn.functional as F` — and puts `capacity_factor` /
+  `gate_noise` **inside** `gate_type`, where Tutel actually reads them
+- an always-on shared expert, with `moe_block_dwconv` controlling whether the
+  MoE'd block keeps PVT v2's DWConv
+- **upcycling**: v9 discarded the stage-4 dense FFN and put nothing in its
+  place, so every "pretrained" MoE run trained stage 4 from random init. It
+  now seeds the shared expert and zeroes the routed experts' fc2, so the block
+  reproduces the dense FFN exactly at step 0 (verified: max|Δ| = 0.0)
+- gradient accumulation (micro-batch 128 × 8 = 1024 effective, for a 12 GB card)
+- milestone checkpoints + `stop_at_epoch` for resuming a long schedule
+- `weights_only=` removed from `trainer.fit` — not a valid argument, it raised
+  `TypeError` before training started
+- `/` removed from the checkpoint filename template, which was silently
+  creating a nested directory per checkpoint
+- the validation confusion matrix is reset each epoch; it had been
+  accumulating every epoch plus the sanity-check batches
+
 `PVT_tutelmoe_ImageNet_v1_B200_RMS_FullFT.ipynb` was deleted: it was the
 parallel RMSNorm experiment, it lacked the gate fix and the confusion matrix,
 and its 9 MB of embedded outputs dominated the repo. What was worth keeping

@@ -3,7 +3,7 @@
 PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
 official size) with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
-lineage. The two source notebooks are kept untouched in the repo root for
+lineage. The source notebooks are kept untouched under `archive/` for
 provenance — see `archive/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
 where each cell ended up.
 
@@ -18,9 +18,6 @@ tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        three annotated EXAMPLES — an arm is a command line, not a
                 file (see scripts/run_ladder.sh)
 scripts/        run_ladder.sh — the whole ladder, one row per invocation
-                scratch_NN_*.yaml        the 90-epoch ladder rows
-                *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
-                bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
 docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
                 SSL_BRANCH.md (where self-supervised pretraining went)
@@ -28,8 +25,9 @@ train.py        terminal entry point (thin shim over pvt_moe/cli.py);
                 --recipe pretrained / downstream chain
 evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
 download_data.py  build the ImageNet / small-dataset Arrow snapshots
-tools/          compare_runs.py (table over results.json files), plot_rope_freqs.py,
-                verify_upcycling.py
+tools/          compare_runs.py (one table over many results.json), plot_rope_freqs.py,
+                probe_checkpoint.py, verify_upcycling.py, check_kernels.py,
+                concurrent_worker_sweep.py — see CLAUDE.md for what each is for
 ```
 
 ## Setting up a GPU box from scratch
@@ -98,19 +96,15 @@ on any problem, so it can gate a script.
 
 ### 4. The MoE backend
 
-Tutel compiles a CUDA extension, so it needs a compiler — `build-essential` on
-Linux, **MSVC Build Tools** on Windows:
+Tutel compiles a CUDA extension, so it needs a compiler (`build-essential` on
+Linux, MSVC Build Tools on Windows):
 
 ```bash
 pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
+python train.py --backend native ...     # or skip it: pure PyTorch, no compiler
 ```
 
-If that will not build (common on Windows without MSVC — WSL2 is usually the
-easier path), skip it and use the pure-PyTorch backend, which needs nothing:
-
-```bash
-python train.py --backend native ...
-```
+`docs/GUIDE.md` §5b covers what the native fallback does and does not change.
 
 ### 5. Credentials and data
 
@@ -139,12 +133,13 @@ python download_data.py --out D:/data/imagenet_arrow
 python train.py --data-dir D:/data/imagenet_arrow --checkpoint-root D:/runs ...
 ```
 
-The snapshot settles at ~160 GB but needs **~320 GB free to build** —
-`datasets` keeps the raw download and the Arrow cache at the same time.
-`download_data.py` checks that `HF_TOKEN` is set and that there is enough free
-space before starting, so a 2–3 hour build fails in the first second rather
-than the last (accepting the licence is on you — HF refuses the download
-otherwise). Run it under `tmux` on a remote box. `docs/GUIDE.md` §2 has the detail.
+The snapshot settles at ~160 GB but needs **~320 GB free to build**, and
+`download_data.py` checks both the token and the free space before starting,
+so a 2–3 hour build fails in the first second rather than the last. Run it
+detached. `docs/GUIDE.md` §1–2 has the rest: the small downstream sets,
+`--fraction` for a benchmarking slice, carving a subset out of an existing
+snapshot, and putting the paths in a gitignored `configs/*.local.yaml` so you
+never pass `--data-dir` again.
 
 ### 6. Gate, smoke-test, then train
 
@@ -196,21 +191,24 @@ Start-Process -NoNewWindow -FilePath .\.venv\Scripts\python.exe `
 ```
 
 If it dies — power cut, OOM, a closed laptop — resume from the last milestone
-rather than restarting. Plan for that by asking for milestones up front:
+rather than restarting. Ask for milestones up front so there is one to resume
+from:
 
 ```bash
 python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]"
 python train.py --recipe scratch --epochs 300 \
     --resume-from /data/runs/<run_name>/milestone-epoch090.ckpt
-#   Windows:  --resume-from D:/runs/<run_name>/milestone-epoch090.ckpt
 ```
+
+`docs/GUIDE.md` §4 covers splitting a 300-epoch cosine across machines,
+`--stop-at`, and what a resume does and does not restore.
 
 ### 8. Running the whole ablation ladder
 
 ```bash
 # Linux / WSL2 / macOS
-scripts/run_ladder.sh scratch                  # rows 1-9 at 90 epochs
-scripts/run_ladder.sh scratch 300              # the same rows at 300
+scripts/run_ladder.sh scratch                  # rows 1-4, 6-9 at the recipe's budget
+scripts/run_ladder.sh scratch 300              # the same rows at 300 epochs
 scripts/run_ladder.sh scratch 90 3 4 7         # only rows 3, 4 and 7
 DRY_RUN=1 scripts/run_ladder.sh scratch        # resolve and print, train nothing
 ```
@@ -228,9 +226,8 @@ it a timing smoke run. Rows 10-12 of the scratch ladder are row 4 crossed with
 two binary flags — `--ladder 4 --no-rope`, `--ladder 4 --no-moe-dwconv`,
 `--ladder 4 --no-moe-dwconv --no-rope` — so they need no rows of their own.
 
-The guard matters: every scratch arm also ships a `_300ep_stop100` sibling
-that matches the same glob, and those are 300-epoch schedules — without the
-skip the loop would launch both budgets.
+Row 5 is skipped by default: it is the "best config" row, which sets the
+300-epoch budget only, so you carry the winning architecture flags yourself.
 
 Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
@@ -271,7 +268,7 @@ CUDA_VISIBLE_DEVICES=3 python train.py --recipe scratch --ladder 8 --experts 8 -
 `drop_path` resolves to 0.1 on all four (the variant's official rate). All four
 run names are distinct, so no two arms can share a checkpoint directory.
 
-**No shared expert in any arm** — `scratch_08` ships with it on, so GPU 3
+**No shared expert in any arm** — ladder row 8 has it on, so GPU 3
 passes `--no-shared-expert` to match GPUs 1–2 (the run name carries no `+sh`).
 That keeps both comparisons single-variable: GPU 1 vs GPU 2 prices **expert
 count** at fixed stage-4 placement, GPU 2 vs GPU 3 prices **placement** at
@@ -285,8 +282,8 @@ only** — it does not measure RoPE's effect on a dense model. Any statement
 about RoPE from this ladder has to carry that scope.
 
 Budget: the scratch recipe's 90 epochs. For the 300-epoch cosine stopped
-early, use the `_300ep_stop100` sibling of the same file, or add
-`--epochs 300 --stop-at N --milestones "[...]"`. Repeat an arm without sharing
+early, add `--epochs 300 --stop-at N --milestones "[...]"` to the same
+command. Repeat an arm without sharing
 its checkpoint directory or W&B name: `--run-suffix v2`.
 
 ## Or use a notebook
@@ -296,28 +293,7 @@ its checkpoint directory or W&B name: `--run-suffix v2`.
 | `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/` from a checkout. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
 | `notebooks/colab_train.ipynb` | the same, on a machine with **no checkout**: `pip install git+<repo>@<sha>` at a pinned commit, then the same CLI. |
 | `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
-| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes) — frozen provenance, unmaintained. |
-
-The patched v10 carries these fixes into its own class definitions
-(each marked `v10 PATCH`):
-
-- `build_moe_ffn_layer` always passes `activation_fn`, working around Tutel's
-  missing `import torch.nn.functional as F` — and puts `capacity_factor` /
-  `gate_noise` **inside** `gate_type`, where Tutel actually reads them
-- an always-on shared expert, with `moe_block_dwconv` controlling whether the
-  MoE'd block keeps PVT v2's DWConv
-- **upcycling**: v9 discarded the stage-4 dense FFN and put nothing in its
-  place, so every "pretrained" MoE run trained stage 4 from random init. It
-  now seeds the shared expert and zeroes the routed experts' fc2, so the block
-  reproduces the dense FFN exactly at step 0 (verified: max|Δ| = 0.0)
-- gradient accumulation (micro-batch 128 × 8 = 1024 effective, for a 12 GB card)
-- milestone checkpoints + `stop_at_epoch` for resuming a long schedule
-- `weights_only=` removed from `trainer.fit` — not a valid argument, it raised
-  `TypeError` before training started
-- `/` removed from the checkpoint filename template, which was silently
-  creating a nested directory per checkpoint
-- the validation confusion matrix is reset each epoch; it had been
-  accumulating every epoch plus the sanity-check batches
+| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes, listed in `archive/README.md`) — frozen provenance, unmaintained. |
 
 `notebooks/v11_train.ipynb` — same package, same results, edit ONLY the CONFIG
 cell. It prints the equivalent command line, so anything tuned interactively
@@ -447,143 +423,39 @@ ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
 sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
-└─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
-│   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
-│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | fmnist | eurosat | path)
-│   │  │    └─────────────────────────────────────────────── input resolution (dataset.img_size; 224 = default)
-│   │  │    │        └────────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
-│   │  │    │        │    └───────────────────────────────── 4 experts, top-1
-│   │  │    │        │    │   └───────────────────────────── shared expert
-│   │  │    │        │    │   │   └───────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
-│   │  │    │        │    │   │   │         └─────────────── norm
-│   │  │    │        │    │   │   │         │  └──────────── recipe + epoch budget
+└──────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └──────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └───────────────────────────────────────── dataset (in1k | in22k | fmnist | eurosat | path)
+│   │  │    └──────────────────────────────────── input resolution (dataset.img_size; 224 = default)
+│   │  │    │        └─────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │    │        │    └────────────────────── 4 experts, top-1
+│   │  │    │        │    │   └────────────────── shared expert
+│   │  │    │        │    │   │   └────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
+│   │  │    │        │    │   │   │         └──── recipe + epoch budget
 ```
 
-Further markers appear only when they apply: `-nat`/`-mb` (backend),
+Further markers appear only when they apply: `-nat` (the native backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
 theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
 `-randexp` (random expert init), `-szi` (`shared_zero` upcycling init; an explicit
 `none` with seeded experts is refused at validate time, so `-nozi` never appears).
 
-## RoPE frequency diagnostics
+## Where to read more
 
-RoPE-Mixed learns its frequencies, so every run with `use_rope` writes the
-`(2, heads, head_dim//2)` tensor of each RoPE'd block twice, into
-`<checkpoint_root>/<run_name>/`: `rope_freqs_init.pt` at step 0 (kept inside every checkpoint too, so a resume on
-another machine rewrites the true init rather than the restored weights) and
-`rope_freqs_final.pt` (refreshed every epoch; a killed run's latest values are
-also in `last.ckpt`, which the plot tool accepts directly).
+The long-form material lives in `docs/`, once each:
 
-```bash
-python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
-    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
-python tools/plot_rope_freqs.py --selftest          # synthetic spread / collapsed / axial cases
-```
-
-CPU only, torch + matplotlib, no dataset or Tutel — so it runs on a laptop
-while the GPU trains. `docs/GUIDE.md` §7 is the reading guide and
-`docs/HPARAMS.md` §2 the healthy-vs-collapsed table.
-
-## Shared expert (`model.moe.shared_expert`)
-
-An always-on dense FFN evaluated for every token alongside the routed
-experts, `y = routed_moe(x) + shared_expert(x)`. It lives outside the backend
-layer, so it works identically under all three backends and its weights are
-never touched by their own expert initialization.
-
-| Knob | Effect |
-|------|--------|
-| `shared_expert: True` | build the shared branch (costs one extra FFN per token: top-k → top-k+1 active) |
-| `moe_block_dwconv: True` | the MoE'd block keeps PVT v2's DWConv (on the shared branch, the only one with an intact token grid) — so RoPE becomes an independent axis instead of a compensation. **Scoped to `moe_placement`**; dense blocks elsewhere are untouched |
-| `upcycle_init` | which branch starts at zero when upcycling: `"routed_zero"` (default — the block starts out computing *exactly* the pretrained dense FFN), `"shared_zero"` (the spec's scheme), or `"none"`. Resolves to `"none"` with no shared expert |
-
-With `mode: hf_pretrained`, the shared branch is loaded verbatim from the
-pretrained dense FFN — the one place a pretrained FFN survives intact rather
-than being replicated into E experts. Read the
-`seeded_shared=... zeroed_routed_fc2=...` fields of the `[HF pretrained]` line
-to confirm it happened. Run names gain `+sh`.
-
-## MoE backends
-
-- **Native** (`--backend native`): pure PyTorch — no CUDA extension, no NCCL,
-  no compiler. The fallback for boxes where Tutel will not build. Top-1 only,
-  architecturally equivalent, and it mirrors Tutel's parameter layout so
-  checkpoints move between the two. Expert arithmetic is bit-exact against
-  Tutel and the aux loss is numerically identical; see `docs/ARCHITECTURE.md`
-  §2b.
-- **Tutel** (default): builds from source on any torch;
-  top-k gate with capacity factor + gate noise. The Tutel gate train-forcing
-  in `engine/classifier.py` is **load-bearing** (gates revert to eval after
-  Lightning validation, silently disabling gate noise).
-
-## Long runs in pieces
-
-Train a 300-epoch schedule across sessions or machines without compressing the
-cosine:
-
-```bash
-python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]" --stop-at 90
-python train.py --recipe scratch --epochs 300 --resume-from .../milestone-epoch090.ckpt
-```
-
-`--epochs` is the schedule; `--stop-at` is only where you get off. Milestone
-checkpoints hold model + optimizer + scheduler + epoch and are never pruned by
-`save_top_k`. A stopped-and-resumed run follows an LR trajectory identical to
-one uninterrupted run — `tests/test_resume.py` asserts exactly that. Details
-in `docs/GUIDE.md` §4.
-
-## Hardware sizing (single 12 GB card)
-
-`batch_size` is the **micro**-batch (what fits VRAM); `effective_batch_size`
-is what the LR is calibrated for. Accumulation is derived, so a 12 GB card
-reproduces the paper's optimization exactly:
-
-```
-batch: 128 micro x 8 accum = 1024 effective
-```
-
-OOM? Two levers, neither of which changes the optimization:
-
-```bash
-python train.py --batch-size 64 --accum 16              # smaller micro-batch
-python train.py --grad-checkpointing "[1]" --batch-size 256   # recompute stage 1
-```
-
-Checkpointing saves in proportion to token count, so stage 1 (56×56 = 3136
-tokens) is worth ~64× stage 4 (7×7 = 49). `[1]` or `[1,2]` typically buys a
-2–4× larger micro-batch for ~30% per-stage slowdown.
-
-Starting points — every row is the **same optimization** (1024 effective),
-only the memory strategy differs:
-
-| GPU | VRAM | `--batch-size` | `--accum` | `--num-workers` |
-|---|---|---|---|---|
-| RTX 5070 | 12 GB | **128** (default) | **8** | 8 |
-| RTX 5090 | 32 GB | 512 | 2 | 12 |
-| H100 | 80 GB | 1024 | 1 | 16–32 |
-| H200 | 141 GB | 1024 | 1 | 16–32 |
-| B200 | 180 GB | 1024 | 1 | 16–32 |
-
-Those rows are for B1. **`--variant b2` needs roughly half the micro-batch**
-(~1.9× the activation memory per image): 64 × 16 on 12 GB, 256 × 4 on 32 GB,
-512 × 2 or 1024 × 1 from 80 GB up. **`--variant b0` needs about a quarter**
-(~0.27×): 512 × 2 on 12 GB, 1024 × 1 from 32 GB up. Effective batch stays 1024
-in every case, so the recipe's LR is unchanged. `python train.py --check-env
---variant b2` (or `b0`) computes the suggestion from the VRAM actually free;
-`docs/HPARAMS.md` §5 has the per-variant table.
-
-Estimates, not measurements — `python train.py --check-env` computes the same
-suggestion from the VRAM actually free on your box, and `setup_environment`
-warns before training if the micro-batch looks too large rather than OOM-ing
-an hour into data loading. Above ~40 GB the bottleneck stops being VRAM and
-becomes data loading; don't raise the *effective* batch past 1024 or the
-recipe's LR no longer matches. `docs/HPARAMS.md` §5 has the reasoning.
-
-Windows notes are handled in-code (no `fork`, no `expandable_segments`).
-
-**Budget honestly**: one ImageNet-1k epoch is an estimated 45–85 min on an
-RTX 5070, so a 90-epoch ablation run is 3–6 days and the 8-run ladder is
-4–8 weeks. Measure one epoch before committing. See `docs/HPARAMS.md` §5.
+| | |
+|---|---|
+| Credentials, building the Arrow snapshot, pointing the code at it | `docs/GUIDE.md` §1-2 |
+| Every flag and its notebook equivalent, side by side | `docs/GUIDE.md` §3 |
+| Long runs in pieces: milestones, `--stop-at`, resuming a 300-epoch cosine | `docs/GUIDE.md` §4 |
+| Sizing it for your GPU; what to do if Tutel will not build | `docs/GUIDE.md` §5, §5b |
+| Reading the startup banner and `results.json` | `docs/GUIDE.md` §6 |
+| RoPE-Mixed frequency diagnostics (`tools/plot_rope_freqs.py`) | `docs/GUIDE.md` §7 |
+| Evaluating and comparing runs (k-NN, probe, `compare_runs.py`) | `docs/GUIDE.md` §8 |
+| Every recipe and ladder row with its cited source | `docs/HPARAMS.md` |
+| Model invariants: MoE placement, the shared expert, backends, RoPE, upcycling | `docs/ARCHITECTURE.md` |
+| Where self-supervised pretraining went | `docs/SSL_BRANCH.md` |
 
 ## Datasets
 
@@ -628,7 +500,7 @@ with seeded validation / test carve-outs where the source has none;
 
 | mode | What happens |
 |------|--------------|
-| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
+| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
 | `warm_start` | load any `last.ckpt` or saved backbone from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._dstr50_from-dense-ft100`) |

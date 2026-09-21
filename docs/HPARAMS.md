@@ -7,7 +7,7 @@ literally — if a default drifts, a test fails by name.
 Pick a path with one key:
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})     # "pretrained" | "ssl_finetune" | "downstream"
+cfg = merge_config(default_config(), {"recipe": "scratch"})     # "pretrained" | "downstream"
 ```
 
 A recipe fills only fields left as `None`. **Anything you set explicitly

@@ -18,8 +18,7 @@ Carries the v9 lineage's load-bearing training semantics:
 - **Discriminative LR + weight-decay hygiene**: 4 parameter groups —
   {stages 1-3, stage 4 + head} x {decay, no-decay}, where the no-decay split
   is the timm rule (``p.ndim <= 1``: biases and all norm weights).
-- **Layer-wise LR decay** (``optim.layer_decay`` < 1, the ssl_finetune /
-  downstream recipes): every block's LR is the peak scaled by
+- **Layer-wise LR decay** (``optim.layer_decay`` < 1, the downstream recipe): every block's LR is the peak scaled by
   ``decay ** (top - layer_id)`` compounding from the head down, the scheme of
   BEiT / SimMIM fine-tuning (``microsoft/SimMIM optimizer.py
   get_swin_layer``, mapped onto PVT v2's attribute names in

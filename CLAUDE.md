@@ -15,9 +15,9 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 - `tests/` — plain `test_*` functions in `test_*.py`; `tests/helpers.py` gives `tiny_config(**overrides)` and `install_fake_tutel_backend()` (returns an undo fn; needed around `build_model` / `LitClassifier` whenever `use_moe` is on)
 - `tools/` — standalone scripts: `plot_rope_freqs.py` (CPU), `verify_upcycling.py` (function preservation on the REAL MoE backend — the suite only covers fake Tutel + native), `compare_runs.py` (table / CSV / PDF over results.json files), `concurrent_worker_sweep.py` (per-arm and aggregate loader throughput under concurrent load; needs data + GPUs, see its header), `probe_checkpoint.py` (forensics on a checkpoint ALONE — config, the LR actually in effect vs the reconstructed schedule, head collapse, Adam moments; never builds the model, so a config mismatch cannot corrupt the reading), `check_kernels.py` (every op the backbone uses at the variant's real shapes, forward and backward, bf16 CUDA vs fp32 and fused SDPA vs math — the fault a fixed-batch overfit cannot see; run it ON THE TRAINING MACHINE)
 - `configs/` — three annotated EXAMPLES of the file format. An ablation arm is a COMMAND LINE (`--recipe X --ladder N` plus budget flags), not a file: `LADDERS` in `config/recipes.py` is the only definition of the arms, and `scripts/run_ladder.sh` sweeps them. A gitignored `configs/*.local.yaml` holds machine paths and composes with an arm.
+- `download_data.py` — builds every Arrow snapshot (ImageNet 1k/22k and the three small sets); checks `HF_TOKEN` and free disk before starting
 - `docs/` — `GUIDE.md` (how to run, datasets, evaluation), `HPARAMS.md` (recipes, ladders), `ARCHITECTURE.md` (invariants), `SSL_BRANCH.md` (where self-supervised pretraining went and what stayed)
 - `notebooks/` — `v11_train.ipynb` is the supervised launcher (from a checkout), `colab_train.ipynb` the same from a pinned `pip install git+...` for a machine with no clone, `quick_bench.ipynb` times a few epochs (edit only their CONFIG cells, via json load/dump); `archive/` — v9/v10 notebooks and the process-history documents, unmaintained
-- `figures/` — thesis figures, vector PDF only
 
 ## Running things
 
@@ -74,13 +74,10 @@ State-dict keys carry the `model.` prefix (`model.block4.1.attn.rope.freqs`).
 
 ## Figures
 
-Under `figures/`, vector PDF, matplotlib only — no seaborn, no style sheets;
-rcParams set explicitly in the script: `font.size 9`, `axes.titlesize 9`,
-`axes.labelsize 9`, `legend.fontsize 8`, `xtick.labelsize 8`,
-`ytick.labelsize 8`, `pdf.fonttype 42`, `savefig.bbox tight`; figure width
-7.0 in (double column), height about 2.3 in per row; colour-blind-safe
-palette (Okabe-Ito or tab10). `tools/plot_rope_freqs.py` is the reference
-implementation of the style.
+The thesis figure style — vector PDF, matplotlib only, explicit rcParams,
+Okabe-Ito — is specified in the docstring of `tools/plot_rope_freqs.py`, the
+reference implementation. There is no tracked `figures/` directory: both
+plotting tools create their `--out` path.
 
 ## Working norms
 

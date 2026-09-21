@@ -234,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(.yaml/.yml need PyYAML). Repeatable: files merge "
                         "in order, later files win on conflicting keys, e.g. "
                         "--config configs/my_paths.local.yaml "
-                        "--config configs/scratch_01_baseline_conv_ffn.yaml")
+                        "--config configs/example_scratch.yaml")
     g.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                    dest="overrides",
                    help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
