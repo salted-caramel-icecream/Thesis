@@ -64,10 +64,10 @@ def test_run_tag_variants():
 
     cfg2 = merge_config(default_config(), {
         "model": {"ablation": {"moe_placement": [[], [], [1], [0, 1]]},
-                  "moe": {"backend": "megablocks"}},
+                  "moe": {"backend": "native"}},
     })
     tag = build_run_tag(validate_config(cfg2))
-    assert "moe-s3b1+s4" in tag and "-mb" in tag, tag
+    assert "moe-s3b1+s4" in tag and "-nat" in tag, tag
 
 
 def test_json_safety_rejects_callables():

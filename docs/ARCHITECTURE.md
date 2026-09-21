@@ -81,9 +81,9 @@ y = routed_moe(x) + shared_expert(x)          # DeepSeekMoE / Qwen-MoE style
 It is a plain `Mlp` held by `MoEMlp` *outside* `moe_layer`, which has three
 consequences worth stating as invariants:
 
-1. **Backend-agnostic and init-safe.** Tutel and MegaBlocks each initialize
-   their own expert tensors at construction; the shared expert is outside that
-   blast radius, so it is the only branch whose weights are guaranteed to be
+1. **Backend-agnostic and init-safe.** Both backends initialize their own
+   expert tensors at construction; the shared expert is outside that blast
+   radius, so it is the only branch whose weights are guaranteed to be
    whatever we put there.
 2. **It can keep the DWConv** (`moe_block_dwconv`, default True), which
    relaxes the invariant above: a shared-expert MoE block is *not*
@@ -121,7 +121,6 @@ data-parallel parameters, unlike the routed expert tensors.
 |---|---|---|
 | `tutel` | **default** | a CUDA extension built from source (compiler required) |
 | `native` | fallback | nothing beyond torch |
-| `megablocks` | experimental | `megablocks==0.10.0` + `grouped_gemm` |
 
 Tutel stays the default because it produced the recorded results; switching
 would make new runs incomparable to the 72.27%. `native`
@@ -165,21 +164,18 @@ lineage several failed runs to get right):
 pass, Tutel gate modules set themselves back to eval, silently zeroing
 `gate_noise` — routing then freezes and experts can collapse. The forcing
 code in `engine/classifier.py` (`train()` override + `on_train_epoch_start`)
-must stay. MegaBlocks does not need this (and the forcing is a no-op for it).
+must stay. The native backend needs none of it (plain `self.training` gates
+its noise), and the forcing is a no-op there.
 
-Backend differences:
+Both backends return `(output, aux_loss)` from one call, which is why
+`MoEMlp.forward` needs no per-backend branch at all. A backend that did not
+share that contract would force a second arm — and a clear/collect protocol
+around a global registry — back into this path. Make a new backend meet the
+contract instead.
 
-| | Tutel | MegaBlocks dMoE |
-|---|---|---|
-| capacity_factor | yes (2.0) | **no-op** (dropless) |
-| gate_noise | yes (0.5) | **no-op** (use `moe_jitter_eps` upstream if ever needed) |
-| aux retrieval | returned by the layer | global registry, **training mode only** |
-| expert layout | `batched_fc1_w/…fc2_w (E, hidden, dim)` — fc2 stored transposed | `w1/w2 (E·hidden, dim)` — w2 rows are `fc2.weight.T` |
-| bias | yes | **none** (grouped MLP ignores `bias`; we pass `bias=False` honestly) |
-
-Expert seeding (`seed_moe_experts_from_dense`) recognizes exactly these
-layouts and **raises** on anything else — never let it shape-guess (the
-archived MegaBlocks attempt silently seeded nothing that way).
+Expert seeding (`seed_moe_experts_from_dense`) recognizes exactly the layouts
+listed above and **raises** on anything else — never let it shape-guess (a
+guessing version once silently seeded nothing).
 
 ## 3. RoPE (`models/rope.py`)
 

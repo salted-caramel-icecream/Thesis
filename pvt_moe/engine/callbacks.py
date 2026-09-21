@@ -205,7 +205,6 @@ class RoutingMonitor(pl.Callback):
         moe = cfg["model"]["moe"]
         self.capacity_factor = moe["capacity_factor"]
         self.top_k = moe["top_k"]
-        self.dropless = moe["backend"] == "megablocks"   # dMoE never drops
         self.last_stats: dict = {}
         self._acc: dict = {}
         self._handles: list = []
@@ -241,9 +240,8 @@ class RoutingMonitor(pl.Callback):
                 acc["counts"] += counts.double()
                 acc["prob_sum"] += probs.sum(dim=0).double()
                 acc["entropy_sum"] += -(probs.clamp_min(1e-12).log() * probs).sum().double()
-                if not self.dropless:
-                    cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
-                    acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
+                cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
+                acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
                 acc["tokens"] += int(tokens)
             except Exception as e:  # noqa: BLE001 — never kill a run for a diagnostic
                 self._failed = True
@@ -258,7 +256,7 @@ class RoutingMonitor(pl.Callback):
 
         @torch.no_grad()
         def hook(mod, args, output):
-            if not self._active or self._failed or self.dropless:
+            if not self._active or self._failed:
                 return
             layer = getattr(mod, "moe_layer", None)
             acc = self._acc.get(name)
@@ -346,7 +344,6 @@ class RoutingMonitor(pl.Callback):
                 "mean_gate_prob": [round(float(v), 6) for v in mean_p],
                 "imbalance": round(imbalance, 6),
                 "drop_rate": round(float(acc["dropped"].cpu()) / tokens, 6),
-                "dropless": self.dropless,
                 "route_entropy": round(_h(share), 6),
                 "gate_entropy": round(float(acc["entropy_sum"].cpu()) / tokens, 6),
                 "max_entropy": round(math.log(experts), 6),

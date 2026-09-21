@@ -44,7 +44,7 @@ if str(REPO) not in sys.path:
 
 import torch  # noqa: E402
 
-from pvt_moe.config import default_config, merge_config, validate_config  # noqa: E402
+from pvt_moe.config import VALID_BACKENDS, default_config, merge_config, validate_config  # noqa: E402
 from pvt_moe.models import build_model  # noqa: E402
 from pvt_moe.models.pretrained import load_backbone_checkpoint, load_hf_pretrained  # noqa: E402
 
@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recipe", required=True, choices=("scratch", "pretrained"),
                    help="the recipe the compared run trains with; it decides what "
                         "model.moe.upcycle_init resolves to (a resolved 'none' is refused)")
-    p.add_argument("--backend", default="tutel", choices=("tutel", "native", "megablocks"))
+    p.add_argument("--backend", default="tutel", choices=VALID_BACKENDS)
     p.add_argument("--experts", type=int, default=4)
     p.add_argument("--hf", action="store_true", help="also run the HF path (downloads weights)")
     p.add_argument("--tol", type=float, default=1e-4)

@@ -359,7 +359,7 @@ name the base LR, the batch it was scaled by and the result.
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
-| MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
+| MoE backend | `--backend tutel\|native` | `moe.backend` |
 | dataset | `--dataset imagenet-1k\|imagenet-22k` (`pass` is SSL-only and refused here) | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 

@@ -312,8 +312,7 @@ def test_R4_backends_get_distinct_run_names():
                  "moe": {"backend": b}})["run_name"]
              for b in VALID_BACKENDS}
     assert len(set(names.values())) == len(VALID_BACKENDS), names
-    assert "-nat" in names["native"] and "-mb" in names["megablocks"]
-    assert "-nat" not in names["tutel"] and "-mb" not in names["tutel"]
+    assert "-nat" in names["native"] and "-nat" not in names["tutel"]
 
     dense = {b: tiny_config(model={"ablation": {"use_moe": False},
                                    "moe": {"backend": b}})["run_name"]

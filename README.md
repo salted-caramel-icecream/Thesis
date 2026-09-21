@@ -524,12 +524,6 @@ to confirm it happened. Run names gain `+sh`.
   top-k gate with capacity factor + gate noise. The Tutel gate train-forcing
   in `engine/classifier.py` is **load-bearing** (gates revert to eval after
   Lightning validation, silently disabling gate noise).
-- **MegaBlocks dMoE** (notebook 02): dropless — `capacity_factor`/`gate_noise`
-  are no-ops. Needs `megablocks==0.10.0` (pins torch 2.7.x) +
-  `grouped_gemm==0.3.0` (CUTLASS build; sm_120/RTX 5090 support unverified).
-  The archived first attempt failed on three counts (no grouped_gemm, aux
-  collected in eval, bias=True silently ignored) — all fixed in
-  `pvt_moe/models/ffn.py`; the notebook's sanity cell checks each one.
 
 ## Long runs in pieces
 

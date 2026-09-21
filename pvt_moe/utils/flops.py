@@ -3,7 +3,7 @@
 All numbers use fvcore's convention: **1 multiply-add (MAC) = 1 "FLOP"** —
 the same convention as the PVT/Swin papers' GFLOPs tables. fvcore traces the
 dense compute; MoE expert FFNs are stubbed during tracing (fvcore cannot
-trace Tutel/MegaBlocks kernels) and added back analytically in the SAME MAC
+trace Tutel kernels) and added back analytically in the SAME MAC
 convention:
 
     moe_macs = seq_len * [ k * (dim*hidden + hidden*dim)   (routed expert FFNs)

@@ -101,7 +101,7 @@ VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
 #: fallback (no CUDA extension, no NCCL, no compiler) for boxes where Tutel
 #: will not build; it is architecturally equivalent at top_k=1 and shares
 #: Tutel's parameter layout, so checkpoints move between the two.
-VALID_BACKENDS = ("tutel", "native", "megablocks")
+VALID_BACKENDS = ("tutel", "native")
 #: "ssl_finetune" is the INTERMEDIATE stage: a supervised ImageNet-1k
 #: fine-tune of an SSL-pretrained backbone. For pyramid ViTs under masked
 #: image modelling the chain is SSL -> supervised ImageNet -> downstream;
@@ -587,8 +587,7 @@ _DEFAULT: dict = {
 
         # --- MoE hyperparameters (previously hardcoded in the notebook) ----
         "moe": {
-            # "tutel" (default, validated) | "native" (pure-torch fallback)
-            # | "megablocks". See VALID_BACKENDS for why tutel stays default.
+            # "tutel" (default, validated) | "native" (pure-torch fallback).
             "backend": "tutel",
             # Sweet Spot runs E=4 and E=8 on IN-1k and notes larger counts
             # need more data to avoid overfitting.
@@ -596,7 +595,7 @@ _DEFAULT: dict = {
             # Tutel: SwinV2-B scores 85.5 at both k=1 and k=2, with k=2 costing
             # +25% activated params and ~17% train speed.
             "top_k": 1,
-            "capacity_factor": 1.0,       # tutel only (megablocks is dropless)
+            "capacity_factor": 1.0,       # tutel only
             "gate_noise": 0.5,            # tutel only
 
             # --- Shared expert (DeepSeekMoE / Qwen-MoE style) --------------
@@ -868,11 +867,9 @@ def run_name_parts(cfg: dict) -> dict:
     if abl["use_moe"]:
         moe_pl = resolve_placement(abl["moe_placement"], abl["moe_last_n_stages"], depths)
         moe_cfg = cfg["model"]["moe"]
-        # Per-backend tag. A binary "tutel or -mb" test silently labelled the
-        # native backend as megablocks; every backend needs its own marker or
-        # two different implementations share a checkpoint directory.
-        backend = {"tutel": "", "native": "-nat", "megablocks": "-mb"}[
-            moe_cfg["backend"]]
+        # Every backend needs its own marker, or two different
+        # implementations share a checkpoint directory.
+        backend = {"tutel": "", "native": "-nat"}[moe_cfg["backend"]]
         shared = "+sh" if moe_cfg.get("shared_expert") else ""
         # The random-expert-init control (pretrained ladder row 6) is
         # architecturally identical to the upcycled run it is compared against,

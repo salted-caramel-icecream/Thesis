@@ -28,26 +28,6 @@ class _FakeMoEMlpTutel(nn.Module):
         self.moe_layer = layer
 
 
-class _FakeMoEMlpMegablocks(nn.Module):
-    """Matches MegaBlocks GroupedMLP: flattened (E*hidden, dim), no biases."""
-
-    def __init__(self):
-        super().__init__()
-        self.backend = "megablocks"
-        self.num_experts = E
-        layer = nn.Module()
-        mlp = nn.Module()
-        mlp.w1 = nn.Parameter(torch.zeros(E * HIDDEN, DIM))
-        mlp.w2 = nn.Parameter(torch.zeros(E * HIDDEN, DIM))
-        experts = nn.Module()
-        experts.mlp = mlp
-        layer.experts = experts
-        router = nn.Module()
-        router.layer = nn.Linear(DIM, E)
-        layer.router = router
-        self.moe_layer = layer
-
-
 def _dense_weights():
     fc1_w = torch.randn(HIDDEN, DIM)
     fc1_b = torch.randn(HIDDEN)
@@ -68,19 +48,6 @@ def test_tutel_layout_seeding():
         assert torch.equal(moe.moe_layer.batched_fc2_bias[e], fc2_b)
     # Router untouched.
     assert moe.moe_layer.gate_wg.abs().sum() > 0
-
-
-def test_megablocks_layout_seeding():
-    moe = _FakeMoEMlpMegablocks()
-    fc1_w, fc1_b, fc2_w, fc2_b = _dense_weights()
-    n = seed_moe_experts_from_dense(moe, fc1_w, fc1_b, fc2_w, fc2_b)
-    assert n == 2, f"expected 2 seeded params (no biases in grouped MLP), got {n}"
-    for e in range(E):
-        rows = slice(e * HIDDEN, (e + 1) * HIDDEN)
-        assert torch.equal(moe.moe_layer.experts.mlp.w1[rows], fc1_w)
-        assert torch.equal(moe.moe_layer.experts.mlp.w2[rows], fc2_w.t())  # rows are fc2.T
-    # Router untouched (still at Linear init, not zeros).
-    assert moe.moe_layer.router.layer.weight.abs().sum() > 0
 
 
 def test_seeding_refuses_unknown_layout():

@@ -101,7 +101,7 @@ def logit_routing_stats(logits: torch.Tensor, capacity_factor: float = 1.0, top_
                          grid) it reads 0.143 where ``imbalance`` reads 0.158,
                          and at ``capacity_factor > 1`` the dead zone is large
                          by design. Always 0 for a dropless backend
-                         (megablocks). Prefer ``imbalance`` as the balance
+                         Prefer ``imbalance`` as the balance
                          measure and this as the cost measure.
     ``route_entropy``    entropy of ``f`` in nats; ``max_entropy`` is ``log E``.
     ``gate_entropy``     mean per-token entropy of the gate softmax. This is the
@@ -165,7 +165,7 @@ def gate_logits(moe_mlp, x_flat: torch.Tensor) -> torch.Tensor:
     """Router logits ``(tokens, E)`` of one MoE layer on its actual input.
 
     Tutel and the native backend keep the gate at ``moe_layer.gates[0].wg``;
-    megablocks' dMoE has ``router.layer``; the test suite's fake Tutel layer
+    The test suite's fake Tutel layer
     carries a bare ``gate_wg`` weight.
     """
     layer = moe_mlp.moe_layer
@@ -174,11 +174,9 @@ def gate_logits(moe_mlp, x_flat: torch.Tensor) -> torch.Tensor:
         return gate.wg(x_flat.to(gate.wg.weight.dtype))
     if hasattr(layer, "gate_wg"):
         return x_flat.to(layer.gate_wg.dtype) @ layer.gate_wg.t()
-    # megablocks: dMoE.router is a LearnedRouter with a .layer Linear.
-    # Its weights are bf16 (never fp32) — cast the input to match.
-    router = layer.router
-    lin = getattr(router, "layer", router)
-    return lin(x_flat.to(lin.weight.dtype))
+    raise AttributeError(
+        f"{type(layer).__name__} exposes neither Tutel's .gates nor the native "
+        f"backend's .gate_wg — cannot read its router logits")
 
 
 def expert_capacity(moe_mlp, tokens: int) -> int | None:
@@ -190,13 +188,10 @@ def expert_capacity(moe_mlp, tokens: int) -> int | None:
     (``top_k * int(capacity_factor * ceil(tokens / E))``), replicated here
     because its layer does not expose it.
 
-    ``None`` means no cap applies and nothing can be dropped: the megablocks
-    backend is dropless by construction, and ``capacity_factor <= 0`` is
-    Tutel's dynamic capacity.
+    ``None`` means no cap applies and nothing can be dropped:
+    ``capacity_factor <= 0`` is Tutel's dynamic capacity.
     """
     layer = getattr(moe_mlp, "moe_layer", None)
-    if getattr(moe_mlp, "backend", None) == "megablocks":
-        return None
     cap_f = getattr(moe_mlp, "capacity_factor", None)
     if cap_f is not None and cap_f <= 0:
         return None
@@ -282,9 +277,7 @@ def routing_stats(model, dataloader, num_batches: int = 50, device=None) -> dict
     for name, m in moe_modules:
         hooks.append(m.register_forward_pre_hook(_make_hook(name, m)))
 
-    # The megablocks backend stores expert/router weights in bf16 and its
-    # grouped kernels never run fp32 — the forward must happen under autocast.
-    # Harmless (and representative of training) for tutel too.
+    # Run under autocast: representative of how training actually routes.
     use_autocast = device.type == "cuda"
     try:
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_autocast):

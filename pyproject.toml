@@ -28,10 +28,8 @@ dependencies = [
 pvt-moe-train = "pvt_moe.cli:main"
 
 [project.optional-dependencies]
-# MoE backends are installed separately — see notebooks 01/02 install cells:
+# The Tutel MoE backend is installed separately (the notebooks' install cell):
 #   tutel:      pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
-#   megablocks: pip install --no-build-isolation grouped_gemm==0.3.0 && pip install megablocks==0.10.0
-#               (megablocks 0.10.0 pins torch 2.7.x)
 extras = ["fvcore", "wandb", "tensorboard"]
 
 [tool.setuptools]

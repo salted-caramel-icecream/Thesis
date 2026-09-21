@@ -24,7 +24,7 @@ back to the input dtype. Under bf16-mixed this is intentional — complex
 multiplication needs fp32 phase accuracy; the cache stays complex64.
 
 In this architecture RoPE exists primarily to reinject positional information
-into MoE blocks: the Tutel/MegaBlocks expert FFN replaces the dense Mlp that
+into MoE blocks: the routed expert FFN replaces the dense Mlp that
 carried PVT v2's depthwise-conv positional encoding (DWConv), so MoE blocks
 would otherwise be position-blind.
 """

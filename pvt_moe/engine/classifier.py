@@ -10,7 +10,7 @@ Carries the v9 lineage's load-bearing training semantics:
   mode after Lightning's validation pass, silently disabling ``gate_noise``
   (and with it the exploration that keeps experts balanced). ``train()`` is
   overridden and ``on_train_epoch_start`` re-forces every gate. Do not
-  remove. (MegaBlocks needs none of this — plain ``self.training`` gates its
+  remove. (The native backend needs none of this — plain ``self.training``
   loss registry.)
 - **Discriminative LR + weight-decay hygiene**: 4 parameter groups —
   {stages 1-3, stage 4 + head} x {decay, no-decay}, where the no-decay split

@@ -2,7 +2,7 @@
 
 The fake backend lets us test the package's MoE *plumbing* (tuple
 propagation, aux averaging, placement, optimizer grouping, seeding math)
-on machines without tutel/megablocks installed. It mimics Tutel's parameter
+on machines without tutel installed. It mimics Tutel's parameter
 layout (batched fc1/fc2) and its ``(output, l_aux)`` return contract.
 """
 
