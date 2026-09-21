@@ -33,7 +33,17 @@ def main() -> int:
     passed, failed, errors = 0, 0, []
 
     for mod_name in modules:
-        module = importlib.import_module(mod_name)
+        try:
+            module = importlib.import_module(mod_name)
+        except BaseException:          # noqa: BLE001
+            # A module that fails to IMPORT used to kill the runner outright:
+            # no summary, no other module's results, and the traceback buried
+            # under whatever had already printed. Count it as one failure and
+            # carry on, the same way a failing test is handled below.
+            failed += 1
+            errors.append((mod_name, "<import>", traceback.format_exc()))
+            print(f"\n== {mod_name} ==\n  FAIL <import>")
+            continue
         tests = [
             (name, fn)
             for name, fn in vars(module).items()

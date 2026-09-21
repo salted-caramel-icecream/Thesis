@@ -1,7 +1,8 @@
 """Model components: backbone, attention, FFN/MoE, RoPE, warm starts."""
 
 from pvt_moe.models.rope import (  # noqa: F401
-    RotaryEmbedding2D, apply_rotary_emb, compute_axial_cis, compute_mixed_cis, init_mixed_freqs,
+    RotaryEmbedding2D, apply_rotary_emb, compute_axial_cos_sin, compute_mixed_cos_sin,
+    init_mixed_freqs,
 )
 from pvt_moe.models.attention import SRAttention  # noqa: F401
 from pvt_moe.models.ffn import DWConv, Mlp, MoEMlp  # noqa: F401

@@ -184,7 +184,7 @@ guessing version once silently seeded nothing).
 
 ## 3. RoPE (`models/rope.py`)
 
-2D complex-multiplication RoPE after rope-vit (Heo et al. ECCV'24; reference
+2D RoPE after rope-vit (Heo et al. ECCV'24; reference
 `naver-ai/rope-vit` `deit/models_v2_rope.py` @ 48d8df50), in two flavours
 selected by `model.ablation.rope_mode`:
 
@@ -198,8 +198,8 @@ selected by `model.ablation.rope_mode`:
 | attention | multi-head (the only kind); frequencies are per query head | multi-head |
 
 **Parameter semantics (mixed).** `freqs[0]` is ω_x, `freqs[1]` is ω_y; dim 1
-is the head, dim 2 the frequency channel (`head_dim // 2` complex pairs — the
-adjacent real dims `(2c, 2c+1)` of q and k). Init is `init_mixed_freqs`, a
+is the head, dim 2 the frequency channel (`head_dim // 2` rotation pairs —
+the ADJACENT dims `(2c, 2c+1)` of q and k). Init is `init_mixed_freqs`, a
 port of the reference's `init_random_2d_freqs`: magnitudes
 `1 / theta ** (4k / head_dim)` for `k = 0 … head_dim//4 − 1`, one random
 angle φ_h per head from the global torch RNG (seed it), the first
@@ -211,6 +211,15 @@ stage 4: 8 × 64 = 512).
 
 Invariants, both flavours unless stated:
 
+- **Real `(cos, sin)`, adjacent-channel pairing.** `get()` returns a pair of
+  fp32 tensors, never a complex one, and `apply_rotary_emb` rotates the
+  adjacent dims `(2c, 2c+1)` — the reference / LLaMA-original convention, NOT
+  half-split `rotate_half`. Because the frequency vector is laid out as
+  `cat([x-freqs, y-freqs])`, the two conventions assign the x and y subspaces
+  to **different channels**, so switching would be a model change, not a
+  refactor (`test_adjacent_pairing_is_not_rotate_half` pins this). Nothing
+  complex is stored or checkpointed: the learnable `freqs` parameter and the
+  per-grid cache are all real.
 - Q is rotated on the full (H, W) grid; K on the SR-reduced (H_kv, W_kv)
   grid **expressed in full-grid units** (centered coordinate scaling
   `(i+0.5)·s − 0.5` with `s = H/H_kv`, exact identity at s=1) so q–k relative
@@ -218,12 +227,12 @@ Invariants, both flavours unless stated:
   `sr_ratio > 1`; V never. Mixed frequencies are per *query* head, and K
   carries the same head count by construction (attention is multi-head only).
 - `head_dim % 4 == 0` wherever RoPE is enabled (validated in config).
-- The mixed phase `exp(i(ω_x·x + ω_y·y))` is computed in fp32 with autocast
-  disabled (`compute_mixed_cis`), and the rotation itself runs in fp32 and
-  casts back — intentional under bf16-mixed (complex phase accuracy). The
-  axial cache stays complex64 on-device, keyed by (H, W, scale, device);
-  mixed phases are recomputed every call because the frequencies change
-  every step.
+- The mixed phase `ω_x·x + ω_y·y` is computed in fp32 with autocast disabled
+  (`compute_mixed_cos_sin`), and the rotation itself runs in fp32 and casts
+  back — intentional under bf16-mixed, where the phase needs fp32 accuracy.
+  The axial `(cos, sin)` cache stays fp32 on-device, keyed by
+  (H, W, scale, device); mixed phases are recomputed every call because the
+  frequencies change every step.
 - `*.rope.freqs` is **excluded from weight decay**: `configure_optimizers`
   puts it in the no-decay groups with the biases and norm weights (the
   reference lists `freqs` under `no_weight_decay`). Decaying it pulls every
