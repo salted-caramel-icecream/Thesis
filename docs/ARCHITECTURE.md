@@ -248,14 +248,6 @@ Invariants, both flavours unless stated:
   therefore always begins with random-angle frequencies — one reason the
   init snapshot exists.
 
-## Norm ablation (`models/norms.py`)
-
-`norm_type: rmsnorm` swaps every norm **except the last stage** (default
-`stage4_keeps_layernorm: True` — the MoE stage stays closest to pretrained LN
-statistics and the router input stays mean-centered; archive precedent).
-RMSNorm has no bias; when loading LN checkpoints the `.bias` keys drop out as
-`dropped_no_target` in the load stats — expected, not a bug.
-
 ## Placement schema
 
 `moe_placement` / `rope_placement`: list of length `num_stages`; entry *i* is

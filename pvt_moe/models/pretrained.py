@@ -17,9 +17,6 @@ Three entry points:
 - ``zero_routed_expert_output(...)`` — zero every routed expert's fc2 so a
   shared-expert block starts out computing EXACTLY the pretrained dense FFN.
 
-Norm-type interop: when the target model uses RMSNorm, LayerNorm ``.bias``
-keys from the source simply have no destination parameter and are dropped
-(reported in the load stats). LN gamma transfers to RMSNorm weight directly.
 
 Every loader returns a stats dict — print it and READ it. A silent
 0-weights-loaded bug cost this project a full failed training run (8.9%
@@ -167,7 +164,7 @@ def load_hf_pretrained(
             dense_mlp_for_seeding[custom_key] = value
             continue
         if custom_key not in model_state:
-            stats["dropped_no_target"] += 1  # e.g. LN bias -> RMSNorm target
+            stats["dropped_no_target"] += 1
             continue
         if model_state[custom_key].shape != value.shape:
             stats["skipped_shape"] += 1

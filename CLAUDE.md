@@ -8,7 +8,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 - `pvt_moe/config.py` — plain-dict config: `_DEFAULT`, recipes, variants, ladders, `build_run_tag`, `validate_config`, `assert_known_keys`
 - `pvt_moe/cli.py` — argparse front end; `train.py` at the root is a shim over it
-- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA multi-head + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `norms.py`, `pretrained.py` (HF remap), `moe_native.py`
+- `pvt_moe/models/` — `pvt.py` (backbone, `build_model`), `attention.py` (SRA multi-head + RoPE), `ffn.py` (MoE FFN, shared expert), `rope.py` (mixed / axial 2D RoPE), `pretrained.py` (HF remap), `moe_native.py`
 - `pvt_moe/engine/` — `classifier.py` (LitClassifier, optimizer groups, layer-wise LR decay, chain provenance at warm start), `callbacks.py` (checkpoints, `RopeFreqSnapshot`, `build_trainer`, `build_ssl_trainer`), `results.py` (`ResultsWriter`: results.json / results.md every epoch), `env.py`
 - `pvt_moe/data/` — ImageNet / PASS / small-set Arrow pipeline; `pvt_moe/utils/` — FLOPs, expert diagnostics
 - `pvt_moe/ssl/` — `simmim.py` (`LitSimMIM`, the default method), `jepa.py` (`LitJEPA`, dense only), `backbone.py` (`build_ssl_backbone`, honours `use_moe`), `diagnostics.py` (`mask_token_routing`), `masking.py`, `predictor.py`; `build_ssl_module(cfg)` dispatches on `ssl.method`
@@ -23,7 +23,7 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 - Tests: `python3 tests/run_all.py` — no pytest, CPU only, must end in `N passed, 0 failed`. **This is the gate before any GPU run.** Two tests TRAIN: `tests/test_learning.py` fits a real `LitClassifier` through `build_trainer` on separable tensors; `tests/test_pipeline_learns.py` writes a synthetic Arrow snapshot and fits through the WHOLE shipped chain — `HFImageDataset`, the real train transform (RandomResizedCrop, flip, timm RandAugment, erasing), `RepeatAugSampler`, forked workers, mixup — and fails if accuracy does not clear chance. Every other test is structural and would pass on a model that converges to the class prior. On a GPU box the suite runs these under the configured precision, so it is also the environment check.
 - `python train.py --overfit-check 200` bisects a run that will not learn: one real batch, the deterministic eval transform, no mixup/aug, a flat LR through its OWN single-group AdamW and a bare Trainer. PASS clears only the model's forward/backward, `training_step`, the loss and plain AdamW on that machine; it says nothing about the 4-group optimizer, the schedule, accumulation, the callbacks, the val loop, the train transform, the sampler, or a kernel whose backward is wrong (conv paths memorise a batch alone). FAIL means the path or the batch. `pvt_moe.models` b2 dense is verified function-identical (forward, train and eval, and every gradient, ≤ 3e-6) to timm's `pvt_v2_b2` with the same weights; do not re-suspect the backbone without a new reason.
-- `archive/PVT_Tutelmoe_v10_patched.ipynb` is NOT a from-scratch reference: its config resumes from a 72.27% checkpoint (`resuming: True`, `lr: 1e-4`, `warmup_epochs: 0`). The from-scratch recipe HAS been seen learning: `sv1_b1_in1k_dense_norope_ln_scratch300` @ 02cf99c, 3 epochs on a local 5070, normal upward W&B trend.
+- `archive/PVT_Tutelmoe_v10_patched.ipynb` is NOT a from-scratch reference: its config resumes from a 72.27% checkpoint (`resuming: True`, `lr: 1e-4`, `warmup_epochs: 0`). The from-scratch recipe HAS been seen learning: `sv1_b1_in1k_dense_norope_scratch300` @ 02cf99c, 3 epochs on a local 5070, normal upward W&B trend.
 - CLI: `python train.py --dry-run` resolves and prints the config without importing torch; `--print-config` / `--save-config FILE` dump the resolved JSON; `--check-env` reports the GPU/VRAM and suggests a batch. Every `train.py` command written into the docs must pass `--dry-run` from the repo root.
 - Never start a real training run from a session: there is no dataset, no GPU, and a run is days of compute.
 
@@ -41,9 +41,9 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 ## Run names and checkpoints
 
-`sv1_{variant}_{in1k|in22k|pass|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{ln|rms}_{scratch90|ft100|sslft100|dstr50|eval|simmim200[-px]|jepa100}[_from-{dense|moe}-{parent budget}]`,
-e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`,
-`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_sslft100_from-dense-simmim200`.
+`sv1_{variant}_{in1k|in22k|pass|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{scratch90|ft100|sslft100|dstr50|eval|simmim200[-px]|jepa100}[_from-{dense|moe}-{parent budget}]`,
+e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`,
+`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_sslft100_from-dense-simmim200`.
 `r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived
 with the SSL chain, so a run directory created before that has no `_r224_`.
 `--resume-from` keeps the derived name, so resume such a run with

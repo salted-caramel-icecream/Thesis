@@ -156,7 +156,7 @@ def test_evaluate_runner_validates_knn_probes_and_merges_into_results():
             assert rec["identity"]["chain"] == ["scratch+moe@imagenet-1k_r64"]     # untouched
             assert "## Evaluation (evaluate.py)" in open(os.path.join(run_dir, "results.md")).read()
             # a backbone file with no head: validate is skipped, knn still runs, results.json is created
-            bdir = os.path.join(d, "sv1_custom_pass_r64_dense_norope_ln_simmim1")
+            bdir = os.path.join(d, "sv1_custom_pass_r64_dense_norope_simmim1")
             os.makedirs(bdir)
             from pvt_moe.ssl import LitSimMIM
             scfg = tiny_config(task="ssl", dataset={"name": "pass", "img_size": 64}, model={"pretrained_hf_id": None})

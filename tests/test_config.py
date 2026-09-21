@@ -17,7 +17,7 @@ from pvt_moe.config import (
 def test_default_config_validates():
     cfg = validate_config(default_config())
     assert cfg["dataset"]["num_classes"] == 1000
-    assert cfg["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
+    assert cfg["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90"
     assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
 
 
@@ -58,10 +58,9 @@ def test_resolve_placement_rejects_bad_length():
 
 def test_run_tag_variants():
     cfg = merge_config(default_config(), {
-        "model": {"norm_type": "rmsnorm",
-                  "ablation": {"use_moe": False, "use_rope": False}},
+        "model": {"ablation": {"use_moe": False, "use_rope": False}},
     })
-    assert build_run_tag(validate_config(cfg)) == "sv1_b1_in1k_r224_dense_norope_rms_scratch90"
+    assert build_run_tag(validate_config(cfg)) == "sv1_b1_in1k_r224_dense_norope_scratch90"
 
     cfg2 = merge_config(default_config(), {
         "model": {"ablation": {"moe_placement": [[], [], [1], [0, 1]]},

@@ -127,8 +127,7 @@ def report_identity(ckpt: dict, cfg: dict) -> None:
     print(f"  global_step        : {step}")
     print(f"  variant            : {_get(cfg, 'model.variant')}")
     print(f"  use_moe            : {_get(cfg, 'model.ablation.use_moe')}"
-          f"     use_rope: {_get(cfg, 'model.ablation.use_rope')}"
-          f"     norm: {_get(cfg, 'model.ablation.norm_type')}")
+          f"     use_rope: {_get(cfg, 'model.ablation.use_rope')}")
     print(f"  num_classes        : {_get(cfg, 'dataset.num_classes')}"
           f"     img_size: {_get(cfg, 'dataset.img_size')}")
     print(f"  precision          : {cfg.get('precision')}")
@@ -445,8 +444,7 @@ def _synthetic(collapsed: bool) -> dict:
             "task": "supervised", "precision": "bf16-mixed", "batch_size": 128,
             "accumulate_grad_batches": 4, "effective_batch_size": 512,
             "model": {"variant": "b2", "drop_path_rate": 0.1,
-                      "ablation": {"use_moe": False, "use_rope": False,
-                                   "norm_type": "layernorm"}},
+                      "ablation": {"use_moe": False, "use_rope": False}},
             "dataset": {"num_classes": classes, "img_size": 224},
             "optim": {"lr": 1e-3, "warmup_epochs": 20},
             "loss": {"mixup_alpha": 0.8, "cutmix_alpha": 1.0,

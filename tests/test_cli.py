@@ -419,7 +419,7 @@ def test_run_suffix_marks_a_repeat_without_touching_the_derived_name():
     its own checkpoint directory; unset, every derived name is unchanged."""
     base = ("--recipe", "scratch", "--variant", "b2", "--no-moe", "--no-rope")
     plain = _cfg(*base)["run_name"]
-    assert plain == "sv1_b2_in1k_r224_dense_norope_ln_scratch90", plain
+    assert plain == "sv1_b2_in1k_r224_dense_norope_scratch90", plain
     assert _cfg(*base, "--run-suffix", "v2")["run_name"] == plain + "_v2"
     assert _cfg(*base, "--run-suffix", "seed7")["run_name"] == plain + "_seed7"
     # an SSL run gets it too (the tag is last in both branches of build_run_tag)

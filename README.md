@@ -243,10 +243,10 @@ the first step: the run name printed at start-up begins `sv1_b2_`.
 
 | GPU | arm | command | run name |
 |---|---|---|---|
-| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
-| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
-| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
-| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_ln_scratch90` |
+| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_scratch90` |
+| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
+| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -277,7 +277,7 @@ since `moe_block_dwconv` feeds only the shared-expert branch.
 
 **The SSL pair — a later wave, not this one.** The SimMIM arms are
 `--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
-(`sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100`) and the same command with
+(`sv1_b2_in1k_r224_dense_rope-s4b2_simmim100`) and the same command with
 `--dataset pass --data-dir /data/pass_arrow`. Running
 ImageNet first gives the PASS arm a reference it otherwise has none of — no
 third-party MIM result on PASS is known — and the pair then isolates the
@@ -427,25 +427,24 @@ merge_config(default_config(), {
 
 Warmup always starts from an absolute **1e-6** — `optim.warmup_start_factor`
 is derived from your peak LR rather than hand-set, so it stays right when you
-change `lr`. Run names carry the budget: `..._ln_scratch90`, `..._ln_ft100`.
+change `lr`. Run names carry the budget: `..._scratch90`, `..._ft100`.
 
 In `notebooks/v11_train.ipynb` the top of the CONFIG cell exposes `RECIPE`,
 `EPOCHS`, `LR`, `WARMUP_EPOCHS`, `MILESTONES`, `STOP_AT` and `RESUME_FROM`
 directly, and prints the equivalent command line.
 
-## The seven ablation axes
+## The six ablation axes
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16) — one kv head per query head, no head-count knob |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
-| 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
-| 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
-| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
-| 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
-| 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
+| 3 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
+| 4 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
+| 5 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
+| 6 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
-Orthogonal to all seven: **model size**, `model.variant` / `--variant b2`
+Orthogonal to all six: **model size**, `model.variant` / `--variant b2`
 (b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
 pretrained HF checkpoint as one set and rejects a disagreeing explicit value,
 so B2 depths can never load B1 weights. `docs/HPARAMS.md` §1 has the table
@@ -456,7 +455,7 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
+sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
 └─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
 │   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
 │   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | pass | fmnist | eurosat | path)

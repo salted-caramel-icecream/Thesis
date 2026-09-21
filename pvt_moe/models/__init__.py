@@ -1,6 +1,5 @@
-"""Model components: backbone, attention, FFN/MoE, norms, RoPE, warm starts."""
+"""Model components: backbone, attention, FFN/MoE, RoPE, warm starts."""
 
-from pvt_moe.models.norms import RMSNorm, build_norm_layers, rmsnorm_backend  # noqa: F401
 from pvt_moe.models.rope import (  # noqa: F401
     RotaryEmbedding2D, apply_rotary_emb, compute_axial_cis, compute_mixed_cis, init_mixed_freqs,
 )

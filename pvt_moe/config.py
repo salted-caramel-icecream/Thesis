@@ -12,7 +12,7 @@ Typical use::
     from pvt_moe import default_config, merge_config, validate_config
 
     cfg = merge_config(default_config(), {
-        "model": {"norm_type": "rmsnorm",
+        "model": {"dense_dwconv": False,
                   "ablation": {"moe_placement": [[], [], [], [-1]]}},
         "dataset": {"name": "imagenet-1k"},
     })
@@ -95,7 +95,6 @@ NUM_CLASSES = {name: spec["num_classes"] for name, spec in DATASETS.items()}
 VALID_TASKS = ("supervised", "ssl")
 
 VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
-VALID_NORMS = ("layernorm", "rmsnorm")
 #: MoE backends. "tutel" is the DEFAULT because it is the implementation the
 #: v9 lineage's results were produced with — switching the default would make
 #: new runs incomparable to the recorded 72.27%. "native" is a pure-PyTorch
@@ -415,7 +414,7 @@ _DEFAULT: dict = {
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
     # Appended to the DERIVED run name, e.g. run_suffix "v2" ->
-    # sv1_b2_in1k_r224_dense_norope_ln_scratch90_v2. For repeats of one arm
+    # sv1_b2_in1k_r224_dense_norope_scratch90_v2. For repeats of one arm
     # (a rerun, another seed, a second attempt) that must not share a
     # checkpoint directory or a W&B name with the first. Ignored when
     # run_name is set explicitly, which replaces the derived name entirely.
@@ -550,14 +549,9 @@ _DEFAULT: dict = {
         # (MoE blocks never have it in their routed branch regardless).
         "dense_dwconv": True,
 
-        # --- Norm ablation -------------------------------------------------
-        "norm_type": "layernorm",         # "layernorm" | "rmsnorm"
+        # LayerNorm is the only norm; RMSNorm was an ablation axis that no
+        # shipped arm ever selected (see archive/NOTEBOOK_TO_PACKAGE.md).
         "norm_eps": 1e-6,
-        # When norm_type == "rmsnorm", keep LayerNorm in the last stage
-        # (archive precedent: the MoE stage stays closest to the pretrained
-        # LN statistics and the router input distribution stays centered).
-        # Set False for an RMSNorm-everywhere ablation.
-        "stage4_keeps_layernorm": True,
 
         # --- Placement ablations -------------------------------------------
         "ablation": {
@@ -807,41 +801,57 @@ def stage_tag(cfg: dict) -> str:
 
 
 def parent_tag(ckpt_path: str | None) -> str | None:
-    """A short tag naming the run a warm-start checkpoint came from, read from
-    its PATH (``<root>/<parent run name>/<file>``): ``from-dense-simmim200``,
-    ``from-moe-sslft100-from-dense-simmim200``.
+    """A short tag naming the run a warm-start checkpoint came from:
+    ``from-dense-simmim200``, ``from-moe-sslft100-from-dense-simmim200``.
 
     Two fine-tunes that differ ONLY in their parent — path 2 (MoE pretrain)
     vs path 3 (dense pretrain, upcycled now) — would otherwise share a run
-    name and a checkpoint directory. Needs no torch and no file access, so
-    ``--dry-run`` shows it. None when the parent directory does not follow
-    this repo's naming (pass --run-name then).
+    name and a checkpoint directory.
+
+    Read from ``<parent dir>/results.json``, which ``ResultsWriter`` refreshes
+    every epoch beside the checkpoint. That file records ``identity.name_moe``
+    and ``identity.name_budget`` — the two fragments ``build_run_tag`` already
+    computed for the parent — so this reads tokens rather than re-deriving
+    them, and a change to the run-name format can never silently break
+    lineage. It is plain JSON, so ``--dry-run`` still needs no torch.
+
+    ``None`` when there is no results.json to read (a checkpoint copied on its
+    own, or one written before the run's first epoch ended). That is not
+    fatal: ``validate_config`` turns it into a warning telling you to pass
+    ``--run-name``.
     """
     if not ckpt_path:
         return None
+    import json
     import os
 
-    parent = os.path.basename(os.path.dirname(os.path.abspath(ckpt_path)))
-    fields = parent.split("_")
-    if len(fields) < 7 or not fields[0].startswith(("sv", "v")):
+    path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)), "results.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            ident = (json.load(fh) or {}).get("identity") or {}
+    except (OSError, ValueError):
         return None
-    if fields[4] == "dense":
-        moe = "dense"
-    elif fields[4].startswith("moe-"):
-        moe = "moe"
-    else:
+    moe, budget = ident.get("name_moe"), ident.get("name_budget")
+    if not moe or not budget:
         return None
-    norm_at = next((i for i in range(5, len(fields)) if fields[i] in ("ln", "rms")), None)
-    if norm_at is None or norm_at + 1 >= len(fields):
-        return None
-    budget = "-".join(fields[norm_at + 1:])
     return f"from-{moe}-{budget}"
 
 
 def build_run_tag(cfg: dict) -> str:
-    """Derive a self-documenting run name from the ablation flags.
+    """The run name: ``sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90``."""
+    return run_name_parts(cfg)["name"]
 
-    Example: ``sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90``
+
+def run_name_parts(cfg: dict) -> dict:
+    """The run name and the two fragments a CHILD run needs to name its parent.
+
+    Returns ``{"name", "moe", "budget"}``. ``moe`` is ``"dense"`` or ``"moe"``
+    and ``budget`` is the trailing ``sslft100-from-dense-simmim200`` fragment;
+    ``run_identity`` records both in results.json as ``name_moe`` /
+    ``name_budget``, and ``parent_tag`` reads them back. Deriving them HERE,
+    where they are already computed, is what lets ``parent_tag`` avoid
+    re-parsing a directory name — so the naming format can change without
+    silently breaking lineage.
 
     The variant sits right after the version: two sizes in one W&B project
     are otherwise indistinguishable, and a B2 run would overwrite a B1 run's
@@ -908,7 +918,6 @@ def build_run_tag(cfg: dict) -> str:
     # Without this, "conv-FFN intact" and "no DWConv" dense arms produce the
     # same run name and overwrite each other's checkpoints.
     dwconv = "" if cfg["model"].get("dense_dwconv", True) else "_nodw"
-    norm = {"layernorm": "ln", "rmsnorm": "rms"}[cfg["model"]["norm_type"]]
     # Budget tag: the epoch count is an ablation axis of its own (90/150/300
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
     budget = {"scratch": "scratch", "pretrained": "ft", "ssl_finetune": "sslft",
@@ -920,15 +929,20 @@ def build_run_tag(cfg: dict) -> str:
         # mask space changes what the encoder sees, so it is tagged too.
         ssl = cfg["ssl"]
         px = "-px" if ssl.get("mask_space") == "pixel" else ""
-        return (f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_"
-                f"{ssl['method']}{ssl['epochs']}{px}{suffix}")
+        tail = f"{ssl['method']}{ssl['epochs']}{px}{suffix}"
+        return {"name": f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{tail}",
+                "moe": "moe" if moe != "dense" else "dense",
+                "budget": tail.replace("_", "-")}
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
     # A warm start from an SSL / fine-tuned checkpoint is named after its
     # parent too (parent_tag), so paths 2 and 3 never share a directory.
     parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "ssl_init" else None
     parent = f"_{parent}" if parent else ""
-    return f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{norm}_{budget}{parent}{suffix}"
+    tail = f"{budget}{parent}{suffix}"
+    return {"name": f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{tail}",
+            "moe": "moe" if moe != "dense" else "dense",
+            "budget": tail.replace("_", "-")}
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1432,21 @@ def drop_removed_keys(cfg: dict) -> list:
     return dropped
 
 
+#: Keys this package used to have, and what became of them. ``assert_known_keys``
+#: prints the message instead of a did-you-mean, because "unknown config key
+#: model.norm_type — did you mean model.norm_eps?" is actively misleading when
+#: the real answer is that the axis was removed.
+#:
+#: This is a message map, NOT a migration engine: there are no checkpoints and
+#: no saved configs carrying these keys, so nothing needs rewriting — only
+#: explaining. If one ever turns up, the message names the key to hand-edit.
+REMOVED_KEYS = {
+    "model.norm_type": "RMSNorm was removed; LayerNorm is the only norm.",
+    "model.stage4_keeps_layernorm":
+        "only meaningful under RMSNorm, which was removed; LayerNorm is the only norm.",
+}
+
+
 def assert_known_keys(cfg: dict) -> None:
     """Reject config keys that do not exist in ``default_config()``.
 
@@ -1446,7 +1475,11 @@ def assert_known_keys(cfg: dict) -> None:
 
     unknown = walk(cfg)
     if unknown:
-        lines = [f"  {u}{_suggest(u, known)}" for u in sorted(unknown)]
+        def explain(u: str) -> str:
+            removed = REMOVED_KEYS.get(u)
+            return f" — {removed}" if removed else _suggest(u, known)
+
+        lines = [f"  {u}{explain(u)}" for u in sorted(unknown)]
         raise ValueError(
             "Unknown config key(s) — a typo here would silently do nothing:\n"
             + "\n".join(lines)
@@ -1475,7 +1508,7 @@ def validate_config(cfg: dict) -> dict:
     - resolves ``model.variant`` into depths / dims / heads / ratios /
       pretrained_hf_id as one set, rejecting disagreements (``apply_variant``)
     - applies the recipe preset to every field left as None (``apply_recipe``)
-    - checks enum fields (mode / norm_type / backend / dataset name)
+    - checks enum fields (mode / backend / dataset name)
     - derives dataset.num_classes from dataset.name
     - resolves moe/rope placements to their canonical list-of-lists form
     - derives run_name when unset
@@ -1495,8 +1528,6 @@ def validate_config(cfg: dict) -> dict:
         raise ValueError(f"mode={cfg['mode']!r} requires ckpt_path")
 
     model = cfg["model"]
-    if model["norm_type"] not in VALID_NORMS:
-        raise ValueError(f"norm_type must be one of {VALID_NORMS}, got {model['norm_type']!r}")
     if model["moe"]["backend"] not in VALID_BACKENDS:
         raise ValueError(
             f"moe.backend must be one of {VALID_BACKENDS}, got {model['moe']['backend']!r}"

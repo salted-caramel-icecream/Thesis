@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import math
 import os
+import pathlib
 import tempfile
 import types
 
@@ -230,8 +232,11 @@ def test_backbone_round_trip_paths_2_and_3_carry_the_chain():
         with tempfile.TemporaryDirectory() as d:
             # path 3: dense SimMIM encoder -> MoE fine-tune upcycles it
             dense = _quiet(LitSimMIM, _cfg(img=64, model={"ablation": ROPE}))
-            p3 = os.path.join(d, "sv1_custom_pass_r64_dense_rope-s4_ln_simmim200", "simmim_backbone.pt")
+            p3 = os.path.join(d, "sv1_custom_pass_r64_dense_rope-s4_simmim200", "simmim_backbone.pt")
             os.makedirs(os.path.dirname(p3))
+            # A real SSL run leaves results.json here too (build_ssl_trainer
+            # installs ResultsWriter); parent_tag reads the lineage from it.
+            _write_results(os.path.dirname(p3), "dense", "simmim200")
             _quiet(dense.save_backbone, p3)
             ck = torch.load(p3, map_location="cpu", weights_only=False)
             assert ck["method"] == "simmim" and ck["cfg"]["chain"] == ["simmim_pretrain@pass_r64"]
@@ -246,9 +251,10 @@ def test_backbone_round_trip_paths_2_and_3_carry_the_chain():
             assert cfg["run_name"].endswith("_sslft2_from-dense-simmim200")
             # path 2: MoE SimMIM encoder -> MoE fine-tune loads it as trained
             moe = _quiet(LitSimMIM, _cfg(img=64, model={"ablation": {**ROPE, **MOE}}))
-            p2 = os.path.join(d, "sv1_custom_pass_r64_moe-s4b1-e4k1+sh_rope-s4_ln_simmim200",
+            p2 = os.path.join(d, "sv1_custom_pass_r64_moe-s4b1-e4k1+sh_rope-s4_simmim200",
                               "simmim_backbone.pt")
             os.makedirs(os.path.dirname(p2))
+            _write_results(os.path.dirname(p2), "moe", "simmim200")
             _quiet(moe.save_backbone, p2)
             ck = torch.load(p2, map_location="cpu", weights_only=False)
             assert ck["cfg"]["chain"] == ["simmim_pretrain+moe@pass_r64"]
@@ -270,20 +276,57 @@ def test_backbone_round_trip_paths_2_and_3_carry_the_chain():
         undo()
 
 
-def test_parent_tag_reads_the_run_name_from_the_checkpoint_path():
-    assert parent_tag("/r/sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200/simmim_backbone.pt") == "from-dense-simmim200"
-    assert parent_tag("D:/r/sv1_b1_pass_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_simmim200-px/x.pt") == "from-moe-simmim200-px"
-    assert parent_tag("/r/sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_rope-s4b2_nodw_rms_sslft100_from-dense-simmim200/last.ckpt") \
-        == "from-moe-sslft100-from-dense-simmim200"
-    assert parent_tag("/x/simmim_backbone.pt") is None and parent_tag(None) is None
+def _write_results(dirpath, moe, budget):
+    """A minimal parent results.json: only the two fragments parent_tag reads."""
+    os.makedirs(dirpath, exist_ok=True)
+    with open(os.path.join(dirpath, "results.json"), "w", encoding="utf-8") as fh:
+        json.dump({"identity": {"name_moe": moe, "name_budget": budget}}, fh)
+    return os.path.join(dirpath, "last.ckpt")
+
+
+def test_parent_tag_reads_the_lineage_from_the_parents_results_json():
+    """parent_tag reads tokens the parent RECORDED, never its directory name.
+
+    The tag used to be recovered by splitting the parent directory on "_" and
+    hunting for the norm segment, which meant any change to the run-name
+    format silently broke lineage. It now reads identity.name_moe /
+    identity.name_budget out of results.json, which build_run_tag wrote.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = _write_results(os.path.join(d, "a_directory_name_nobody_parses"),
+                              "dense", "simmim200")
+        assert parent_tag(ckpt) == "from-dense-simmim200"
+
+        ckpt = _write_results(os.path.join(d, "whatever"), "moe",
+                              "sslft100-from-dense-simmim200")
+        assert parent_tag(ckpt) == "from-moe-sslft100-from-dense-simmim200"
+
+        # No results.json, an unreadable one, and no checkpoint at all: None,
+        # which validate_config turns into a "pass --run-name" warning.
+        assert parent_tag(os.path.join(d, "empty", "last.ckpt")) is None
+        assert parent_tag(None) is None
+        bad = os.path.join(d, "corrupt")
+        os.makedirs(bad)
+        pathlib.Path(bad, "results.json").write_text("{not json")
+        assert parent_tag(os.path.join(bad, "last.ckpt")) is None
+        # Present but missing the fields (a results.json from before this change)
+        partial = os.path.join(d, "partial")
+        os.makedirs(partial)
+        pathlib.Path(partial, "results.json").write_text('{"identity": {"seed": 42}}')
+        assert parent_tag(os.path.join(partial, "last.ckpt")) is None
+
+
+def test_a_warm_start_without_a_parent_tag_warns_and_keeps_the_bare_budget():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         c = validate_config(merge_config(default_config(), {"recipe": "ssl_finetune", "ckpt_path": "/x/b.pt",
                                                             "use_wandb": False}))
     assert "carries no parent tag" in buf.getvalue() and c["run_name"].endswith("_sslft100")
     # resume keeps the original name: no parent suffix
-    c = validate_config(merge_config(default_config(), {"mode": "resume", "use_wandb": False,
-                                                        "ckpt_path": "/r/sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200/last.ckpt"}))
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = _write_results(os.path.join(d, "parent"), "dense", "simmim200")
+        c = validate_config(merge_config(default_config(), {"mode": "resume", "use_wandb": False,
+                                                            "ckpt_path": ckpt}))
     assert "from-" not in c["run_name"]
 
 

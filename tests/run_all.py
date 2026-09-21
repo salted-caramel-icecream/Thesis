@@ -4,9 +4,7 @@ No pytest dependency — plain functions named ``test_*`` in ``test_*.py``
 files. Exits non-zero on any failure. These tests are the gate before ANY
 GPU run: if they fail, do not upload / launch training.
 
-Version guards: the suite runs on torch >= 2.3 (the RMSNorm fused kernel is
-exercised only when the local torch has it; the fallback is exercised
-otherwise — both paths are correct).
+The suite runs on torch >= 2.3.
 """
 
 from __future__ import annotations

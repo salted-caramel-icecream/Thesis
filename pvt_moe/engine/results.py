@@ -116,7 +116,7 @@ def run_identity(cfg: dict) -> dict:
         "epochs": cfg["ssl"]["epochs"] if cfg.get("task") == "ssl" else cfg["epochs"],
         "effective_batch_size": cfg.get("effective_batch_size"),
         "precision": cfg.get("precision"),
-        "norm": m["norm_type"], "dense_dwconv": m.get("dense_dwconv", True),
+        "dense_dwconv": m.get("dense_dwconv", True),
         # Stochastic depth leaves NO trace in the checkpoint (DropPath holds no
         # parameters and no buffers) and none in the run name, so this record
         # is the only place a resume can check it against — see
@@ -137,6 +137,16 @@ def run_identity(cfg: dict) -> dict:
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
+    # The two run-name fragments a CHILD run reads back through
+    # config.parent_tag to name its parent, recorded as tokens so nothing has
+    # to re-parse a directory name. See config.run_name_parts.
+    try:
+        from pvt_moe.config import run_name_parts
+
+        parts = run_name_parts(cfg)
+        ident["name_moe"], ident["name_budget"] = parts["moe"], parts["budget"]
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        pass
     if cfg.get("task") == "ssl":
         s = cfg["ssl"]
         ident["ssl"] = {"method": s["method"], "lr": s["lr"], "base_lr": s["base_lr"],

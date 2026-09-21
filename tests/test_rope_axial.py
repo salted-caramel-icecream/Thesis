@@ -1,41 +1,13 @@
-"""RMSNorm correctness + RoPE cache/rotation invariants."""
+"""Axial RoPE cache and rotation invariants.
+
+The mixed (learnable) path is tests/test_rope_mixed.py.
+"""
 
 from __future__ import annotations
 
 import torch
 
-from pvt_moe.models.norms import RMSNorm, build_norm_layers, rmsnorm_backend
 from pvt_moe.models.rope import RotaryEmbedding2D, apply_rotary_emb, compute_axial_cis
-
-
-def test_rmsnorm_matches_reference():
-    torch.manual_seed(0)
-    norm = RMSNorm(32, eps=1e-6)
-    with torch.no_grad():
-        norm.weight.copy_(torch.rand(32) + 0.5)
-    x = torch.randn(4, 7, 32)
-    ref = x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * norm.weight
-    out = norm(x)
-    assert torch.allclose(out, ref, atol=1e-5), (out - ref).abs().max()
-    print(f"  (backend: {rmsnorm_backend()})")
-
-
-def test_rmsnorm_has_no_bias():
-    norm = RMSNorm(16)
-    assert getattr(norm, "bias", None) is None
-    assert sum(p.numel() for p in norm.parameters()) == 16
-
-
-def test_norm_factory():
-    main, last = build_norm_layers("layernorm", 1e-6, True)
-    assert isinstance(main(8), torch.nn.LayerNorm) and isinstance(last(8), torch.nn.LayerNorm)
-
-    main, last = build_norm_layers("rmsnorm", 1e-6, True)
-    assert isinstance(main(8), RMSNorm)
-    assert isinstance(last(8), torch.nn.LayerNorm)  # stage-4 keeps LN
-
-    main, last = build_norm_layers("rmsnorm", 1e-6, False)
-    assert isinstance(last(8), RMSNorm)  # RMS everywhere
 
 
 def test_rope_cache_shape_and_dtype():

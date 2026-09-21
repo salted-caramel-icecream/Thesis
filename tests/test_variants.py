@@ -81,7 +81,7 @@ def test_default_is_b1_and_unchanged():
     assert m["ablation"]["moe_placement"] == [[], [], [], [1]]
     assert m["ablation"]["rope_placement"] == [[], [], [], [1]]
     assert m["drop_path_rate"] == 0.1
-    assert c["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
+    assert c["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90"
 
 
 # --- a variant is one coherent set -----------------------------------------
@@ -95,7 +95,7 @@ def test_variant_b2_sets_the_whole_set_together():
     assert m["mlp_ratios"] == [8, 8, 4, 4]
     assert m["sr_ratios"] == [8, 4, 2, 1]
     assert m["pretrained_hf_id"] == "OpenGVLab/pvt_v2_b2"
-    assert c["run_name"] == "sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_rope-s4b2_ln_scratch90"
+    assert c["run_name"] == "sv1_b2_in1k_r224_moe-s4b2-e4k1+sh_rope-s4b2_scratch90"
     p = _cli("--variant", "b2", "--recipe", "pretrained")
     assert p["model"]["pretrained_hf_id"] == "OpenGVLab/pvt_v2_b2"
     assert p["mode"] == "hf_pretrained"
@@ -245,7 +245,7 @@ def test_run_names_are_distinct_across_variants_and_carry_the_variant():
     for v, name in names.items():
         assert name.startswith(f"sv1_{v}_in1k_r224_"), name
     # Everything after the variant is the familiar scheme.
-    assert names["b1"].split("_", 2)[2] == "in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90"
+    assert names["b1"].split("_", 2)[2] == "in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90"
     assert build_run_tag(_cfg(model={"variant": "b2"}, recipe="pretrained")).endswith("_ft100")
 
 

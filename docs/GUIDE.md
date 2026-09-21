@@ -357,7 +357,6 @@ name the base LR, the batch it was scaled by and the result.
 | RoPE flavour | `--rope-mode mixed\|axial` (mixed = learnable RoPE-Mixed, default; axial = fixed, run tag `-ax`) | `ablation.rope_mode` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
-| norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
 | MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
@@ -588,21 +587,21 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
+same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
 The `r224` field is the input resolution (`dataset.img_size`). It arrived with
 the SSL chain, so a run directory created before that merge is named without
-it: `sv1_b1_in1k_dense_norope_ln_scratch300`, where the same config now derives
-`sv1_b1_in1k_r224_dense_norope_ln_scratch300`. `--resume-from` keeps the derived
+it: `sv1_b1_in1k_dense_norope_scratch300`, where the same config now derives
+`sv1_b1_in1k_r224_dense_norope_scratch300`. `--resume-from` keeps the derived
 name, so a bare resume would load the old `last.ckpt` but write every later
 checkpoint, `results.json` and W&B row into the new directory. Keep the old one
 by passing its name explicitly:
 
 ```bash
 python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml \
-    --run-name sv1_b1_in1k_dense_norope_ln_scratch300 \
-    --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_ln_scratch300/last.ckpt
+    --run-name sv1_b1_in1k_dense_norope_scratch300 \
+    --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_scratch300/last.ckpt
 ```
 
 Check with `--dry-run` first: the printed `run:` line must show the old name.

@@ -42,7 +42,6 @@ from pvt_moe.config import (
     VALID_BACKENDS,
     VALID_MASK_SPACES,
     VALID_MODES,
-    VALID_NORMS,
     VALID_RECIPES,
     VALID_ROPE_MODES,
     VALID_SSL_METHODS,
@@ -149,7 +148,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "heads, mlp/sr ratios and the pretrained HF checkpoint "
                         "as one set; explicit values that disagree are rejected. "
                         "custom = hand-tune them via --set / a config file")
-    g.add_argument("--norm", choices=VALID_NORMS, dest="norm_type")
     _bool_pair(g, "moe", "use_moe", "enable MoE (--no-moe for the dense arm)")
     _bool_pair(g, "rope", "use_rope", "enable RoPE (--no-rope to disable)")
     _bool_pair(g, "dwconv", "dense_dwconv",
@@ -376,7 +374,6 @@ _FLAG_PATHS = {
     "grad_clip": "optim.grad_clip",
     "stage4_lr_multiplier": "optim.stage4_lr_multiplier",
     "drop_path_rate": "model.drop_path_rate",
-    "norm_type": "model.norm_type",
     "dense_dwconv": "model.dense_dwconv",
     "moe_block_dwconv": "model.moe.moe_block_dwconv",
     "use_moe": "model.ablation.use_moe",
@@ -527,7 +524,7 @@ def describe(cfg: dict) -> str:
             f"| clip {o['grad_clip']} | stage4 LR x{o['stage4_lr_multiplier']} "
             f"| layer_decay {o['layer_decay']}")
         lines.append(
-            f"  drop_path {m['drop_path_rate']} | norm {m['norm_type']} "
+            f"  drop_path {m['drop_path_rate']} "
             f"| dense_dwconv {m['dense_dwconv']} | {cfg['dataset']['name']} "
             f"@ {cfg['dataset']['img_size']}px"
             + (f" | subset {cfg['dataset']['subset_file']}" if cfg["dataset"].get("subset_file") else ""))

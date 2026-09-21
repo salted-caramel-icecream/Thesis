@@ -622,7 +622,7 @@ def test_saved_config_rederives_run_name_and_theta():
         saved = json.load(open(path))
         assert saved["run_name"] is None and saved["model"]["ablation"]["rope_theta"] is None
         c = _cli("--config", path, "--rope-mode", "axial")
-        assert c["run_name"].endswith("rope-s4b1-ax_ln_scratch90") and c["model"]["ablation"]["rope_theta"] == 50.0
+        assert c["run_name"].endswith("rope-s4b1-ax_scratch90") and c["model"]["ablation"]["rope_theta"] == 50.0
         # an explicit run name survives the round trip
         assert main(["--dry-run", "--no-wandb", "--run-name", "mine", "--save-config", path]) == 0
         assert json.load(open(path))["run_name"] == "mine"

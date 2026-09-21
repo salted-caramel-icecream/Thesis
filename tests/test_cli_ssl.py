@@ -20,12 +20,25 @@ def _cfg(argv, verbose=False):
         return build_config(build_parser().parse_args([*argv, "--no-wandb"]), verbose=verbose)
 
 
+def _parent_run(root, name, moe, budget, leaf="simmim_backbone.pt"):
+    """A parent run directory as a real run leaves it: the checkpoint plus the
+    results.json ResultsWriter refreshes every epoch. parent_tag reads the
+    lineage out of that file, not out of the directory name."""
+    d = os.path.join(root, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "results.json"), "w", encoding="utf-8") as fh:
+        json.dump({"identity": {"name_moe": moe, "name_budget": budget}}, fh)
+    path = os.path.join(d, leaf)
+    open(path, "wb").close()
+    return path
+
+
 def test_task_ssl_defaults_to_dense_simmim_and_epochs_mean_pretraining_epochs():
     c = _cfg(["--task", "ssl", "--dataset", "pass"])
     assert c["task"] == "ssl" and c["ssl"]["method"] == "simmim" and c["ssl"]["epochs"] == 200
     assert c["model"]["ablation"]["use_moe"] is False and c["model"]["drop_path_rate"] == 0.0
     assert c["ssl"]["lr"] == 2e-4 * 1024 / 512 and c["ssl"]["mask_space"] == "token"
-    assert c["run_name"] == "sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200"
+    assert c["run_name"] == "sv1_b1_pass_r224_dense_rope-s4b1_simmim200"
     assert c["chain"] == ["simmim_pretrain@pass_r224"] and c["_eval_only"] is False
     c = _cfg(["--task", "ssl", "--dataset", "pass", "--epochs", "100", "--mask-space", "pixel",
               "--mask-ratio", "0.5", "--base-lr", "1e-4"])
@@ -51,16 +64,18 @@ def test_moe_pretraining_needs_an_explicit_ask():
 
 
 def test_chained_recipes_resolve_their_documented_values():
-    c = _cfg(["--recipe", "ssl_finetune", "--ckpt", "/r/sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200/simmim_backbone.pt"])
-    # 10, not the reference yaml's 20: SimMIM section 4.1's ablation protocol
-    # ("100-epoch training, and a cosine learning rate scheduler with 10-epoch
-    # warm-up") is the setting this chain reproduces; 20 is its 800-epoch
-    # scaling config. docs/HPARAMS.md section 3b records both.
-    assert c["mode"] == "ssl_init" and c["epochs"] == 100 and c["optim"]["warmup_epochs"] == 10
-    assert c["optim"]["base_lr"] == 1.25e-3 and c["optim"]["lr"] == 1.25e-3 * 1024 / 512
-    assert c["optim"]["layer_decay"] == 0.9 and c["model"]["drop_path_rate"] == 0.1
-    assert c["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_sslft100_from-dense-simmim200"
-    assert "[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03" in describe(c)
+    with tempfile.TemporaryDirectory() as d:
+        ckpt = _parent_run(d, "sv1_b1_pass_r224_dense_rope-s4b1_simmim200", "dense", "simmim200")
+        c = _cfg(["--recipe", "ssl_finetune", "--ckpt", ckpt])
+        # 10, not the reference yaml's 20: SimMIM section 4.1's ablation
+        # protocol ("100-epoch training, and a cosine learning rate scheduler
+        # with 10-epoch warm-up") is the setting this chain reproduces; 20 is
+        # its 800-epoch scaling config. docs/HPARAMS.md section 3b records both.
+        assert c["mode"] == "ssl_init" and c["epochs"] == 100 and c["optim"]["warmup_epochs"] == 10
+        assert c["optim"]["base_lr"] == 1.25e-3 and c["optim"]["lr"] == 1.25e-3 * 1024 / 512
+        assert c["optim"]["layer_decay"] == 0.9 and c["model"]["drop_path_rate"] == 0.1
+        assert c["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_sslft100_from-dense-simmim200"
+        assert "[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03" in describe(c)
     c = _cfg(["--recipe", "ssl_finetune", "--ckpt", "/x.pt", "--layer-decay", "0.8", "--lr", "1e-3", "--no-moe"])
     assert c["optim"]["layer_decay"] == 0.8 and c["optim"]["lr"] == 1e-3     # explicit lr bypasses the rule
     c = _cfg(["--recipe", "downstream", "--dataset", "pathmnist", "--ckpt", "/x/last.ckpt",
@@ -75,7 +90,8 @@ def test_documented_commands_pass_dry_run():
         ["--task", "ssl", "--dataset", "pass", "--moe"],
         ["--task", "ssl", "--dataset", "pass", "--mask-space", "pixel"],
         ["--task", "ssl", "--dataset", "imagenet-1k", "--ssl-method", "jepa", "--epochs", "100"],
-        ["--recipe", "ssl_finetune", "--ckpt", "/r/sv1_b1_pass_r224_dense_rope-s4b1_ln_simmim200/simmim_backbone.pt"],
+        # no results.json at these paths: exercises the "pass --run-name" warning
+        ["--recipe", "ssl_finetune", "--ckpt", "/r/sv1_b1_pass_r224_dense_rope-s4b1_simmim200/simmim_backbone.pt"],
         ["--recipe", "ssl_finetune", "--ckpt", "/r/x/simmim_backbone.pt", "--no-moe"],
         ["--recipe", "downstream", "--dataset", "eurosat", "--ckpt", "/r/x/last.ckpt"],
         ["--recipe", "downstream", "--dataset", "fashionmnist", "--ckpt", "/r/x/last.ckpt", "--variant", "b2"],
