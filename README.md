@@ -9,14 +9,12 @@ where each cell ended up.
 
 ```
 pvt_moe/        the package — ALL logic lives here
-PVT_Tutelmoe_v12_standalone.ipynb
-                the v9 notebook patched in place — SELF-CONTAINED, no
-                dependency on pvt_moe/ (verify: python tests/verify_patched_notebook.py)
-archive/        the original v9 notebook, unmaintained, kept for provenance
-notebooks/      thin launchers — v11_train.ipynb is the current supervised
-                one; 03_ssl_pretrain.ipynb is SSL pretraining (SimMIM / JEPA);
-                quick_bench.ipynb times a few epochs on this machine;
-                01 supervised/Tutel and 02 MegaBlocks are older
+archive/        the v9/v10 notebooks and the process documents that recorded
+                how they became the package; unmaintained, kept for provenance
+notebooks/      thin launchers — v11_train.ipynb trains from a checkout,
+                colab_train.ipynb from a pip install, 03_ssl_pretrain.ipynb is
+                SSL pretraining (SimMIM / JEPA), quick_bench.ipynb times a few
+                epochs on this machine
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
                 scratch_NN_*.yaml        the 90-epoch ladder rows
@@ -302,14 +300,12 @@ its checkpoint directory or W&B name: `--run-suffix v2`.
 
 ## Or use a notebook
 
-Three, for different purposes:
-
 | | |
 |---|---|
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/` from a checkout. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
+| `notebooks/colab_train.ipynb` | the same, on a machine with **no checkout**: `pip install git+<repo>@<sha>` at a pinned commit, then the same CLI. |
 | `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
-| `PVT_Tutelmoe_v12_standalone.ipynb` | **generated from `pvt_moe/`** by `tools/make_v12_notebook.py` — self-contained (no package import), each code cell a package file inlined verbatim, with "Δ since v10" cells striking through the old lines. Regenerate after package changes; verified by `tests/verify_v12_notebook.py`. |
-| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes) — frozen provenance; superseded by v12. |
+| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes) — frozen provenance, unmaintained. |
 
 The patched v10 carries these fixes into its own class definitions
 (each marked `v10 PATCH`):
