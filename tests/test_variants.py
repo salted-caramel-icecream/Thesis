@@ -226,12 +226,26 @@ def test_ladder_rows_land_on_the_last_block_under_b2():
             _assert_last_block_placements(c, f"{recipe} row {row}")
 
 
-def test_shipped_yaml_configs_land_on_the_last_block_under_b2():
-    # shipped_config_files() skips the gitignored *.local.yaml machine-path
-    # files: alone they resolve to the default arm and may collide with a row.
-    files = shipped_config_files()
-    assert len(files) >= 20, files
-    for f in files:
+def test_every_ladder_row_lands_on_the_last_block_under_b2():
+    """-1 in a placement means "the stage's last block" for ANY variant, so
+    every ladder row must still land on a real block when the depths change.
+
+    Swept over LADDERS rather than configs/*.yaml: the ladder is the only
+    definition of the arms now, and the files are three examples.
+    """
+    from pvt_moe.config import LADDERS
+
+    rows = 0
+    for recipe, table in LADDERS.items():
+        for row in table:
+            c = _cli("--recipe", recipe, "--ladder", str(row), "--variant", "b2")
+            assert c["model"]["depths"] == [3, 4, 6, 3], (recipe, row)
+            _assert_last_block_placements(c, f"{recipe} ladder row {row}")
+            rows += 1
+    assert rows >= 18, rows
+
+    # and the three shipped examples, which are configs a person may copy
+    for f in shipped_config_files():
         c = _cli("--config", f, "--variant", "b2")
         assert c["model"]["depths"] == [3, 4, 6, 3], f
         _assert_last_block_placements(c, f)

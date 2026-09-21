@@ -1,0 +1,31 @@
+# EXAMPLE — the file shape, not an arm anyone is expected to run.
+#
+# An ablation arm is a COMMAND LINE, not a file. `--ladder N` picks a
+# spec-defined architecture row (docs/HPARAMS.md §4) and the budget flags are
+# independent of it, so a new budget costs no new file:
+#
+#   python train.py --recipe scratch --ladder 3                     # 90 epochs
+#   python train.py --recipe scratch --ladder 3 --epochs 300        # same arm, 300
+#   python train.py --recipe scratch --ladder 3 --epochs 5 \
+#                   --set wandb_project=pvt-moe-bench               # a timing smoke run
+#
+# This file is what a config looks like when you genuinely need one: a machine
+# with unusual paths, or an arm the ladder does not name. It is the equivalent
+# of `--recipe scratch --ladder 3`.
+#
+# Precedence, lowest to highest:
+#   default_config() < --config (repeatable, later wins) < --ladder < flags < --set
+# so `--config this.yaml --epochs 300` works and the flag wins.
+
+recipe: "scratch"
+epochs: 90
+
+model:
+  moe:
+    num_experts: 4
+    shared_expert: false
+  ablation:
+    use_moe: true
+    # per-stage lists of block indices; -1 = the stage's last block, whatever
+    # the variant. [[], [], [], [-1]] is stage 4's last block only.
+    moe_placement: [[], [], [], [-1]]

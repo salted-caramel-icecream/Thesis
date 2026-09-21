@@ -330,22 +330,42 @@ def test_config_errors_exit_2_instead_of_raising():
 
 # --- config files, data dirs, resume ---------------------------------------
 
-def test_every_shipped_config_file_resolves():
-    """configs/*.yaml are the ablation arms — all must build a valid config
-    and none may collide on run_name (that would share a checkpoint dir)."""
+def test_every_ladder_row_resolves_to_a_distinct_run_name():
+    """The LADDERS table is the only definition of the ablation arms, so the
+    sweep belongs here rather than over configs/*.yaml.
+
+    configs/ used to hold 42 files that were, measured, byte-identical to
+    `--recipe X --ladder N` plus budget flags — two encodings of one matrix,
+    with nothing asserting they agreed. Now an arm is a command line and the
+    files are three annotated examples.
+
+    Two rows colliding on run_name would mean two arms sharing a checkpoint
+    directory, which is the failure this guards.
+    """
+    from pvt_moe.config import LADDERS
+
+    names = {}
+    for recipe, rows in LADDERS.items():
+        for row in rows:
+            cfg = _cfg("--recipe", recipe, "--ladder", str(row))
+            names.setdefault(cfg["run_name"], []).append(f"{recipe}/{row}")
+    dupes = {k: v for k, v in names.items() if len(v) > 1}
+    # Row 5 is "best config": it sets only the 300-epoch budget, so it
+    # legitimately matches whatever architecture the defaults give.
+    dupes = {k: v for k, v in dupes.items() if not all(r.endswith("/5") for r in v)}
+    assert not dupes, f"ladder rows collide on run_name: {dupes}"
+
+
+def test_the_example_configs_resolve():
+    """configs/ holds annotated EXAMPLES now, not arms. They still have to be
+    valid, or the thing being demonstrated is wrong."""
     from pvt_moe.cli import load_config_file, shipped_config_files
 
-    # shipped_config_files() skips the gitignored *.local.yaml machine-path
-    # files: alone they resolve to the default arm and may collide with a row.
     files = shipped_config_files()
-    assert len(files) >= 18, f"expected the full ladder, found {len(files)}"
-    names = {}
+    assert len(files) == 3, f"expected the three examples, found {files}"
     for f in files:
         assert load_config_file(f), f
-        cfg = _cfg("--config", f)
-        names.setdefault(cfg["run_name"], []).append(pathlib.Path(f).name)
-    dupes = {k: v for k, v in names.items() if len(v) > 1}
-    assert not dupes, f"config files collide on run_name: {dupes}"
+        assert _cfg("--config", f)["run_name"]
 
 
 def test_two_config_files_compose_in_order_and_later_wins():
@@ -380,10 +400,10 @@ def test_two_config_files_compose_in_order_and_later_wins():
 
 def test_local_config_files_are_excluded_from_the_shipped_sweep():
     """A gitignored configs/*.local.yaml holds only machine paths, so alone it
-    resolves to the default arm and collides with scratch_04 on run_name. The
-    shipped-config sweeps must skip it instead of failing the suite. The
-    exclusion lives in pvt_moe.cli (is_local_config / shipped_config_files),
-    which both sweeps use, so this fails against a cli.py without it."""
+    resolves to the default arm. The shipped-config sweeps must skip it
+    instead of picking it up. The exclusion lives in pvt_moe.cli
+    (is_local_config / shipped_config_files), which both sweeps use, so this
+    fails against a cli.py without it."""
     import test_variants
     from pvt_moe.cli import is_local_config, shipped_config_files
 
@@ -393,23 +413,22 @@ def test_local_config_files_are_excluded_from_the_shipped_sweep():
         "dataset:\n  arrow_dirs:\n    imagenet-1k: /tmp/wf_arrow\n"
         "checkpoint_root: /tmp/wf_ckpt\nlog_root: /tmp/wf_logs\n")
     try:
-        # It collides with row 4 by construction ...
-        assert _cfg("--config", str(local))["run_name"] == \
-            _cfg("--config", "configs/scratch_04_moe_shared.yaml")["run_name"]
+        # Paths only, so alone it resolves to the default arm ...
+        assert _cfg("--config", str(local))["run_name"] == _cfg()["run_name"]
         # ... is recognised as machine-local and left out of the shipped list
-        # (which still holds every real arm) ...
+        # (which still holds the committed examples) ...
         assert is_local_config(local) and is_local_config(str(local))
-        assert not is_local_config("configs/scratch_04_moe_shared.yaml")
+        assert not is_local_config("configs/example_scratch.yaml")
         assert str(local) not in shipped_config_files()
-        assert "configs/scratch_04_moe_shared.yaml" in shipped_config_files()
+        assert "configs/example_scratch.yaml" in shipped_config_files()
         # (every machine-local file is excluded, not just this fixture: a
         # developer's own my_paths.local.yaml must not fail the gate)
         assert shipped_config_files() == sorted(
             str(f) for f in pathlib.Path("configs").glob("*.yaml")
             if not is_local_config(f))
         # ... and both sweeps must still pass with it present.
-        test_every_shipped_config_file_resolves()
-        test_variants.test_shipped_yaml_configs_land_on_the_last_block_under_b2()
+        test_the_example_configs_resolve()
+        test_variants.test_every_ladder_row_lands_on_the_last_block_under_b2()
     finally:
         local.unlink()
 
@@ -462,7 +481,7 @@ def test_local_configs_are_gitignored():
     for ext in ("yaml", "yml", "json"):
         assert f"configs/*.local.{ext}" in active, ext
         assert is_local_config(f"configs/my_paths.local.{ext}"), ext
-    assert not is_local_config("configs/scratch_01_baseline_conv_ffn.yaml")
+    assert not is_local_config("configs/example_scratch.yaml")
     assert not is_local_config("configs/notes.local.txt")
 
 

@@ -15,7 +15,9 @@ notebooks/      thin launchers — v11_train.ipynb trains from a checkout,
                 colab_train.ipynb from a pip install, quick_bench.ipynb times
                 a few epochs on this machine
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
-configs/        one YAML per ablation arm (--config configs/xxx.yaml)
+configs/        three annotated EXAMPLES — an arm is a command line, not a
+                file (see scripts/run_ladder.sh)
+scripts/        run_ladder.sh — the whole ladder, one row per invocation
                 scratch_NN_*.yaml        the 90-epoch ladder rows
                 *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
                 bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
@@ -207,19 +209,24 @@ python train.py --recipe scratch --epochs 300 \
 
 ```bash
 # Linux / WSL2 / macOS
-for f in configs/scratch_0*.yaml; do
-    case "$f" in *_300ep_stop100.yaml) continue ;; esac   # ladder rows only
-    python train.py --config "$f" --data-dir /data/imagenet_arrow || break
-done
+scripts/run_ladder.sh scratch                  # rows 1-9 at 90 epochs
+scripts/run_ladder.sh scratch 300              # the same rows at 300
+scripts/run_ladder.sh scratch 90 3 4 7         # only rows 3, 4 and 7
+DRY_RUN=1 scripts/run_ladder.sh scratch        # resolve and print, train nothing
 ```
 ```powershell
 # Windows — D: is only an example; substitute your own drive
-foreach ($f in Get-ChildItem configs/scratch_0*.yaml |
-                Where-Object { $_.Name -notlike '*_300ep_stop100.yaml' }) {   # ladder rows only
-    python train.py --config $f.FullName --data-dir D:/data/imagenet_arrow
+foreach ($row in 1,2,3,4,6,7,8,9) {
+    python train.py --recipe scratch --ladder $row --data-dir D:/data/imagenet_arrow
     if ($LASTEXITCODE -ne 0) { break }
 }
 ```
+
+The budget is a flag, not a file: `--epochs 300` reruns the same arm on a
+300-epoch schedule, and `--epochs 5 --set wandb_project=pvt-moe-bench` makes
+it a timing smoke run. Rows 10-12 of the scratch ladder are row 4 crossed with
+two binary flags — `--ladder 4 --no-rope`, `--ladder 4 --no-moe-dwconv`,
+`--ladder 4 --no-moe-dwconv --no-rope` — so they need no rows of their own.
 
 The guard matters: every scratch arm also ships a `_300ep_stop100` sibling
 that matches the same glob, and those are 300-epoch schedules — without the
@@ -239,10 +246,10 @@ the first step: the run name printed at start-up begins `sv1_b2_`.
 
 | GPU | arm | command | run name |
 |---|---|---|---|
-| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_scratch90` |
-| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
-| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
-| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
+| 0 | dense baseline | `--recipe scratch --ladder 1` | `sv1_b2_in1k_r224_dense_norope_scratch90` |
+| 1 | MoE E=4 | `--recipe scratch --ladder 3` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
+| 2 | MoE E=8 | `--recipe scratch --ladder 3 --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--recipe scratch --ladder 8 --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -255,10 +262,10 @@ placement.
 COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
         --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
 
-CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
-CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
-CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
-CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert $COMMON
+CUDA_VISIBLE_DEVICES=0 python train.py --recipe scratch --ladder 1 $COMMON
+CUDA_VISIBLE_DEVICES=1 python train.py --recipe scratch --ladder 3 $COMMON
+CUDA_VISIBLE_DEVICES=2 python train.py --recipe scratch --ladder 3 --experts 8 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --recipe scratch --ladder 8 --experts 8 --no-shared-expert $COMMON
 ```
 
 `drop_path` resolves to 0.1 on all four (the variant's official rate). All four
@@ -347,8 +354,8 @@ python train.py --no-moe --no-dwconv --rope            # a dense ablation arm
 python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
-python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
-python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm (create the .local file first)
+python train.py --recipe scratch --ladder 4            # one ablation arm
+python train.py --config configs/my_paths.local.yaml --recipe scratch --ladder 1  # machine paths + arm (create the .local file first)
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)

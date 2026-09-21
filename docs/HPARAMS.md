@@ -316,7 +316,20 @@ control and appends `-ax` to the rope fragment:
 | neither | `--no-moe-dwconv --no-rope` | `+sh-plain_norope` |
 | both, fixed axial RoPE | `--moe-dwconv --rope --rope-mode axial` | `+sh_rope-s4b1-ax` |
 
-Ready-made: `configs/scratch_10..12_*.yaml`.
+These are the old ladder "rows 10-12", and they are deliberately NOT rows:
+they are row 4 crossed with two binary flags, so adding them to `LADDERS`
+would rebuild the same permutation explosion the config files had (the next
+cross, x `--rope-mode axial`, would want rows 13-18). Run them as:
+
+```bash
+python train.py --recipe scratch --ladder 4 --no-rope              # was row 10
+python train.py --recipe scratch --ladder 4 --no-moe-dwconv        # was row 11
+python train.py --recipe scratch --ladder 4 --no-moe-dwconv --no-rope   # was row 12
+```
+
+Each differs from the retired YAML in `rope_placement` alone, which
+`build_model` never reads when `use_rope` is False — same model, same run
+name (verified across all 42 retired files).
 
 "Neither" is not degenerate. PVT v2 has no learned or sinusoidal position
 embedding, but its zero-padded patch-embed convs leak absolute position

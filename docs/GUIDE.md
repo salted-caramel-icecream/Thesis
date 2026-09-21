@@ -201,19 +201,18 @@ Then **compose** it with an ablation arm — `--config` may be repeated, the
 files merge in order and a later file wins on any key both set:
 
 ```bash
-python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml
+python train.py --config configs/my_paths.local.yaml --recipe scratch --ladder 1
 ```
 
 This is the one documented command that needs a file you create first: from
 a clean checkout it stops with `error: --config file not found`, by design.
 
 Never run the paths file alone. It sets no architecture, so alone it resolves
-to the default arm and gets the same `run_name` as
-`configs/scratch_04_moe_shared.yaml` (row 4) — it would write into row 4's
-checkpoint directory. Because a `*.local.yaml` can collide with a ladder row
-like that by construction, the test suite's shipped-config sweep
-(`tests/test_cli.py`, `tests/test_variants.py`) skips `*.local.yaml`; the
-shipped `configs/*.yaml` arms are still checked for run-name collisions.
+to the default arm — ladder row 4 — and would write into that run's
+checkpoint directory. Because a `*.local.yaml` collides with a ladder row like
+that by construction, `shipped_config_files()` excludes `*.local.yaml` and the
+test suite sweeps the **ladder** for run-name collisions
+(`tests/test_cli.py`, `tests/test_variants.py`).
 
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
@@ -335,15 +334,20 @@ without training; `--print-config` dumps the resolved JSON.
 
 ### Ablation arms
 
-Each row of the ladder in `docs/HPARAMS.md` §4 ships as a config file:
+An arm is a **command line**, not a file. `--ladder N` applies the row from
+`docs/HPARAMS.md` §4 and prints what it set:
 
 ```bash
-python train.py --config configs/scratch_04_moe_shared.yaml
-for f in configs/scratch_0*.yaml; do python train.py --config "$f"; done
+python train.py --recipe scratch --ladder 4
+scripts/run_ladder.sh scratch                  # rows 1-9
 ```
 
-Equivalently `--ladder 4`, which also prints what it set. Every arm gets a
-distinct run name, so none can overwrite another's checkpoints.
+Every row gets a distinct run name, so none can overwrite another's
+checkpoints — the test suite asserts that over the whole table.
+
+`configs/` holds three annotated examples of the file format, for when you do
+want a file (an arm the ladder does not name, or machine paths). They are not
+arms anyone is expected to run.
 
 ---
 
@@ -397,12 +401,14 @@ budget, and a `_300ep_stop100` sibling that builds the cosine for 300 and
 stops at 100.
 
 ```bash
-python train.py --config configs/scratch_01_baseline_conv_ffn.yaml            # 90 ep
-python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
+python train.py --recipe scratch --ladder 1                          # 90 ep
+python train.py --recipe scratch --ladder 1 --epochs 300 --stop-at 100 \
+                --milestones "[100,150,200,300]"                     # 300-ep cosine, stop at 100
 ```
 
-The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
-`[100, 150, 200, 300]`, so a resume needs no edit. Two consequences:
+The budget is orthogonal to the arm, so it is flags rather than a second file
+per row. Milestones at `[100, 150, 200, 300]` mean a resume needs no edit.
+Two consequences:
 
 - Stochastic depth is **unchanged by the budget**: it is the variant's
   official rate (0.1 for b0–b2), the same as the 90-epoch rows, so the budget
@@ -411,36 +417,32 @@ The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
 - Run names end in `_scratch300` rather than `_scratch90`, so the two budgets
   never share a checkpoint directory or a W&B name.
 
-Ladder row 4 has **no** `_300ep_stop100` file: row 4 is the default
-architecture, so row 4 at 300 epochs *is* row 5, byte for byte. Stop it at 100
-with the flag instead, and the resume continues the same directory:
+Row 4 at 300 epochs *is* row 5, byte for byte: row 4 is the default
+architecture and row 5 sets only the 300-epoch budget.
 
 ```bash
-python train.py --config configs/scratch_05_final_300ep.yaml --stop-at 100
+python train.py --recipe scratch --ladder 5 --stop-at 100
 ```
 
 ### 5-epoch timing / smoke runs
 
-`configs/bench_*_5ep.yaml` mirrors each scratch arm at a 5-epoch budget with
-validation and logging on, for measuring per-epoch wall clock and proving an
-arm builds, trains and logs before a long run is launched. They log to the
-`pvt-moe-bench` W&B project, never next to thesis results.
-
-`--variant` is a flag, so one file covers every size and each size gets its
-own run name:
+Any arm at a 5-epoch budget, with validation and logging on, measures real
+per-epoch wall clock and proves the arm builds, trains and logs before a long
+run is launched. Send them to a separate W&B project so smoke runs never land
+next to thesis results:
 
 ```bash
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b0
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b1
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b2
+python train.py --recipe scratch --ladder 4 --epochs 5 \
+                --set wandb_project=pvt-moe-bench --variant b0
 ```
 
-The whole matrix, 11 arms x 3 sizes = 33 runs:
+The whole matrix, 8 rows x 3 sizes = 24 runs:
 
 ```bash
 for v in b0 b1 b2; do
-  for c in configs/bench_*_5ep.yaml; do
-    python train.py --config "$c" --variant "$v"
+  for row in 1 2 3 4 6 7 8 9; do
+    python train.py --recipe scratch --ladder "$row" --epochs 5 \
+                    --set wandb_project=pvt-moe-bench --variant "$v"
   done
 done
 ```
@@ -491,9 +493,8 @@ an RTX 5090 with 24 cores on the **full** snapshot, batch 128, B1 dense:
 | real training | 2,287 | 9.3 min/epoch, GPU-bound |
 
 It varies **one** axis at a time, though: `USE_MOE` is a single switch and the
-size is fixed per run. To time every arm instead, use the
-`configs/bench_*_5ep.yaml` sweep above, which logs each arm under its own run
-name.
+size is fixed per run. To time every arm instead, use the 5-epoch ladder
+sweep above, which logs each arm under its own run name.
 
 ---
 
@@ -555,7 +556,7 @@ checkpoint, `results.json` and W&B row into the new directory. Keep the old one
 by passing its name explicitly:
 
 ```bash
-python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml \
+python train.py --recipe scratch --ladder 1 --epochs 300 --stop-at 100 \
     --run-name sv1_b1_in1k_dense_norope_scratch300 \
     --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_scratch300/last.ckpt
 ```
