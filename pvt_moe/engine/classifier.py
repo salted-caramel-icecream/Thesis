@@ -4,14 +4,19 @@ Carries the v9 lineage's load-bearing training semantics:
 
 - **Aux loss handling**: model returns ``(logits, aux)`` with aux already
   averaged over MoE blocks; here it is clamped (spike guard), weighted by
-  ``loss.aux_weight``, added to the CE loss, and dropped for the step if the
-  total goes NaN/Inf.
+  ``loss.aux_weight`` and added to the CE loss. A non-finite total **raises**
+  ``FloatingPointError`` naming both terms. It used to fall back to plain CE
+  for that step, which could only ever hide a non-finite *aux* — a bad CE
+  survived the fallback unchanged — so the one thing it did was mask router
+  instability, silently and untested. ``pvt_moe.ssl.simmim`` keeps the same
+  semantics with ``recon`` in place of ``ce``; that parity is a documentation
+  claim, not shared code.
 - **Tutel gate train-forcing**: Tutel gate modules revert themselves to eval
   mode after Lightning's validation pass, silently disabling ``gate_noise``
   (and with it the exploration that keeps experts balanced). ``train()`` is
   overridden and ``on_train_epoch_start`` re-forces every gate. Do not
-  remove. (The native backend needs none of this — plain ``self.training``
-  loss registry.)
+  remove. (The native backend needs none of this: its gate reads
+  ``self.training`` directly.)
 - **Discriminative LR + weight-decay hygiene**: 4 parameter groups —
   {stages 1-3, stage 4 + head} x {decay, no-decay}, where the no-decay split
   is the timm rule (``p.ndim <= 1``: biases and all norm weights).
@@ -349,11 +354,21 @@ class LitClassifier(pl.LightningModule):
         if aux is not None:
             aux = torch.clamp(aux, max=self.aux_clamp)  # load-balancing spike guard
             loss = ce_loss + self.aux_weight * aux
-            if torch.isnan(loss) or torch.isinf(loss):
-                loss = ce_loss  # drop aux for this step rather than poison the run
         else:
-            loss = ce_loss
             aux = torch.zeros((), device=logits.device)
+            loss = ce_loss
+
+        # One check after the branch, so a non-finite CE fails too. The guard
+        # this replaced lived INSIDE the aux branch and fell back to ce_loss,
+        # which left a non-finite CE untouched — it could only ever hide a bad
+        # aux, i.e. exactly the router divergence worth stopping for.
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"non-finite training loss at batch {batch_idx}: "
+                f"total={loss.item()} ce={ce_loss.item():.6g} aux={aux.item():.6g} "
+                f"(aux clamped at {self.aux_clamp}, weight {self.aux_weight}). "
+                f"A non-finite aux is the router gate diverging; a non-finite ce "
+                f"is the model or the data.")
 
         self.log("train_loss_step", loss, on_step=True, on_epoch=False)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)

@@ -156,9 +156,14 @@ lineage several failed runs to get right):
 1. Every MoE block returns `(x, aux)` from its own forward.
 2. `forward_features` **averages** aux over the number of MoE blocks.
 3. The model returns `(logits, aux)` — `aux is None` iff no MoE block ran.
-4. The training loop (never the model) clamps aux at `loss.aux_clamp`,
-   weights it by `loss.aux_weight`, and drops it for the step if the total
-   loss goes NaN/Inf.
+4. The training loop (never the model) clamps aux at `loss.aux_clamp` and
+   weights it by `loss.aux_weight`. A non-finite total **raises**
+   `FloatingPointError` naming both terms — it does not fall back to CE. The
+   old fallback sat inside the `aux is not None` branch and returned
+   `ce_loss`, so a non-finite CE passed through unchanged: the only thing it
+   could ever hide was a diverging router. A sweep script can catch
+   `FloatingPointError` to mark one arm diverged and continue, while a real
+   crash still stops everything.
 
 **INVARIANT — Tutel gates revert to eval.** After every Lightning validation
 pass, Tutel gate modules set themselves back to eval, silently zeroing

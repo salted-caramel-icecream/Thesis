@@ -246,7 +246,8 @@ class LitJEPA(pl.LightningModule):
             loss = F.smooth_l1_loss(pred[mask], tgt[mask])
         self.train(was_training)
         if not torch.isfinite(loss):
-            raise RuntimeError(f"JEPA sanity step produced a non-finite loss: {loss.item()}")
+            raise FloatingPointError(
+                f"JEPA sanity step produced a non-finite loss: {loss.item()}")
         return {"loss": loss.item(), "mask_ratio": mask.float().mean().item(),
                 "target_std": tgt_raw.std(dim=(0, 1)).mean().item(),
                 "aux": 0.0 if aux is None else float(aux)}

@@ -204,11 +204,20 @@ class LitSimMIM(pl.LightningModule):
         if aux is not None:
             aux = torch.clamp(aux, max=self.aux_clamp)   # load-balancing spike guard
             loss = recon + self.aux_weight * aux
-            if torch.isnan(loss) or torch.isinf(loss):
-                loss = recon                              # drop aux for this step
         else:
-            loss = recon
             aux = torch.zeros((), device=x.device)
+            loss = recon
+
+        # Matches LitClassifier.training_step: one check after the branch, so a
+        # non-finite recon fails too. The guard this replaced sat inside the aux
+        # branch and fell back to recon, so it could only hide a bad aux.
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"non-finite SimMIM loss: total={loss.item()} "
+                f"recon={recon.item():.6g} aux={aux.item():.6g} "
+                f"(aux clamped at {self.aux_clamp}, weight {self.aux_weight}). "
+                f"A non-finite aux is the router gate diverging; a non-finite "
+                f"recon is the encoder, the mask or the data.")
         return {"loss": loss, "recon": recon, "aux": aux, "x_rec": x_rec,
                 "patch_mask": patch_mask, "token_mask": token_mask,
                 "mask_ratio": patch_mask.float().mean()}
@@ -237,7 +246,8 @@ class LitSimMIM(pl.LightningModule):
             out = self.masked_forward(x)
         self.train(was_training)
         if not torch.isfinite(out["loss"]):
-            raise RuntimeError(f"SimMIM sanity step produced a non-finite loss: {out['loss'].item()}")
+            raise FloatingPointError(
+                f"SimMIM sanity step produced a non-finite loss: {out['loss'].item()}")
         return {"loss": out["loss"].item(), "recon": out["recon"].item(), "aux": out["aux"].item(),
                 "mask_ratio": out["mask_ratio"].item(),
                 "x_rec_shape": tuple(out["x_rec"].shape)}
