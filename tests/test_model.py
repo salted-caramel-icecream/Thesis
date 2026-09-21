@@ -126,18 +126,13 @@ def test_freeze_stages():
     assert all(p.requires_grad for p in model.head.parameters())
 
 
-def test_return_tokens_and_stage1_masking():
+def test_return_tokens_gives_the_stage4_sequence():
+    """return_tokens is what the k-NN / probe feature extractors consume."""
     cfg = tiny_config()
     model = build_model(cfg)
     x = torch.randn(2, 3, 224, 224)
     tokens, aux = model.forward_features(x, return_tokens=True)
     assert tokens.shape == (2, 49, cfg["model"]["embed_dims"][-1])
-
-    mask = torch.zeros(2, 56 * 56, dtype=torch.bool)
-    mask[:, :100] = True
-    mask_token = torch.zeros(cfg["model"]["embed_dims"][0])
-    tokens2, _ = model.forward_features(
-        x, return_tokens=True, stage1_token_mask=mask, mask_token=mask_token
-    )
-    assert tokens2.shape == tokens.shape
-    assert not torch.allclose(tokens, tokens2)  # masking must change features
+    pooled, _ = model.forward_features(x)
+    assert pooled.shape == (2, cfg["model"]["embed_dims"][-1])
+    assert torch.allclose(pooled, tokens.mean(dim=1), atol=1e-5)

@@ -10,7 +10,7 @@ One row per run: identity (variant, dataset, the CHAIN of stages that
 produced the weights), progress, latest / best validation top-1 and top-5,
 parameters, GFLOPs, measured throughput and peak VRAM, the minimum routing
 entropy over MoE blocks, and whatever ``evaluate.py`` merged in (k-NN, linear
-probe, test split). The chain column is what tells a "SimMIM -> ImageNet
+probe, test split). The chain column is what tells an "ImageNet
 fine-tune -> EuroSAT" number apart from a "scratch on EuroSAT" one.
 
 Needs nothing but the standard library (matplotlib only for ``--plot``).

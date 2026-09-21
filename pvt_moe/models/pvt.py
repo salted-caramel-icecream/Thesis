@@ -273,7 +273,7 @@ class PyramidVisionTransformerV2(nn.Module):
         The learnable RoPE-Mixed frequencies: decaying them pulls every
         frequency toward zero, i.e. toward position blindness (rope-vit lists
         ``freqs`` under ``no_weight_decay`` for the same reason). Both
-        ``LitClassifier`` and ``LitJEPA`` consult this.
+        ``LitClassifier`` consults this.
         """
         return {n for n, _ in self.named_parameters() if n.endswith("rope.freqs")}
 
@@ -308,8 +308,6 @@ class PyramidVisionTransformerV2(nn.Module):
         self,
         x: torch.Tensor,
         return_tokens: bool = False,
-        stage1_token_mask: torch.Tensor | None = None,
-        mask_token: torch.Tensor | None = None,
     ):
         """Run the 4-stage backbone.
 
@@ -318,10 +316,8 @@ class PyramidVisionTransformerV2(nn.Module):
         ``return_tokens`` — and ``aux`` is the mean MoE load-balancing loss
         over MoE blocks (None when no MoE block ran).
 
-        SSL hooks (used by pvt_moe.ssl): ``stage1_token_mask`` is a (B, N1)
-        bool tensor over the stage-1 token grid; masked tokens are replaced by
-        the learnable ``mask_token`` (C1,) right after the first patch
-        embedding (SimMIM-style masking for hierarchical backbones).
+        ``return_tokens`` is what the k-NN / linear-probe evaluation and the
+        upcycling verifier use (``pvt_moe.eval.features``, ``eval.probe``).
         """
         B = x.shape[0]
         aux_total = 0.0
@@ -333,12 +329,6 @@ class PyramidVisionTransformerV2(nn.Module):
             norm = getattr(self, f"norm{i + 1}")
 
             x, H, W = patch_embed(x)
-            if i == 0 and stage1_token_mask is not None:
-                if mask_token is None:
-                    raise ValueError("stage1_token_mask requires mask_token")
-                x = torch.where(
-                    stage1_token_mask[..., None], mask_token.to(x.dtype).expand_as(x), x
-                )
 
             checkpointed = (
                 self.training
@@ -377,7 +367,7 @@ class PyramidVisionTransformerV2(nn.Module):
 def build_model(cfg: dict) -> PyramidVisionTransformerV2:
     """Construct the backbone from a validated config dict.
 
-    Warm starting (HF weights / SSL checkpoints / expert seeding) is handled
+    Warm starting (HF weights / local checkpoints / expert seeding) is handled
     separately by ``pvt_moe.models.pretrained`` — this builds architecture
     only.
     """

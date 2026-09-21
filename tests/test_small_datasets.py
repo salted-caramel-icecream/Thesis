@@ -45,7 +45,7 @@ def test_registry_is_exactly_fashionmnist_eurosat_pathmnist_with_budgets_and_lic
     # the CLI accepts them for --recipe downstream only with a checkpoint
     c = build_config(build_parser().parse_args(["--recipe", "downstream", "--dataset", "eurosat",
                                                 "--ckpt", "/x.pt", "--no-wandb"]), verbose=False)
-    assert c["epochs"] == 50 and c["mode"] == "ssl_init"
+    assert c["epochs"] == 50 and c["mode"] == "warm_start"
 
 
 def _fashion_like(n=20, classes=10):

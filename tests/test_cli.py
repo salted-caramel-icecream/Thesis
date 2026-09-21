@@ -423,7 +423,7 @@ def test_run_suffix_marks_a_repeat_without_touching_the_derived_name():
     assert _cfg(*base, "--run-suffix", "v2")["run_name"] == plain + "_v2"
     assert _cfg(*base, "--run-suffix", "seed7")["run_name"] == plain + "_seed7"
     # an SSL run gets it too (the tag is last in both branches of build_run_tag)
-    assert _cfg("--task", "ssl", "--dataset", "pass", "--run-suffix", "v3")["run_name"].endswith("_v3")
+    assert _cfg("--recipe", "pretrained", "--run-suffix", "v3")["run_name"].endswith("_v3")
     # an explicit --run-name replaces the derived name entirely, suffix included
     assert _cfg(*base, "--run-name", "explicit", "--run-suffix", "v2")["run_name"] == "explicit"
     # it becomes a directory name, so anything path-unsafe is refused

@@ -1,11 +1,10 @@
 """Evaluate a checkpoint: validation top-1, k-NN, linear probe; merge into results.json.
 
 Accepts a Lightning checkpoint (``last.ckpt``, ``milestone-*.ckpt``,
-``epochNNN-valacc*.ckpt``) or an SSL backbone file (``simmim_backbone.pt``,
-``jepa_backbone.pt``). The checkpoint's own config decides the architecture;
-``dataset`` / ``data_dir`` / ``img_size`` / ``batch_size`` / ``num_workers``
-override where it is evaluated, so a PASS-pretrained encoder can be scored
-on ImageNet-1k (labels enter the SSL pipeline HERE, docs/SIMMIM_GUIDE.md §7).
+``epochNNN-valacc*.ckpt``) or a bare backbone file saved by a previous run.
+The checkpoint's own config decides the architecture; ``dataset`` /
+``data_dir`` / ``img_size`` / ``batch_size`` / ``num_workers`` override where
+it is evaluated, so one encoder can be scored on a different dataset.
 
 What each part means:
 
@@ -15,8 +14,8 @@ What each part means:
   (train features extracted with the EVAL transform, no augmentation).
 - ``probe``: ``LitProbe`` — frozen backbone + one linear layer trained for
   ``probe_epochs`` on the train split with the standard train transform,
-  scored on the split. Both are collapse detectors for a MIM encoder; the
-  headline for a SimMIM arm is the fine-tuned top-1.
+  scored on the split. Both are collapse detectors; the headline number is
+  the fine-tuned top-1.
 
 Every number is merged under ``eval["<dataset>@<split>"]`` of the run
 directory's ``results.json`` (created if the directory only holds a backbone
@@ -55,11 +54,9 @@ def eval_config(ckpt_cfg: dict, dataset: str | None = None, data_dir: str | None
                 num_workers: int | None = None) -> dict:
     """The checkpoint's config re-pointed at the evaluation dataset."""
     cfg = copy.deepcopy(ckpt_cfg)
-    over = {"task": "supervised", "mode": "scratch", "ckpt_path": None,
+    over = {"mode": "scratch", "ckpt_path": None,
             "use_wandb": False, "use_tensorboard": False, "dataset": {}}
     name = dataset or cfg["dataset"]["name"]
-    if not DATASETS[name]["labelled"]:
-        raise ValueError(f"{name} is unlabelled; evaluate on a labelled dataset (--dataset imagenet-1k)")
     over["dataset"]["name"] = name
     over["dataset"]["num_classes"] = None                 # re-derived for the eval dataset
     if data_dir:
@@ -92,7 +89,7 @@ def build_eval_loaders(cfg: dict, split: str = "validation"):
         raw = DatasetDict.load_from_disk(cfg["dataset"]["arrow_dirs"][cfg["dataset"]["name"]])
         if "test" not in raw:
             raise ValueError(f"{cfg['dataset']['name']} snapshot has no 'test' split: {list(raw)}")
-        val_ds = HFImageDataset(raw["test"], transform=val_tf, labelled=True)
+        val_ds = HFImageDataset(raw["test"], transform=val_tf)
     if val_ds is None:
         raise ValueError("no validation split to evaluate on")
     base = train_ds.dataset if hasattr(train_ds, "dataset") and hasattr(train_ds, "indices") else train_ds

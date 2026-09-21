@@ -3,9 +3,7 @@
 Cosine similarity between L2-normalised features, the ``k`` nearest train
 images vote for their class with weight ``exp(sim / T)``, ``T = 0.07``;
 ``k = 20`` is the headline (DINO / iBOT report 20 for ImageNet-1k). It needs
-no training, so it is the cheapest collapse detector for an SSL encoder —
-and, like the linear probe, it is EXPECTED to read low for a masked-image-
-modelling encoder (docs/SIMMIM_GUIDE.md §7).
+no training, so it is the cheapest collapse detector for an encoder.
 """
 
 from __future__ import annotations

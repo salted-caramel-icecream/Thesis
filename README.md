@@ -13,21 +13,18 @@ archive/        the v9/v10 notebooks and the process documents that recorded
                 how they became the package; unmaintained, kept for provenance
 notebooks/      thin launchers — v11_train.ipynb trains from a checkout,
                 colab_train.ipynb from a pip install, 03_ssl_pretrain.ipynb is
-                SSL pretraining (SimMIM / JEPA), quick_bench.ipynb times a few
+                quick_bench.ipynb times a few
                 epochs on this machine
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
 configs/        one YAML per ablation arm (--config configs/xxx.yaml)
                 scratch_NN_*.yaml        the 90-epoch ladder rows
                 *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
                 bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
-                ssl_NN_*.yaml            SSL pretraining arms (dense / MoE / pixel-space mask / JEPA)
 docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
-                SIMMIM_GUIDE.md (SSL: recipe, the stem leak, three pretraining
-                paths, the chain, evaluation protocol), JEPA_GUIDE.md (the
-                alternative SSL method)
+                SSL_BRANCH.md (where self-supervised pretraining went)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py);
-                --task ssl pretrains, --recipe ssl_finetune / downstream chain
+                --recipe pretrained / downstream chain
 evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
 download_data.py  build the ImageNet / PASS / small-dataset Arrow snapshots
 tools/          compare_runs.py (table over results.json files), plot_rope_freqs.py,
@@ -233,7 +230,7 @@ Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
 weeks, not days — see `docs/HPARAMS.md` §5.
 
-### 9. Wave 1: expert count at fixed placement, plus the SSL pair
+### 9. Wave 1: expert count at fixed placement
 
 Four arms, B2 throughout, all from scratch on the shipped 90-epoch ladder
 budget (90 matches ScMoE's comparison budget). No dedicated config files —
@@ -274,18 +271,6 @@ That keeps both comparisons single-variable: GPU 1 vs GPU 2 prices **expert
 count** at fixed stage-4 placement, GPU 2 vs GPU 3 prices **placement** at
 fixed E=8. It also means no routed block has a DWConv anywhere in the wave,
 since `moe_block_dwconv` feeds only the shared-expert branch.
-
-**The SSL pair — a later wave, not this one.** The SimMIM arms are
-`--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
-(`sv1_b2_in1k_r224_dense_rope-s4b2_simmim100`) and the same command with
-`--dataset pass --data-dir /data/pass_arrow`. Running
-ImageNet first gives the PASS arm a reference it otherwise has none of — no
-third-party MIM result on PASS is known — and the pair then isolates the
-pretraining corpus with everything else fixed. MoE is **off on both**: adding
-experts would confound the dataset comparison and put untested parameters into
-a path that has never completed an epoch. `mask_token_routing` therefore emits
-nothing on these arms (it requires `--moe`); it belongs to a later arm, once
-SimMIM is known to work.
 
 **Scope of the RoPE claim.** RoPE is on in both MoE arms and is not varied in
 Wave 1. It is tested later by re-running the winning MoE configuration with
@@ -391,28 +376,28 @@ Every row gets a distinct run name (a test enforces it — colliding names would
 share a checkpoint directory and a W&B run). `--dry-run` resolves the config
 and stops; `--print-config` / `--save-config FILE` dump the resolved JSON.
 
-## Recipes: from scratch, pretrained, or the SSL chain
+## Recipes: from scratch, pretrained, or downstream
 
 One key picks the whole hyperparameter set (`docs/HPARAMS.md` is the source of
 truth; `tests/test_recipes.py::test_spec_*` assert every value):
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "ssl_finetune" | "downstream"
+cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "downstream"
 ```
 
-| | `scratch` (default) | `pretrained` | `ssl_finetune` | `downstream` |
-|---|---|---|---|---|
-| `mode` | `scratch` | `hf_pretrained` | `ssl_init` (`--ckpt <run>/simmim_backbone.pt`) | `ssl_init` (`--ckpt <run>/last.ckpt`) |
-| Epochs | **90** (ablations) / 150 / 300 (final) | 100 | 100 | fixed per dataset (fashionmnist 30, eurosat 50, pathmnist 30) |
-| Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) | same |
-| Warmup epochs | 5 | 3 | 20 | 5 |
-| Layer-wise LR decay | — | — | 0.9 | 0.9 |
-| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 | 0.1 |
-| Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 | 1.0 |
-| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical | identical |
+| | `scratch` (default) | `pretrained` | `downstream` |
+|---|---|---|---|
+| `mode` | `scratch` | `hf_pretrained` | `warm_start` (`--ckpt <run>/last.ckpt`) |
+| Epochs | **90** (ablations) / 150 / 300 (final) | 100 | fixed per dataset (fashionmnist 30, eurosat 50, pathmnist 30) |
+| Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) |
+| Warmup epochs | 5 | 3 | 5 |
+| Layer-wise LR decay | — | — | 0.9 |
+| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 |
+| Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 |
+| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical |
 
-SSL pretraining itself is `--task ssl` (SimMIM by default, `--ssl-method
-jepa`), not a recipe — see "Self-supervised pretraining" below.
+Self-supervised pretraining is not a recipe and is not on this branch — see
+`docs/SSL_BRANCH.md`.
 
 A recipe fills only fields left as `None`, so **anything you set explicitly
 wins**:
@@ -440,7 +425,7 @@ directly, and prints the equivalent command line.
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16) — one kv head per query head, no head-count knob |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
 | 3 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D RoPE (rope-vit), real `(cos, sin)` form, adjacent-channel pairing; needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
-| 4 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
+| 4 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 5 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
 | 6 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
@@ -607,14 +592,6 @@ paths in
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.
 
-**PASS** (`--dataset pass`, SSL pretraining only): 1,439,588 unlabelled
-images, no people, CC-BY 4.0, not gated — `python download_data.py --dataset
-pass --out DIR` (~166 GB, ~333 GB free while building; the script deletes
-only PASS's raw download between the conversion and the save). It has no
-labels and no validation split, so every supervised recipe refuses it;
-`train.py --task ssl` and the SSL notebook use it by default. Evaluation
-still happens on a labelled set (`docs/SIMMIM_GUIDE.md` §6).
-
 **Small downstream sets** (`--recipe downstream`): `fashionmnist` (10
 classes, 28 px grayscale, MIT), `eurosat` (10 classes, 64 px RGB, MIT) and
 `pathmnist` (9 classes, MedMNIST+ 224 px, CC BY 4.0), each with a fixed
@@ -645,38 +622,6 @@ with seeded validation / test carve-outs where the source has none;
   Scientific Data 2023 (MedMNIST+ sizes 64/128/224 in the same release) —
   CC BY 4.0; source data Kather et al., NCT-CRC-HE-100K, 2018, CC BY 4.0.
 
-## Self-supervised pretraining (SimMIM, or JEPA)
-
-`docs/SIMMIM_GUIDE.md` is the reference. The chain for a pyramid backbone
-under masked image modelling is **pretrain → supervised ImageNet-1k
-fine-tune → downstream** (SwinV2 §4.2, BEiT), and every `results.json`
-records which chain produced its numbers:
-
-```bash
-python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200          # dense (paths 1 / 3)
-python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200 --moe    # MoE pretrain (path 2)
-python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
-    --dataset imagenet-1k --data-dir /data/imagenet_arrow                                    # intermediate stage
-python train.py --recipe downstream --dataset eurosat --data-dir /data/eurosat_arrow \
-    --ckpt /data/runs/<fine-tune run>/last.ckpt                                             # downstream
-python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
-    --data-dir /data/imagenet_arrow --knn --probe-epochs 20                                 # collapse check
-python tools/compare_runs.py /data/runs                                                     # one table
-```
-
-SimMIM's recipe (32-px patches, ratio 0.6, L1 on masked pixels, base LR
-2e-4 per 512 with the linear scaling rule, wd 0.05, betas (0.9, 0.999),
-clip 5, 224 throughout) is followed exactly where PVT v2 allows it; the one
-place it cannot be is PVT v2's **overlapping** 7×7/stride-4 stem, which lets
-visible tokens see a 3-px band of each masked patch (measured: 6.9 % of the
-masked pixels at ratio 0.6). The real runs use `token` (SimMIM's own
-behaviour; the band is too small to justify leaving the published recipe);
-`--mask-space pixel` removes the band and changes nothing else, kept as the
-control. With `--moe` the load-balancing loss counts the masked positions —
-a stated decision, `docs/SIMMIM_GUIDE.md` §4. Linear-probe / k-NN accuracy
-is **expected to be low** for a MIM encoder; the headline of an SSL arm is
-the fine-tuned top-1.
-
 ## Warm starts (`mode`)
 
 | mode | What happens |
@@ -684,7 +629,7 @@ the fine-tuned top-1.
 | `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
-| `ssl_init` | load a SimMIM / JEPA backbone (`<run>/<method>_backbone.pt`) or any `last.ckpt` from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._sslft100_from-dense-simmim200`) |
+| `warm_start` | load any `last.ckpt` or saved backbone from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._dstr50_from-dense-ft100`) |
 | `resume` | full Lightning resume from `ckpt_path` |
 
 Always read the `[HF pretrained] loaded=...` line: a remap drift once cost a

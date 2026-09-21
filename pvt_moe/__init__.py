@@ -14,7 +14,6 @@ Subpackages
 - ``pvt_moe.models``  : architecture (pure torch, no heavy deps)
 - ``pvt_moe.data``    : HF-Arrow ImageNet pipeline (1k / 22k)
 - ``pvt_moe.engine``  : LightningModule + trainer/callback factories
-- ``pvt_moe.ssl``     : JEPA-style self-supervised pretraining
 - ``pvt_moe.utils``   : FLOPs accounting + diagnostics
 """
 

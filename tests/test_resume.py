@@ -300,7 +300,7 @@ def test_resume_guards_every_field_that_changes_training_invisibly():
     guarded = {c for c, _ in RESUME_IDENTITY_FIELDS}
     for expected in ("model.drop_path_rate", "effective_batch_size", "loss.aux_weight",
                      "model.moe.capacity_factor", "model.moe.gate_noise",
-                     "optim.grad_clip", "ssl.grad_clip", "ssl.mask_ratio"):
+                     "optim.grad_clip"):
         assert expected in guarded, expected
     assert not any("layer_decay" in c for c in guarded), "guarding a no-op is worse than not"
 

@@ -8,9 +8,7 @@ Carries the v9 lineage's load-bearing training semantics:
   ``FloatingPointError`` naming both terms. It used to fall back to plain CE
   for that step, which could only ever hide a non-finite *aux* — a bad CE
   survived the fallback unchanged — so the one thing it did was mask router
-  instability, silently and untested. ``pvt_moe.ssl.simmim`` keeps the same
-  semantics with ``recon`` in place of ``ce``; that parity is a documentation
-  claim, not shared code.
+  instability, silently and untested.
 - **Tutel gate train-forcing**: Tutel gate modules revert themselves to eval
   mode after Lightning's validation pass, silently disabling ``gate_noise``
   (and with it the exploration that keeps experts balanced). ``train()`` is
@@ -27,7 +25,7 @@ Carries the v9 lineage's load-bearing training semantics:
   get_swin_layer``, mapped onto PVT v2's attribute names in
   ``layer_id_of``). ``1.0`` keeps the 4-group layout above byte-for-byte.
 - **Chain provenance**: a warm start prepends the parent checkpoint's
-  ``chain`` (an SSL run's stage tag) or the HF id to ``cfg["chain"]`` BEFORE
+  ``chain`` (its stage tag) or the HF id to ``cfg["chain"]`` BEFORE
   the hyperparameters are saved, so the checkpoint and results.json name the
   whole path that produced the run.
 
@@ -145,10 +143,10 @@ class LitClassifier(pl.LightningModule):
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"),
             )
             self._extend_chain([f"hf_pretrained@{cfg['model']['pretrained_hf_id']}"])
-        elif mode == "ssl_init":
+        elif mode == "warm_start":
             stats = load_backbone_checkpoint(
                 self.model, cfg["ckpt_path"], skip_head=True, expected_cfg=cfg,
-                check_arch=cfg["model"].get("ssl_init_check_arch", True),
+                check_arch=cfg["model"].get("warm_start_check_arch", True),
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"))
             self._extend_chain(stats.get("parent_chain") or [])

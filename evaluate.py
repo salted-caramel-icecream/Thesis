@@ -2,7 +2,7 @@
 """Evaluate a checkpoint: validation top-1, k-NN, linear probe -> results.json.
 
     python evaluate.py --ckpt /data/runs/<run>/last.ckpt                    # top-1/top-5 on its dataset
-    python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt \\
+    python evaluate.py --ckpt /data/runs/<run>/last.ckpt \\
         --dataset imagenet-1k --data-dir /data/imagenet_arrow --knn --probe-epochs 20
     python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset eurosat \\
         --data-dir /data/eurosat_arrow --split test
@@ -26,10 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="evaluate.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", required=True, metavar="PATH",
-                   help="Lightning checkpoint (last.ckpt, milestone-*.ckpt) or an SSL "
-                        "backbone file (simmim_backbone.pt / jepa_backbone.pt)")
-    labelled = tuple(n for n, s in DATASETS.items() if s["labelled"])
-    p.add_argument("--dataset", choices=labelled,
+                   help="Lightning checkpoint (last.ckpt, milestone-*.ckpt) or a "
+                        "bare backbone file saved by a previous run")
+    p.add_argument("--dataset", choices=tuple(DATASETS),
                    help="labelled dataset to evaluate on (default: the checkpoint's own)")
     p.add_argument("--data-dir", metavar="DIR", help="Arrow snapshot of --dataset")
     p.add_argument("--split", choices=("validation", "test"), default="validation")

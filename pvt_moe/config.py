@@ -29,13 +29,9 @@ import re
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Datasets the pipeline knows. ``labelled: False`` marks an SSL-only corpus:
-#: it has no labels, so it is usable only with ``task: "ssl"`` (JEPA) and is
-#: refused by every supervised recipe at validate time. PASS (Asano et al.,
-#: NeurIPS Datasets & Benchmarks 2021): 1,439,588 images, CC-BY 4.0, no people,
-#: a single ``train`` split, no labels. Its ``hf_id`` is None because the Hub
-#: cannot serve it (loading script, no parquet branch); it is built from the
-#: Zenodo tars with ``download_data.py --from-images`` — docs/GUIDE.md section 2.
+#: Datasets the pipeline knows. Every one is labelled: the unlabelled PASS
+#: corpus moved to the ``ssl`` git branch with the rest of self-supervised
+#: pretraining — see docs/SSL_BRANCH.md.
 #: imagenet-22k uses the fall11 / full-tag convention (21841 synsets), which is
 #: what the standard HF Arrow builds and OpenGVLab-style pretraining use.
 #: ``finetune_epochs`` is a FIXED budget per small dataset: open-ended runs on
@@ -49,10 +45,6 @@ DATASETS = {
     "imagenet-22k": {"num_classes": 21841, "labelled": True, "tag": "in22k",
                      "hf_id": "timm/imagenet-22k-wds", "gated": True, "finetune_epochs": None,
                      "licence": "ImageNet terms of access; gated on HF"},
-    "pass": {"num_classes": 0, "labelled": False, "tag": "pass",
-             "hf_id": None, "gated": False, "finetune_epochs": None,
-             "hf_id_hint": "yukimasano/pass (loading script — not loadable; use Zenodo)",
-             "licence": "CC-BY 4.0 (images and dataset)"},
     # --- small transfer / downstream sets (supervised, scratch or fine-tune) ---
     # Native resolutions are far below 224; dataset.img_size (224) upsamples
     # them in the train/val transforms, so results on these partly measure
@@ -92,9 +84,8 @@ DATASETS = {
 SMALL_DATASETS = tuple(n for n, s in DATASETS.items() if s.get("finetune_epochs"))
 #: Class counts are DERIVED from dataset.name — never hand-set num_classes.
 NUM_CLASSES = {name: spec["num_classes"] for name, spec in DATASETS.items()}
-VALID_TASKS = ("supervised", "ssl")
 
-VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
+VALID_MODES = ("scratch", "hf_pretrained", "warm_start", "resume")
 #: MoE backends. "tutel" is the DEFAULT because it is the implementation the
 #: v9 lineage's results were produced with — switching the default would make
 #: new runs incomparable to the recorded 72.27%. "native" is a pure-PyTorch
@@ -102,15 +93,7 @@ VALID_MODES = ("scratch", "hf_pretrained", "ssl_init", "resume")
 #: will not build; it is architecturally equivalent at top_k=1 and shares
 #: Tutel's parameter layout, so checkpoints move between the two.
 VALID_BACKENDS = ("tutel", "native")
-#: "ssl_finetune" is the INTERMEDIATE stage: a supervised ImageNet-1k
-#: fine-tune of an SSL-pretrained backbone. For pyramid ViTs under masked
-#: image modelling the chain is SSL -> supervised ImageNet -> downstream;
-#: going SSL -> downstream directly underperforms (SwinV2, arXiv 2111.09883
-#: §4.2, describes its own SwinV2-G recipe as self-supervised pretraining
-#: followed by a further supervised classification stage on the same data
-#: before task fine-tuning; BEiT uses the same scheme). "downstream" is the
-#: final stage on a small dataset, with a per-dataset epoch budget.
-VALID_RECIPES = ("scratch", "pretrained", "ssl_finetune", "downstream")
+VALID_RECIPES = ("scratch", "pretrained", "downstream")
 
 #: How an upcycled MoE block is initialized. Both branches copy the pretrained
 #: FFN, so one of them must start at zero or the block emits ~2x the dense
@@ -236,36 +219,10 @@ RECIPES = {
         },
         # model.drop_path_rate: the variant's official rate (variant_drop_path).
     },
-    # Intermediate stage: SSL checkpoint -> supervised ImageNet-1k.
-    # Values from microsoft/SimMIM @ d3e29bc,
-    # configs/swin_base__100ep/simmim_finetune__swin_base__img224_window7__100ep.yaml
-    # (base_lr 1.25e-3 under the /512 rule, warmup 20, layer decay 0.9,
-    # drop path 0.1, RandAug (9, 0.5) + label smoothing 0.1 + mixup/cutmix).
-    "ssl_finetune": {
-        "mode": "ssl_init",
-        "epochs": 100,
-        "optim": {
-            "base_lr": 1.25e-3,
-            "lr_reference_batch": 512,
-            "lr": None,                    # DERIVED by the linear scaling rule
-            # SimMIM section 4.1's ablation protocol: "100-epoch training, and a
-            # cosine learning rate scheduler with 10-epoch warm-up". The
-            # reference yaml's WARMUP_EPOCHS 20 belongs to the 800-epoch
-            # scaling config, which is not the setting this chain reproduces.
-            "warmup_epochs": 10,
-            "stage4_lr_multiplier": 1.0,
-            # Layer-wise decay compounding from the head down. SimMIM §4.3
-            # uses 0.9 for a 100-epoch pretrain and lowers it with model size
-            # and pretraining length (0.8 Swin-B, 0.75 Swin-L, 0.7 SwinV2-H at
-            # 800 ep); at 200 ep on a 25M model 0.9 is the conservative end.
-            "layer_decay": 0.9,
-        },
-        "model": {"drop_path_rate": 0.1},
-    },
     # Final stage: a small labelled dataset. The epoch budget comes from
     # DATASETS[name]["finetune_epochs"] unless set explicitly.
     "downstream": {
-        "mode": "ssl_init",
+        "mode": "warm_start",
         "epochs": None,                    # filled from the dataset's budget
         "optim": {
             "base_lr": 1.25e-3,
@@ -314,82 +271,6 @@ RECIPES = {
 # Default configuration (reproduces the v9 training recipe)
 # ---------------------------------------------------------------------------
 
-#: JEPA pretraining defaults (``cfg["ssl"]``; pvt_moe.ssl.jepa). Living here
-#: means ``validate_config`` accepts the block and catches typos inside it.
-#: ``lr`` is the I-JEPA value for a global batch of ``lr_reference_batch``;
-#: like the supervised recipe it is NOT rescaled automatically — LitJEPA
-#: prints the resolved LR, the effective batch and what linear scaling
-#: would give, and you decide.
-VALID_SSL_METHODS = ("simmim", "jepa")
-VALID_MASK_SPACES = ("token", "pixel")
-
-#: Optimiser settings per SSL method; ``apply_ssl_method`` fills any ``None``
-#: field of ``cfg["ssl"]`` from here, then resolves
-#: ``lr = base_lr * effective_batch / lr_reference_batch`` (the linear scaling
-#: rule; SimMIM's reference batch is 512, MAE/JEPA's is 2048).
-#:
-#: simmim: microsoft/SimMIM @ d3e29bc — configs/swin_base__100ep/*.yaml,
-#:   config.py defaults and main_simmim.py's scaling rule. NOT yet checked
-#:   against the published paper (the PDF has not reached this machine).
-#: jepa:   I-JEPA-style values this repo shipped before SimMIM was added.
-SSL_METHOD_DEFAULTS = {
-    "simmim": {"epochs": 200, "base_lr": 2e-4, "lr_reference_batch": 512,
-               "warmup_epochs": 10, "warmup_lr_base": 1e-6, "final_lr_base": 1e-5,
-               "weight_decay": 0.05, "betas": [0.9, 0.999], "grad_clip": 5.0},
-    "jepa": {"epochs": 100, "base_lr": 1.5e-3, "lr_reference_batch": 2048,
-             "warmup_epochs": 15, "warmup_lr_base": 0.0, "final_lr_base": 1e-6,
-             "weight_decay": 0.04, "betas": [0.9, 0.95], "grad_clip": 3.0},
-}
-
-SSL_DEFAULTS = {
-    "method": "simmim",           # VALID_SSL_METHODS; "jepa" kept reachable
-    # None => filled from SSL_METHOD_DEFAULTS[method]; anything set wins.
-    "epochs": None,
-    "base_lr": None,              # what the linear scaling rule starts from
-    "lr_reference_batch": None,   # simmim 512, jepa 2048
-    "lr": None,                   # DERIVED; set explicitly to bypass the rule
-    "warmup_epochs": None,
-    # The three LRs are DERIVED from the three *_base fields, which the
-    # resolution never writes to. Deriving warmup_lr/final_lr IN PLACE (reading
-    # the field the scaled value is then stored in) made them non-idempotent:
-    # every re-validate multiplied them by batch/reference again, so a config
-    # round-tripped through --save-config, or a checkpoint's config re-read by
-    # evaluate.py, silently doubled both.
-    "warmup_lr_base": None,       # simmim 1e-6, jepa 0.0
-    "final_lr_base": None,        # simmim 1e-5, jepa 1e-6
-    "warmup_lr": None,            # DERIVED from warmup_lr_base
-    "final_lr": None,             # DERIVED from final_lr_base
-    "weight_decay": None,
-    "betas": None,
-    "grad_clip": None,
-    # --- SimMIM (masked image modelling) ---------------------------------
-    # 32-px mask patches, 60% masked, L1 on ImageNet-normalised pixels over
-    # masked pixels only; the prediction head is one 1x1 conv + PixelShuffle
-    # on the stride-32 stage-4 map (microsoft/SimMIM models/simmim.py).
-    "mask_patch_size": 32,
-    "mask_ratio": 0.6,
-    # WHERE the mask is applied. "token" is SimMIM's: replace stage-1 tokens
-    # with the shared mask token AFTER the patch embed. With PVT v2's
-    # OVERLAPPING 7x7/stride-4 embed that lets surviving tokens see a 3-px
-    # band on the bottom/right edge of each masked patch (183/1024 = 17.9% of
-    # an isolated patch, 6.9% of masked pixels at ratio 0.6; measured, see
-    # docs/SIMMIM_GUIDE.md). "pixel" masks BEFORE the embed, which removes the
-    # leak but departs from SimMIM. Swin's non-overlapping embed has no leak,
-    # so SimMIM never had to choose.
-    "mask_space": "token",
-    # --- JEPA only --------------------------------------------------------
-    "weight_decay_end": 0.4,      # cosine-ramped from weight_decay
-    "ema_momentum": 0.996,        # cosine-ramped to ema_momentum_end
-    "ema_momentum_end": 1.0,
-    "mask_n_blocks": 4,
-    "mask_block_area": [0.10, 0.20],
-    "mask_aspect_ratio": [0.75, 1.5],
-    "predictor_dim": 384,
-    "predictor_depth": 6,
-    "predictor_heads": 6,
-}
-
-
 _DEFAULT: dict = {
     # Run-name prefix. "sv1" = the September 2026 edit of the architecture
     # (variants, MHA-by-default, depth-independent placement); the earlier
@@ -402,12 +283,8 @@ _DEFAULT: dict = {
     #                  checkpoint + upcycled experts
     # Setting `recipe` also sets `mode` unless you set `mode` yourself.
     "recipe": "scratch",
-    # "supervised" (train.py, LitClassifier) | "ssl" (JEPA pretraining,
-    # notebooks/03). Decides which datasets are admissible: an unlabelled
-    # corpus (PASS) is refused unless task is "ssl".
-    "task": "supervised",
     # Which sequence of stages produced this run, oldest first, e.g.
-    # ["simmim_pretrain@pass_r224", "ssl_finetune@imagenet-1k_r224"].
+    # ["hf_finetune@imagenet-1k_r224", "downstream@eurosat_r224"].
     # validate_config seeds it with THIS stage; a warm start prepends the
     # parent checkpoint's chain, and results.json records the whole thing.
     "chain": [],
@@ -427,7 +304,8 @@ _DEFAULT: dict = {
     #   scratch       - random init
     #   hf_pretrained - load OpenGVLab/pvt_v2_b<variant> via key remap (+ MoE expert
     #                   seeding from the dense FFN when use_moe)
-    #   ssl_init      - load a JEPA-pretrained backbone checkpoint
+    #   warm_start    - load a backbone checkpoint from a previous run
+    #                   (what the downstream recipe does)
     #   resume        - full Lightning resume (model+optimizer+scheduler) from
     #                   ckpt_path
     # None => taken from the recipe. Set explicitly to override.
@@ -481,15 +359,14 @@ _DEFAULT: dict = {
     "use_tensorboard": False,
 
     "dataset": {
-        # "imagenet-1k" | "imagenet-22k" | "pass" (SSL only) | the small
-        # downstream sets "fashionmnist" | "eurosat" | "pathmnist" (DATASETS).
+        # "imagenet-1k" | "imagenet-22k" | the small downstream sets
+        # "fashionmnist" | "eurosat" | "pathmnist" (DATASETS).
         "name": "imagenet-1k",
         "num_classes": None,              # DERIVED — leave None
         "img_size": 224,
         "arrow_dirs": {
             "imagenet-1k": "/workspace/ModelTraining/datasets/imagenet_arrow",
             "imagenet-22k": "/workspace/ModelTraining/datasets/imagenet22k_arrow",
-            "pass": "/workspace/ModelTraining/datasets/pass_arrow",
             "fashionmnist": "/workspace/ModelTraining/datasets/fashionmnist_arrow",
             "eurosat": "/workspace/ModelTraining/datasets/eurosat_arrow",
             "pathmnist": "/workspace/ModelTraining/datasets/pathmnist_arrow",
@@ -533,7 +410,7 @@ _DEFAULT: dict = {
         "attn_drop_rate": 0.0,
         # None => derived. scratch: the VARIANT's official rate at any epoch
         # budget (variant_drop_path; b0-b2 0.1, b3-b5 0.3). pretrained /
-        # ssl_finetune / downstream: 0.1 from the recipe. task ssl: 0.0.
+        # downstream: 0.1 from the recipe.
         "drop_path_rate": None,
         # Stages (1-based) to run under gradient checkpointing while training:
         # recompute activations in the backward pass instead of storing them.
@@ -644,11 +521,11 @@ _DEFAULT: dict = {
         "pretrained_hf_id": None,
         # Seed MoE experts from the dense HF FFN weights (sparse upcycling).
         "seed_moe_from_dense": True,
-        # mode ssl_init: refuse a JEPA backbone whose saved architecture
+        # mode warm_start: refuse a backbone whose saved architecture
         # (variant, depths/widths, RoPE mode and placement, MoE placement)
-        # differs from this run instead of loading what fits and leaving the
-        # rest at random init. False downgrades the refusal to a warning.
-        "ssl_init_check_arch": True,
+        # differs from this run, instead of loading what fits and leaving
+        # the rest at random init. False downgrades the refusal to a warning.
+        "warm_start_check_arch": True,
         # Resuming (--resume-from) refuses to silently change a setting the
         # checkpoint cannot carry — drop_path_rate today
         # (engine.results.RESUME_IDENTITY_FIELDS), compared against the
@@ -666,7 +543,7 @@ _DEFAULT: dict = {
         # None => recipe default (1.0 for both recipes; Sparse Upcycling B.9
         # found differential expert/router LRs generally hurt).
         "stage4_lr_multiplier": None,
-        # Linear scaling rule (SimMIM main_simmim.py / main_finetune.py):
+        # Linear scaling rule (SimMIM main_finetune.py):
         # lr = base_lr * effective_batch / lr_reference_batch. Both None on
         # the from-scratch and HF recipes, which state an absolute `lr`
         # calibrated for LR_REFERENCE_BATCH and are NOT rescaled.
@@ -685,9 +562,6 @@ _DEFAULT: dict = {
         "warmup_start_factor": None,
         "eta_min": 1e-6,
     },
-
-    # JEPA pretraining knobs (see SSL_DEFAULTS); ignored by supervised runs.
-    "ssl": copy.deepcopy(SSL_DEFAULTS),
 
     "loss": {
         "aux_weight": 0.01,               # MoE load-balancing loss weight
@@ -778,30 +652,27 @@ def _placement_tag(placement, depths) -> str:
 
 
 def stage_tag(cfg: dict) -> str:
-    """One pipeline stage in words: ``"simmim_pretrain@pass_r224"``,
-    ``"ssl_finetune+moe@imagenet-1k_r224"``.
+    """One pipeline stage in words: ``"hf_finetune@imagenet-1k_r224"``,
+    ``"downstream+moe@eurosat_r224"``.
 
     ``cfg["chain"]`` is the list of these, oldest first, so a result can name
-    the whole path that produced it (SSL pretrain -> intermediate supervised
-    ImageNet fine-tune -> downstream task). ``+moe`` marks a stage whose
-    backbone carried routed experts, which is what tells the three
-    pretraining paths apart in a chain (docs/SIMMIM_GUIDE.md §6).
+    the whole path that produced it (ImageNet fine-tune -> downstream task).
+    ``+moe`` marks a stage whose backbone carried routed experts, which is
+    what tells a dense-parent chain from a routed one.
     """
     ds = cfg["dataset"]["name"]
     res = f"r{cfg['dataset']['img_size']}"
     abl = cfg["model"]["ablation"]
     moe = "+moe" if abl.get("use_moe") and any(abl.get("moe_placement") or []) else ""
-    if cfg.get("task") == "ssl":
-        return f"{cfg['ssl']['method']}_pretrain{moe}@{ds}_{res}"
     kind = {"scratch": "scratch", "pretrained": "hf_finetune",
-            "ssl_finetune": "ssl_finetune", "downstream": "downstream"}.get(
+            "downstream": "downstream"}.get(
         cfg.get("recipe"), cfg.get("mode") or "run")
     return f"{kind}{moe}@{ds}_{res}"
 
 
 def parent_tag(ckpt_path: str | None) -> str | None:
     """A short tag naming the run a warm-start checkpoint came from:
-    ``from-dense-simmim200``, ``from-moe-sslft100-from-dense-simmim200``.
+    ``from-dense-ft100``, ``from-moe-dstr50-from-dense-ft100``.
 
     Two fine-tunes that differ ONLY in their parent — path 2 (MoE pretrain)
     vs path 3 (dense pretrain, upcycled now) — would otherwise share a run
@@ -845,7 +716,7 @@ def run_name_parts(cfg: dict) -> dict:
     """The run name and the two fragments a CHILD run needs to name its parent.
 
     Returns ``{"name", "moe", "budget"}``. ``moe`` is ``"dense"`` or ``"moe"``
-    and ``budget`` is the trailing ``sslft100-from-dense-simmim200`` fragment;
+    and ``budget`` is the trailing ``dstr50-from-dense-ft100`` fragment;
     ``run_identity`` records both in results.json as ``name_moe`` /
     ``name_budget``, and ``parent_tag`` reads them back. Deriving them HERE,
     where they are already computed, is what lets ``parent_tag`` avoid
@@ -879,7 +750,7 @@ def run_name_parts(cfg: dict) -> dict:
         # one checkpoint directory. Tagging it everywhere would put a marker on
         # every from-scratch run, which never upcycles anything.
         init_applies = (
-            cfg.get("mode") in ("hf_pretrained", "ssl_init")
+            cfg.get("mode") in ("hf_pretrained", "warm_start")
             and moe_cfg.get("shared_expert")
             and cfg["model"].get("seed_moe_from_dense", True)
         )
@@ -917,24 +788,15 @@ def run_name_parts(cfg: dict) -> dict:
     dwconv = "" if cfg["model"].get("dense_dwconv", True) else "_nodw"
     # Budget tag: the epoch count is an ablation axis of its own (90/150/300
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
-    budget = {"scratch": "scratch", "pretrained": "ft", "ssl_finetune": "sslft",
+    budget = {"scratch": "scratch", "pretrained": "ft",
               "downstream": "dstr"}.get(cfg.get("recipe"), "run")
     # Repeat marker: last, so the arm is still readable left to right.
     suffix = f"_{cfg['run_suffix']}" if cfg.get("run_suffix") else ""
-    if cfg.get("task") == "ssl":
-        # An SSL run is identified by its method and pretraining length; the
-        # mask space changes what the encoder sees, so it is tagged too.
-        ssl = cfg["ssl"]
-        px = "-px" if ssl.get("mask_space") == "pixel" else ""
-        tail = f"{ssl['method']}{ssl['epochs']}{px}{suffix}"
-        return {"name": f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{tail}",
-                "moe": "moe" if moe != "dense" else "dense",
-                "budget": tail.replace("_", "-")}
     # epochs == 0 is the eval-only row of the pretrained ladder.
     budget = "eval" if cfg["epochs"] == 0 else f"{budget}{cfg['epochs']}"
-    # A warm start from an SSL / fine-tuned checkpoint is named after its
+    # A warm start from a fine-tuned checkpoint is named after its
     # parent too (parent_tag), so paths 2 and 3 never share a directory.
-    parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "ssl_init" else None
+    parent = parent_tag(cfg.get("ckpt_path")) if cfg.get("mode") == "warm_start" else None
     parent = f"_{parent}" if parent else ""
     tail = f"{budget}{parent}{suffix}"
     return {"name": f"{cfg['version']}_{variant}_{ds}_{res}_{moe}_{rope}{dwconv}_{tail}",
@@ -1074,11 +936,11 @@ def ladder_overrides(recipe: str, row: int) -> tuple:
 
 
 def resolve_lr(base_lr: float, effective_batch: int, reference_batch: int) -> float:
-    """The linear scaling rule shared by SimMIM and MAE-family recipes."""
+    """The linear scaling rule shared by the MAE-family recipes."""
     return base_lr * effective_batch / reference_batch
 
 
-def lr_banner(cfg: dict, ssl: bool = False) -> str:
+def lr_banner(cfg: dict) -> str:
     """One line naming the BASE lr, the batch it was scaled by, and the result.
 
     Printed at startup by every entry point so the learning rate actually in
@@ -1088,12 +950,6 @@ def lr_banner(cfg: dict, ssl: bool = False) -> str:
     accum = cfg.get("accumulate_grad_batches") or 1
     eff = cfg.get("effective_batch_size") or micro * accum
     batch = f"batch {micro} micro x {accum} accum = {eff} effective"
-    if ssl:
-        s = cfg["ssl"]
-        return (f"[ssl] method {s['method']} | base_lr {s['base_lr']:.2e} x ({eff} / "
-                f"{s['lr_reference_batch']}) -> lr {s['lr']:.2e} | {batch} | "
-                f"warmup {s['warmup_epochs']} ep from {s['warmup_lr']:.2e}, "
-                f"final {s['final_lr']:.2e} | {s['epochs']} epochs")
     o = cfg["optim"]
     if o.get("base_lr") is not None:
         rule = (f"base_lr {o['base_lr']:.2e} x ({eff} / {o['lr_reference_batch']}) -> "
@@ -1101,78 +957,6 @@ def lr_banner(cfg: dict, ssl: bool = False) -> str:
     else:
         rule = f"lr {o['lr']:.2e} (absolute; calibrated for batch {LR_REFERENCE_BATCH})"
     return f"[optim] {rule} | {batch} | layer_decay {o['layer_decay']}"
-
-
-def apply_ssl_method(cfg: dict) -> list:
-    """Fill ``cfg["ssl"]`` from the selected method and resolve its LRs.
-
-    ``ssl.method`` picks a row of ``SSL_METHOD_DEFAULTS``; every ``None``
-    field takes that row's value. ``lr``/``warmup_lr``/``final_lr`` are then
-    derived from their base values by the linear scaling rule, exactly as
-    ``main_simmim.py`` does (it scales the peak, warmup and minimum LRs
-    together). Set any of them explicitly to bypass the rule.
-    """
-    ssl = cfg["ssl"]
-    method = ssl.get("method")
-    if method not in VALID_SSL_METHODS:
-        raise ValueError(f"ssl.method must be one of {VALID_SSL_METHODS}, got {method!r}")
-    if ssl.get("mask_space") not in VALID_MASK_SPACES:
-        raise ValueError(
-            f"ssl.mask_space must be one of {VALID_MASK_SPACES}, got {ssl.get('mask_space')!r}")
-    filled = []
-    for key, value in SSL_METHOD_DEFAULTS[method].items():
-        if ssl.get(key) is None:
-            ssl[key] = copy.deepcopy(value)
-            filled.append(f"ssl.{key}")
-    eff = (cfg.get("effective_batch_size")
-           or cfg["batch_size"] * (cfg.get("accumulate_grad_batches") or 1))
-    ref = ssl["lr_reference_batch"]
-    # Derive from the *_base fields, never from the field being written: an
-    # already-resolved value must survive a second validate_config unchanged.
-    for key, base_key in (("lr", "base_lr"), ("warmup_lr", "warmup_lr_base"),
-                          ("final_lr", "final_lr_base")):
-        if ssl.get(key) is not None:
-            continue                 # explicit, or resolved on an earlier pass
-        ssl[key] = resolve_lr(ssl[base_key], eff, ref)
-        filled.append(f"ssl.{key}")
-    if method == "simmim" and cfg.get("task") == "ssl":
-        img = cfg["dataset"]["img_size"]
-        mp = ssl["mask_patch_size"]
-        if img % mp != 0:
-            raise ValueError(
-                f"ssl.mask_patch_size {mp} must divide dataset.img_size {img}: SimMIM "
-                f"masks whole {mp}x{mp} patches on a {img // mp}x{img // mp} grid")
-    return filled
-
-
-def rebind_ssl_method(cfg: dict, method: str) -> None:
-    """Re-resolve ``cfg["ssl"]`` for ``method``, keeping values the user set.
-
-    An SSL module is its own method whatever the config says: a supervised
-    config carries the default (simmim) row, so ``LitJEPA`` has to rebind.
-    Values that match what the CURRENT method's resolution would produce were
-    auto-filled and are re-derived; anything else was set deliberately and is
-    kept.
-    """
-    ssl = cfg["ssl"]
-    current = ssl.get("method")
-    if current == method:
-        if ssl.get("lr") is None:
-            apply_ssl_method(cfg)
-        return
-    auto = set()
-    if current in SSL_METHOD_DEFAULTS:
-        probe = copy.deepcopy(cfg)
-        for key in list(SSL_METHOD_DEFAULTS[current]) + ["lr"]:
-            probe["ssl"][key] = None
-        apply_ssl_method(probe)
-        auto = {k for k in list(SSL_METHOD_DEFAULTS[current]) + ["lr"]
-                if ssl.get(k) == probe["ssl"].get(k)}
-    for key in list(SSL_METHOD_DEFAULTS[method]) + ["lr"]:
-        if key in auto or ssl.get(key) is None:
-            ssl[key] = None
-    ssl["method"] = method
-    apply_ssl_method(cfg)
 
 
 def apply_variant(cfg: dict) -> list:
@@ -1322,13 +1106,6 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
     # Stochastic depth for from-scratch runs scales with the epoch budget.
     # From scratch: the variant's OFFICIAL rate, whatever the epoch budget
     # (variant_drop_path; the epoch-based rule it replaced is recorded there).
-    # SSL PRETRAINING uses none: SimMIM's pretrain config sets DROP_PATH_RATE
-    # 0.0 (microsoft/SimMIM configs/swin_base__100ep/simmim_pretrain_*.yaml;
-    # 0.1 is its FINE-TUNE value, carried by the ssl_finetune recipe), and
-    # I-JEPA / MAE pretrain without stochastic depth as well.
-    if cfg["model"].get("drop_path_rate") is None and cfg.get("task") == "ssl":
-        cfg["model"]["drop_path_rate"] = 0.0
-        filled.append("model.drop_path_rate")
     if cfg["model"].get("drop_path_rate") is None:
         cfg["model"]["drop_path_rate"] = variant_drop_path(cfg["model"]["variant"])
         filled.append("model.drop_path_rate")
@@ -1340,8 +1117,8 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
         filled.append("optim.warmup_start_factor")
 
     # Upcycling init: a recipe may fill it; anything still unset upcycles
-    # nothing — EXCEPT a warm start (mode ssl_init OR hf_pretrained), which
-    # upcycles a dense FFN (the JEPA backbone's own, or the HF checkpoint's)
+    # nothing — EXCEPT a warm start (mode warm_start OR hf_pretrained), which
+    # upcycles a dense FFN (the parent run's own, or the HF checkpoint's)
     # into the MoE'd block whichever recipe supplied the rest. Keying this on
     # the recipe alone left "mode: hf_pretrained" under the scratch recipe at
     # "none": shared expert seeded, routed experts replicated, nothing zeroed,
@@ -1351,7 +1128,7 @@ def apply_recipe(cfg: dict, verbose: bool = False) -> dict:
     # where shared_expert is known to be final.
     if cfg["model"]["moe"].get("upcycle_init") is None:
         cfg["model"]["moe"]["upcycle_init"] = (
-            "routed_zero" if cfg.get("mode") in ("ssl_init", "hf_pretrained")
+            "routed_zero" if cfg.get("mode") in ("warm_start", "hf_pretrained")
             else "none")
         filled.append("model.moe.upcycle_init")
 
@@ -1515,13 +1292,10 @@ def validate_config(cfg: dict) -> dict:
     assert_known_keys(cfg)
     apply_variant(cfg)
     apply_recipe(cfg)
-    # Always resolve cfg["ssl"] (it only fills that subtree) so an SSL module
-    # constructed from any config sees numbers, never None.
-    apply_ssl_method(cfg)
 
     if cfg["mode"] not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {cfg['mode']!r}")
-    if cfg["mode"] in ("resume", "ssl_init") and not cfg.get("ckpt_path"):
+    if cfg["mode"] in ("resume", "warm_start") and not cfg.get("ckpt_path"):
         raise ValueError(f"mode={cfg['mode']!r} requires ckpt_path")
 
     model = cfg["model"]
@@ -1530,29 +1304,13 @@ def validate_config(cfg: dict) -> dict:
             f"moe.backend must be one of {VALID_BACKENDS}, got {model['moe']['backend']!r}"
         )
 
-    if cfg.get("task") not in VALID_TASKS:
-        raise ValueError(f"task must be one of {VALID_TASKS}, got {cfg.get('task')!r}")
     ds = cfg["dataset"]
     if ds["name"] not in DATASETS:
         raise ValueError(f"dataset.name must be one of {tuple(DATASETS)}, got {ds['name']!r}")
-    if not DATASETS[ds["name"]]["labelled"] and cfg["task"] != "ssl":
-        raise ValueError(
-            f"dataset {ds['name']!r} is UNLABELLED (PASS: SSL pretraining only) and "
-            f"cannot train or evaluate a classifier — task is {cfg['task']!r} "
-            f"(recipe {cfg.get('recipe')!r}, mode {cfg['mode']!r}). Pretrain on it with "
-            "`train.py --task ssl` or notebooks/03_ssl_pretrain.ipynb (task: \"ssl\"); a "
-            "supervised run needs a labelled dataset."
-        )
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
 
-    # An SSL run's budget is ssl.epochs (--epochs sets it and leaves the
-    # supervised `epochs` to the recipe, where it means nothing); that is what
-    # build_ssl_trainer runs to, so it is what these two must be measured
-    # against. Checking the supervised field instead would refuse a milestone
-    # inside the pretraining budget and accept one the run never reaches.
-    ssl_run = cfg.get("task") == "ssl"
-    budget = cfg["ssl"]["epochs"] if ssl_run else cfg["epochs"]
-    field = "ssl.epochs" if ssl_run else "epochs"
+    budget = cfg["epochs"]
+    field = "epochs"
     stop_at = cfg.get("stop_at_epoch")
     if stop_at is not None and not 1 <= stop_at <= budget:
         raise ValueError(
@@ -1584,11 +1342,11 @@ def validate_config(cfg: dict) -> dict:
             f"model.moe.upcycle_init must be one of {VALID_UPCYCLE_INITS}, "
             f"got {moe['upcycle_init']!r}"
         )
-    if (cfg["mode"] in ("ssl_init", "hf_pretrained") and moe["upcycle_init"] == "none"
+    if (cfg["mode"] in ("warm_start", "hf_pretrained") and moe["upcycle_init"] == "none"
             and moe.get("shared_expert") and model["ablation"]["use_moe"]
             and model.get("seed_moe_from_dense", True)):
         # Explicit "none" here means the shared expert AND the routed experts
-        # both carry the dense FFN (JEPA backbone or HF checkpoint), i.e. the
+        # both carry the dense FFN (parent checkpoint or HF), i.e. the
         # block emits ~2x the dense layer at step 0. That is never what a
         # warm-start run wants.
         raise ValueError(
@@ -1641,9 +1399,9 @@ def validate_config(cfg: dict) -> dict:
     # rather than silently rescaling, which would make runs incomparable.
     eff = cfg["effective_batch_size"]
     if (eff != LR_REFERENCE_BATCH and cfg["recipe"] is not None
-            and cfg["optim"].get("base_lr") is None and cfg.get("task") != "ssl"):
+            and cfg["optim"].get("base_lr") is None):
         # Not for recipes that state a base_lr (the rule WAS applied, see
-        # lr_banner) nor for SSL runs (cfg["ssl"] has its own rule).
+        # lr_banner).
         suggested = cfg["optim"]["lr"] * eff / LR_REFERENCE_BATCH
         print(
             f"[config] effective_batch_size is {eff}, but the recipe's "
@@ -1664,7 +1422,7 @@ def validate_config(cfg: dict) -> dict:
                 "It becomes part of the checkpoint directory name.")
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)
-        if cfg["mode"] == "ssl_init" and parent_tag(cfg.get("ckpt_path")) is None:
+        if cfg["mode"] == "warm_start" and parent_tag(cfg.get("ckpt_path")) is None:
             print(f"[config] ckpt_path {cfg['ckpt_path']!r} is not <root>/<run_name>/<file>, so "
                   "the run name carries no parent tag: two warm starts from different "
                   "parents would share a checkpoint directory — pass --run-name.")

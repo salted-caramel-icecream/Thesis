@@ -567,24 +567,6 @@ def test_cross_directory_resume_keeps_the_true_init():
             assert os.path.exists(os.path.join(c, cfg3["run_name"], "rope_freqs_final.pt"))
 
 
-def test_jepa_excludes_freqs_from_weight_decay():
-    import types
-    from pvt_moe.ssl.jepa import LitJEPA
-    jepa = LitJEPA(tiny_config(model={"ablation": MIXED_S3_S4}))
-    jepa.__dict__["_trainer"] = types.SimpleNamespace(estimated_stepping_batches=10)
-    opt = jepa.configure_optimizers()
-    optimizer = opt["optimizer"] if isinstance(opt, dict) else opt[0][0]
-    ids = {id(p) for n, p in jepa.context.named_parameters() if n.endswith("rope.freqs")}
-    assert ids, "the SSL context encoder should carry mixed RoPE frequencies"
-    seen = 0
-    for g in optimizer.param_groups:
-        for p in g["params"]:
-            if id(p) in ids:
-                seen += 1
-                assert g["weight_decay"] == 0.0 and not g.get("use_wd_schedule", False)
-    assert seen == len(ids)
-
-
 def test_frozen_stages_keep_freqs_trainable():
     model = build_model(tiny_config(model={"ablation": MIXED_S3_S4}))
     model.freeze_stages(3)

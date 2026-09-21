@@ -109,7 +109,7 @@ def test_write_results_is_atomic_and_keeps_eval_and_markdown_renders_without_opt
 def test_compare_runs_summarises_and_renders_a_table(capsys=None):
     with tempfile.TemporaryDirectory() as d:
         for name, acc, chain in (("a", 0.71, ["scratch@imagenet-1k_r224"]),
-                                 ("b", 0.73, ["simmim_pretrain@pass_r224", "ssl_finetune@imagenet-1k_r224"])):
+                                 ("b", 0.73, ["hf_finetune@imagenet-1k_r224", "downstream@eurosat_r224"])):
             os.makedirs(os.path.join(d, name))
             rec = {"identity": {"run_name": name, "variant": "b1", "dataset": "imagenet-1k", "chain": chain},
                    "status": {"epochs_completed": 90, "epoch_budget": 90, "finished": True},
@@ -123,7 +123,7 @@ def test_compare_runs_summarises_and_renders_a_table(capsys=None):
         assert len(files) == 2
         rows = [compare_runs.summarize(json.load(open(f)), f) for f in files]
         b = next(r for r in rows if r["run"] == "b")
-        assert b["chain"].endswith("ssl_finetune@imagenet-1k_r224") and b["top1"] == 73.0
+        assert b["chain"].endswith("downstream@eurosat_r224") and b["top1"] == 73.0
         assert b["moe_entropy"] == "1.20/1.39" and b["knn"] == 30.0 and b["test_top1"] == 72.0
         table = compare_runs.render_table(rows)
         assert "| a |" in table and "| b |" in table and "best top-1 (ep)" in table
@@ -155,17 +155,6 @@ def test_evaluate_runner_validates_knn_probes_and_merges_into_results():
             assert rec["eval"]["imagenet-1k@test"]["knn"]["top1"] == r["knn"]["top1"]
             assert rec["identity"]["chain"] == ["scratch+moe@imagenet-1k_r64"]     # untouched
             assert "## Evaluation (evaluate.py)" in open(os.path.join(run_dir, "results.md")).read()
-            # a backbone file with no head: validate is skipped, knn still runs, results.json is created
-            bdir = os.path.join(d, "sv1_custom_pass_r64_dense_norope_simmim1")
-            os.makedirs(bdir)
-            from pvt_moe.ssl import LitSimMIM
-            scfg = tiny_config(task="ssl", dataset={"name": "pass", "img_size": 64}, model={"pretrained_hf_id": None})
-            with contextlib.redirect_stdout(io.StringIO()):
-                LitSimMIM(scfg).save_backbone(os.path.join(bdir, "simmim_backbone.pt"))
-                r2 = evaluate(os.path.join(bdir, "simmim_backbone.pt"), dataset="imagenet-1k", data_dir=root,
-                              num_workers=0, knn=True, max_batches=2)
-            assert "validate" not in r2 and "knn" in r2
-            assert read_results(bdir)["identity"]["chain"] == ["simmim_pretrain@pass_r64"]
     finally:
         undo()
 
@@ -234,8 +223,6 @@ def test_results_record_the_knobs_that_change_routing_and_the_tokens_capacity_dr
     ident = run_identity(cfg)
     assert ident["moe"]["capacity_factor"] == 0.5 and ident["moe"]["gate_noise"] == 0.25
     assert ident["optim"]["grad_clip"] == cfg["optim"]["grad_clip"]
-    ssl_ident = run_identity(tiny_config(task="ssl", model={"ablation": {"use_moe": False}}))
-    assert ssl_ident["ssl"]["grad_clip"] == cfg["ssl"]["grad_clip"]
 
     # 2. the measurement is EXACT against the layer that does the dropping.
     for capacity_factor, expect_drops in ((1.0, True), (0.25, True), (0.0, False)):

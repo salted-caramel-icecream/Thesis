@@ -38,6 +38,6 @@ packages = [
     "pvt_moe.models",
     "pvt_moe.data",
     "pvt_moe.engine",
-    "pvt_moe.ssl",
+    "pvt_moe.eval",
     "pvt_moe.utils",
 ]

@@ -1,4 +1,4 @@
-"""Warm-start utilities: HF weight remapping, expert seeding, SSL init.
+"""Warm-start utilities: HF weight remapping, expert seeding, checkpoint init.
 
 Three entry points:
 
@@ -8,7 +8,7 @@ Three entry points:
   MoE blocks, and optionally seeds MoE experts from those skipped dense
   weights (sparse upcycling, Komatsuzaki et al. 2023).
 - ``load_backbone_checkpoint(model, path, ...)`` — load a backbone
-  ``state_dict`` saved by this package (e.g. a JEPA-pretrained encoder).
+  ``state_dict`` saved by this package (e.g. a previous run's encoder).
 - ``seed_moe_experts_from_dense(...)`` — copy dense fc1/fc2 into every
   expert. Layout-aware for Tutel and the native backend; refuses to guess.
 - ``seed_shared_expert_from_dense(...)`` — copy the dense FFN (fc1/fc2 AND
@@ -225,7 +225,7 @@ def moe_block_prefixes_of(model) -> set:
 def upcycle_moe_blocks(model, dense_mlp: dict, moe_block_prefixes, upcycle_init: str,
                        stats: dict | None = None) -> dict:
     """Seed every MoE'd block from the dense FFN it replaced — the ONE
-    upcycling routine, shared by the HF and the ssl_init warm starts.
+    upcycling routine, shared by the HF and the local-checkpoint warm starts.
 
     ``dense_mlp`` maps full dense-model keys (``block4.1.mlp.fc1.weight``,
     ``...mlp.dwconv.dwconv.weight``, ...) to tensors. Per block: the routed
@@ -469,13 +469,13 @@ def zero_routed_expert_output(moe_mlp) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Backbone checkpoints (SSL init, official .pth files, our own saves)
+# Backbone checkpoints (official .pth files, our own saves)
 # ---------------------------------------------------------------------------
 
 def _checkpoint_cfg(ckpt) -> dict | None:
     """The config a checkpoint was trained with, if it carries one.
 
-    ``LitJEPA.save_backbone`` writes ``{"state_dict", "cfg"}``; a Lightning
+    A backbone save writes ``{"state_dict", "cfg"}``; a Lightning
     checkpoint keeps it under ``hyper_parameters["cfg"]``.
     """
     if not isinstance(ckpt, dict):
@@ -566,7 +566,7 @@ def load_backbone_checkpoint(
     ``mlp.*`` tensors for blocks the model converted to MoE are not dropped
     but handed to ``upcycle_moe_blocks`` (when ``seed_moe_experts``), which
     seeds the routed experts and the shared expert and applies
-    ``upcycle_init`` — so a JEPA backbone's own stage-4 FFN is the dense
+    ``upcycle_init`` — so the parent backbone's own stage-4 FFN is the dense
     teacher and the MoE'd block reproduces it at step 0.
 
     With ``expected_cfg`` (the run's validated config) the checkpoint's saved
@@ -587,8 +587,8 @@ def load_backbone_checkpoint(
 
     cleaned = {}
     for k, v in state.items():
-        # "context." covers Lightning checkpoints written by LitJEPA (its
-        # encoder attribute is self.context) and "encoder." those of LitSimMIM;
+        # "context." and "encoder." cover Lightning checkpoints whose module
+        # held the backbone under one of those attribute names;
         # trailing dots keep the prefixes unambiguous. target./predictor./
         # head.0. keys intentionally get no prefix match and drop out.
         for prefix in ("model.", "module.", "backbone.", "context_encoder.", "context.",
@@ -614,9 +614,9 @@ def load_backbone_checkpoint(
             text = "\n  - ".join(problems)
             if check_arch and _checkpoint_cfg(ckpt) is not None:
                 raise ValueError(
-                    f"ssl_init checkpoint {path} was trained with a different architecture:"
+                    f"warm-start checkpoint {path} was trained with a different architecture:"
                     f"\n  - {text}\nMatch the run to the checkpoint (--variant / --rope-mode / "
-                    f"--rope-placement ...) or set model.ssl_init_check_arch: false to load "
+                    f"--rope-placement ...) or set model.warm_start_check_arch: false to load "
                     f"what fits and leave the rest at random init.")
             print(f"[backbone ckpt] WARNING: {text}")
 

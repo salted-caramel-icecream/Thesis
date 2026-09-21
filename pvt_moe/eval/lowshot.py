@@ -8,7 +8,7 @@ keeps, so a 1% / 10% fine-tune is reproducible to the image and two arms
 compared on "1%" saw the SAME 1%. Per class ``max(1, round(n_c * fraction))``
 images are drawn without replacement with ``numpy.random.default_rng(seed)``;
 for ImageNet-1k at 1% that is ~12.8 images per class, 12,811 in total, the
-size of the SimCLR / SSL-benchmark 1% split. Train with
+size of the standard low-shot 1% split. Train with
 ``--subset-file <json>`` (``dataset.subset_file``); the validation split is
 never subsetted.
 

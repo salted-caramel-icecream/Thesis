@@ -218,48 +218,6 @@ shipped `configs/*.yaml` arms are still checked for run-name collisions.
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
 
-### PASS (SSL pretraining only)
-
-| | |
-|---|---|
-| what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
-| licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
-| source | **not the Hub.** `yukimasano/pass` ships a loading script (`pass.py`), `datasets` removed loading-script support in 5.0.0, and the repo has no `refs/convert/parquet` branch to fall back on (at ~167 GB it is past the Hub's auto-conversion limit). The images come from Zenodo (record 6615455) via the dataset's own `download.sh`; this repo converts the extracted folder. Single `train` split, no validation/test |
-| `arrow_dirs` key | `pass` |
-| disk | ~166 GB snapshot, and **~333 GB while building**: the extracted JPEGs (~167 GB) and the snapshot (~166 GB) must coexist, because `save_to_disk` reads the JPEGs to embed them. `imagefolder`'s own Arrow cache holds file *paths*, not pixels, so it costs kilobytes. Delete the JPEGs once the build prints `done` and you are back to ~166 GB |
-| usable with | `task: "ssl"` only — `train.py --task ssl --dataset pass` or `notebooks/03_ssl_pretrain.ipynb` (SimMIM by default, `--ssl-method jepa`). Every supervised recipe refuses it at validate time: the corpus has no labels |
-| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is `evaluate.py` (k-NN, linear probe) plus the intermediate fine-tune on a labelled set (`docs/SIMMIM_GUIDE.md` §6) |
-
-Two steps. First fetch and extract the tars with the dataset's own script —
-delete each tar as it extracts if space is tight, since the tars and the
-extracted JPEGs are each ~167 GB and never need to coexist:
-
-```bash
-git clone https://github.com/yukimasano/PASS
-cd PASS && bash download.sh /data/pass_jpg
-```
-
-Then convert that folder into the snapshot this repo reads:
-
-```bash
-python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
-rm -rf /data/pass_jpg      # only after it prints `done` — reclaims ~167 GB
-```
-
-`--dataset pass` **without** `--from-images` exits 2 with that route spelled
-out, rather than a traceback from inside `datasets`.
-
-The conversion passes `drop_labels=True` deliberately: `download.sh` extracts
-into numbered subfolders, and `imagefolder` would otherwise read those
-directory names as a `ClassLabel` and hand an unlabelled corpus a fabricated
-ground truth. The snapshot ends up with one `image` column, which is what the
-loader expects — it finds the image column by feature type and never reads the
-creator, date or GPS columns. The build also checks the row count against
-PASS's own 1,439,588 and warns loudly if the extraction came up short.
-
-Because `save_to_disk` embeds the image bytes, the finished snapshot is
-self-contained: the JPEG folder and the `imagefolder` cache can both go.
-
 ### Small downstream sets (`--recipe downstream`)
 
 Three labelled sets for the last stage of the chain, all far below 224 px
@@ -321,23 +279,21 @@ A **recipe** fills only fields left as `None`, so anything you set wins.
 Unknown keys are rejected with a suggestion — a typo cannot silently become a
 key nothing reads.
 
-### The four recipes (and the SSL task)
+### The three recipes
 
-| | `scratch` | `pretrained` | `ssl_finetune` | `downstream` |
-|---|---|---|---|---|
-| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone) | `ssl_init` from `--ckpt` (any `last.ckpt`) |
-| epochs | 90 (ladder: 90/150/300) | 100 | 100 | fixed per dataset (30 / 50 / 30) |
-| peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) | same |
-| warmup | 5 | 3 | 20 | 5 |
-| layer-wise LR decay | — | — | 0.9 | 0.9 |
-| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 | 0.1 |
-| everything else | identical (batch, aug, MoE, weight decay, clipping) | | | |
+| | `scratch` | `pretrained` | `downstream` |
+|---|---|---|---|
+| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts | `warm_start` from `--ckpt` (any `last.ckpt`) |
+| epochs | 90 (ladder: 90/150/300) | 100 | fixed per dataset (30 / 50 / 30) |
+| peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) |
+| warmup | 5 | 3 | 5 |
+| layer-wise LR decay | — | — | 0.9 |
+| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 |
+| everything else | identical (batch, aug, MoE, weight decay, clipping) | | |
 
-Self-supervised pretraining is not a recipe but a task: `--task ssl`
-(`ssl.method` simmim | jepa) trains the backbone alone and writes
-`<run_dir>/<method>_backbone.pt`; `docs/SIMMIM_GUIDE.md` has the recipe, the
-chain and the three pretraining paths. `[optim]` / `[ssl]` lines at startup
-name the base LR, the batch it was scaled by and the result.
+The `[optim]` line at startup names the base LR, the batch it was scaled by
+and the result. Self-supervised pretraining is not here: it lives on the
+`ssl` git branch (`docs/SSL_BRANCH.md`).
 
 ### The knobs, in both front ends
 
@@ -360,7 +316,7 @@ name the base LR, the batch it was scaled by and the result.
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
 | MoE backend | `--backend tutel\|native` | `moe.backend` |
-| dataset | `--dataset imagenet-1k\|imagenet-22k` (`pass` is SSL-only and refused here) | `dataset.name` |
+| dataset | `--dataset imagenet-1k\|imagenet-22k` | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
 Before the first upcycled run on a new box: `python tools/verify_upcycling.py
@@ -590,8 +546,8 @@ composition, MoE settings, DWConv/RoPE state — and the run name encodes the
 same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
-The `r224` field is the input resolution (`dataset.img_size`). It arrived with
-the SSL chain, so a run directory created before that merge is named without
+The `r224` field is the input resolution (`dataset.img_size`). It arrived
+later than the first runs, so an early run directory may be named without
 it: `sv1_b1_in1k_dense_norope_scratch300`, where the same config now derives
 `sv1_b1_in1k_r224_dense_norope_scratch300`. `--resume-from` keeps the derived
 name, so a bare resume would load the old `last.ckpt` but write every later
@@ -616,19 +572,17 @@ Watch for these lines:
 | `[milestone] epoch N: saved full state` | a resumable snapshot exists |
 | `[rope] saved N frequency tensor(s) -> .../rope_freqs_init.pt` | the step-0 RoPE-Mixed frequencies are on disk — the drift plot in §7 needs them |
 | `val_precision_macro` far below `val_acc` | expert/class collapse — check `expert_utilization` |
-| `[chain] simmim_pretrain@pass_r224 -> ssl_finetune+moe@imagenet-1k_r224` | the warm start prepended its parent's stages; this is what `results.json` records as the run's provenance |
+| `[chain] hf_finetune@imagenet-1k_r224 -> downstream+moe@eurosat_r224` | the warm start prepended its parent's stages; this is what `results.json` records as the run's provenance |
 | `[backbone ckpt] ... seeded_moe_blocks=1 ... zeroed_routed_fc2=2` | a dense checkpoint was upcycled (path 3); `already carries the MoE weights ... nothing to upcycle` = path 2, loaded as trained |
-| `[ssl] method simmim \| base_lr 2.00e-04 x (1024 / 512) -> lr 4.00e-04` / `[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03` | the linear scaling rule was applied; `lr ... (absolute; calibrated for batch 1024)` means it was not |
-| `[optimizer] layer_decay 0.9: ... lr 2.50e-03 (head ...) .. 4.16e-04 (stage-1 patch embed ...)` | layer-wise decay is on (ssl_finetune / downstream) |
-| `[mask routing] block4.1.mlp: ... (aux loss counts both)` | MoE pretraining: how masked-position and visible tokens spread over the experts |
+| `[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03` | the linear scaling rule was applied; `lr ... (absolute; calibrated for batch 1024)` means it was not |
+| `[optimizer] layer_decay 0.9: ... lr 2.50e-03 (head ...) .. 4.16e-04 (stage-1 patch embed ...)` | layer-wise decay is on (downstream) |
 | `[config] ckpt_path ... carries no parent tag` | the checkpoint path is not `<root>/<run_name>/<file>`; two warm starts from different parents would share a directory — pass `--run-name` |
 
 Every run directory also holds **`results.json` and `results.md`**,
 rewritten at every epoch boundary: identity and chain, latest / best
 accuracy, measured seconds per epoch, images per second and peak VRAM,
 parameter counts and GFLOPs, expert utilisation, environment, a per-epoch
-history, and (for SSL runs) the note that probe / k-NN accuracy is expected
-to be low under masked image modelling (§8).
+history.
 
 ---
 
@@ -694,16 +648,16 @@ laptop and run it there while the GPU keeps training. Output goes to
 ```bash
 # a finished classifier: top-1 / top-5 on its own validation split
 python evaluate.py --ckpt /data/runs/<run>/last.ckpt --data-dir /data/imagenet_arrow
-# an SSL encoder: k-NN + linear probe on ImageNet-1k (collapse detectors — expected to read low under MIM)
-python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
+# a frozen encoder: k-NN + linear probe (collapse detectors, not the headline)
+python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset imagenet-1k \
     --data-dir /data/imagenet_arrow --knn --probe-epochs 20
 # the downstream test split, once, at the end
 python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset eurosat --data-dir /data/eurosat_arrow --split test
 # low-shot subsets: seeded, class-balanced, written once and shared by every arm
 python -m pvt_moe.eval.lowshot --dataset imagenet-1k --data-dir /data/imagenet_arrow \
     --fraction 0.01 --seed 0 --out subsets/imagenet-1k_1pct_seed0.json
-python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
-    --data-dir /data/imagenet_arrow --subset-file subsets/imagenet-1k_1pct_seed0.json
+python train.py --recipe pretrained --data-dir /data/imagenet_arrow \
+    --subset-file subsets/imagenet-1k_1pct_seed0.json
 # one table over every results.json below a root (+ CSV / markdown / a vector-PDF bar chart)
 python tools/compare_runs.py /data/runs --sort best_top1 --csv table.csv --plot figures/top1_by_run.pdf
 ```

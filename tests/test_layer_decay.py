@@ -21,7 +21,7 @@ def _lit(**over):
         return LitClassifier(tiny_config(**over))
 
 
-def test_layer_ids_follow_the_simmim_swin_rule_on_pvt_names():
+def test_layer_ids_follow_the_swin_rule_on_pvt_names():
     lit = _lit(model={"depths": [2, 2, 2, 2]})          # B1-shaped depth
     ids = lit.layer_id_of
     top = 9                                              # sum(depths) + 1
@@ -73,13 +73,12 @@ def test_layer_decay_one_keeps_the_four_group_layout():
 
 
 def test_recipes_state_the_layer_decay_they_use():
-    """docs/HPARAMS.md: ssl_finetune / downstream 0.9 (SimMIM 100-ep fine-tune);
+    """docs/HPARAMS.md: downstream 0.9 (the reference 100-ep fine-tune);
     scratch / pretrained none (1.0)."""
-    assert RECIPES["ssl_finetune"]["optim"]["layer_decay"] == 0.9
     assert RECIPES["downstream"]["optim"]["layer_decay"] == 0.9
     for recipe in ("scratch", "pretrained"):
         c = validate_config(merge_config(default_config(), {"recipe": recipe, "use_wandb": False}))
         assert c["optim"]["layer_decay"] == 1.0
-    c = validate_config(merge_config(default_config(), {"recipe": "ssl_finetune", "ckpt_path": "/x.pt",
+    c = validate_config(merge_config(default_config(), {"recipe": "downstream", "dataset": {"name": "eurosat"}, "ckpt_path": "/x.pt",
                                                         "use_wandb": False, "optim": {"layer_decay": 0.75}}))
     assert c["optim"]["layer_decay"] == 0.75                                   # explicit wins
