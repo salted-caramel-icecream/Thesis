@@ -55,7 +55,8 @@ The `sv1` prefix (`config/defaults.py` `"version"`) is bumped on every architect
 change so old and new runs never share a W&B name or a checkpoint directory.
 Two configs that differ in anything that changes the model must give
 different names (tests enforce it); a `warm_start` run is also named after its
-parent (`config.parent_tag`, read from the checkpoint's directory name) so
+parent (`config.parent_tag`, read from the parent's `results.json`, never by
+parsing its directory name) so
 the MoE-pretrain and dense-pretrain paths never share a directory.
 `cfg["chain"]` lists the stages that produced the weights
 (`hf_finetune@imagenet-1k_r224 -> downstream+moe@eurosat_r224`, `+moe` =

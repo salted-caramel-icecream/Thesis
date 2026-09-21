@@ -108,3 +108,109 @@ def test_merge_replaces_lists_wholesale():
     })
     assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
     assert cfg["model"]["variant"] == "b1"  # untouched
+
+
+def test_every_removed_key_explains_itself_instead_of_guessing():
+    """A key this package USED to have must say what became of it.
+
+    ``assert_known_keys``' did-you-mean is right for a typo and wrong for a
+    deliberate removal. Measured before this test existed: ``--set task=ssl``
+    answered "Did you mean 'optim.betas'?" — a fuzzy match on a key the user
+    never meant, for an axis that moved to another git branch. Each entry is
+    asserted to reach the message, and to beat the did-you-mean to it.
+    """
+    from pvt_moe.config import REMOVED_KEYS
+    from pvt_moe.config.validate import assert_known_keys
+
+    # Iterating the map alone cannot catch a DELETED entry — there would be
+    # nothing left to check. The keys this change set removed are therefore
+    # named. This list is not derivable from the code (nothing records what a
+    # key used to be), and it only grows when someone deliberately removes a
+    # key, so it is a record rather than a second copy to keep in sync.
+    for expected in ("model.norm_type", "model.stage4_keeps_layernorm",
+                     "task", "ssl", "model.ssl_init_check_arch"):
+        assert expected in REMOVED_KEYS, \
+            f"{expected} was removed from the config but no longer explains itself"
+
+    assert REMOVED_KEYS, "the map is empty; removals would fall back to did-you-mean"
+    for dotted, message in REMOVED_KEYS.items():
+        cfg = default_config()
+        node = cfg
+        parts = dotted.split(".")
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = "whatever"
+        try:
+            assert_known_keys(cfg)
+        except ValueError as e:
+            text = str(e)
+            assert message in text, f"{dotted}: message not shown, got {text!r}"
+            assert "Did you mean" not in text, \
+                f"{dotted}: fell through to a did-you-mean instead of its message"
+        else:
+            raise AssertionError(f"{dotted} was accepted; it is supposed to be removed")
+
+
+def test_removed_keys_does_not_claim_a_key_that_still_exists():
+    """A live key listed here would be unreachable prose.
+
+    ``model.moe.backend`` is the case in point: only the ``megablocks`` VALUE
+    was removed, so the key is still real and a bad value is caught by
+    ``validate_config`` with the list of the ones that remain. Listing it
+    would be a message that never prints.
+    """
+    from pvt_moe.config import REMOVED_KEYS
+    from pvt_moe.config.validate import _schema_paths
+    from pvt_moe.config.defaults import _DEFAULT
+
+    live = _schema_paths(_DEFAULT)
+    for dotted in REMOVED_KEYS:
+        assert dotted not in live, f"{dotted} still exists in default_config(); its message is dead code"
+
+
+def test_parent_tag_reads_results_json_and_degrades_to_a_warning():
+    """Lineage comes from the parent's results.json, never from its directory name.
+
+    Phase 3 deleted the path parser: a run name that changes format must not
+    be able to silently break warm-start lineage. Two halves, both required:
+
+    1. with the parent's results.json present, the child's name carries
+       ``_from-<moe>-<budget>`` taken verbatim from ``identity``;
+    2. with it absent, ``parent_tag`` returns ``None`` and ``validate_config``
+       WARNS (telling you to pass ``--run-name``) rather than raising — the
+       documented contract, since a checkpoint can be copied on its own.
+    """
+    import json
+    import os
+    import tempfile
+
+    from pvt_moe.config import parent_tag
+
+    with tempfile.TemporaryDirectory() as root:
+        run_dir = os.path.join(root, "sv1_b1_in1k_r224_dense_norope_ft100")
+        os.makedirs(run_dir)
+        ckpt = os.path.join(run_dir, "last.ckpt")
+        open(ckpt, "wb").close()
+
+        results = os.path.join(run_dir, "results.json")
+        with open(results, "w", encoding="utf-8") as fh:
+            json.dump({"identity": {"name_moe": "dense", "name_budget": "ft100"}}, fh)
+        assert parent_tag(ckpt) == "from-dense-ft100"
+
+        # the tokens are read, not re-derived: a name the parser could never
+        # have produced still round-trips
+        with open(results, "w", encoding="utf-8") as fh:
+            json.dump({"identity": {"name_moe": "moe", "name_budget": "dstr50-from-dense-ft100"}}, fh)
+        assert parent_tag(ckpt) == "from-moe-dstr50-from-dense-ft100"
+
+        cfg = merge_config(default_config(), {
+            "recipe": "downstream", "dataset": {"name": "eurosat"}, "ckpt_path": ckpt})
+        assert validate_config(cfg)["run_name"].endswith("_from-moe-dstr50-from-dense-ft100")
+
+        # no results.json -> None, and validate_config warns rather than raising
+        os.remove(results)
+        assert parent_tag(ckpt) is None
+        cfg = merge_config(default_config(), {
+            "recipe": "downstream", "dataset": {"name": "eurosat"}, "ckpt_path": ckpt})
+        name = validate_config(cfg)["run_name"]
+        assert "_from-" not in name, f"a parentless warm start must carry no parent tag: {name}"

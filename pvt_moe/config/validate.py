@@ -116,10 +116,19 @@ def drop_removed_keys(cfg: dict) -> list:
 #: This is a message map, NOT a migration engine: there are no checkpoints and
 #: no saved configs carrying these keys, so nothing needs rewriting — only
 #: explaining. If one ever turns up, the message names the key to hand-edit.
+#: ``model.moe.backend`` is deliberately absent: the KEY still exists, only the
+#: ``megablocks`` VALUE went, and a bad value is caught by ``validate_config``
+#: with the list of the ones that remain.
 REMOVED_KEYS = {
     "model.norm_type": "RMSNorm was removed; LayerNorm is the only norm.",
     "model.stage4_keeps_layernorm":
         "only meaningful under RMSNorm, which was removed; LayerNorm is the only norm.",
+    "task": "self-supervised pretraining moved to the 'ssl' git branch "
+            "(docs/SSL_BRANCH.md); this branch is supervised only.",
+    "ssl": "self-supervised pretraining moved to the 'ssl' git branch "
+           "(docs/SSL_BRANCH.md); this branch is supervised only.",
+    "model.ssl_init_check_arch": "renamed to model.warm_start_check_arch when "
+                                 "mode 'ssl_init' became 'warm_start'.",
 }
 
 
@@ -325,8 +334,8 @@ def validate_config(cfg: dict) -> dict:
     if cfg["run_name"] is None:
         cfg["run_name"] = build_run_tag(cfg)
         if cfg["mode"] == "warm_start" and parent_tag(cfg.get("ckpt_path")) is None:
-            print(f"[config] ckpt_path {cfg['ckpt_path']!r} is not <root>/<run_name>/<file>, so "
-                  "the run name carries no parent tag: two warm starts from different "
+            print(f"[config] no readable results.json beside {cfg['ckpt_path']!r}, so the "
+                  "run name carries no parent tag: two warm starts from different "
                   "parents would share a checkpoint directory — pass --run-name.")
 
     assert_json_safe(cfg)
