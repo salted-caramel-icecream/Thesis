@@ -4,7 +4,7 @@ PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
 official size) with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
 lineage. The two source notebooks are kept untouched in the repo root for
-provenance — see `docs/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
+provenance — see `archive/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
 where each cell ended up.
 
 ```
@@ -27,7 +27,7 @@ docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
                 SIMMIM_GUIDE.md (SSL: recipe, the stem leak, three pretraining
                 paths, the chain, evaluation protocol), JEPA_GUIDE.md (the
-                alternative SSL method), NOTEBOOK_TO_PACKAGE.md
+                alternative SSL method)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py);
                 --task ssl pretrains, --recipe ssl_finetune / downstream chain
 evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
