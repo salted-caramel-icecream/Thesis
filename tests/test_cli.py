@@ -6,6 +6,7 @@ precedence order is default < --config < --ladder < flags < --set.
 
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 import tempfile
@@ -616,3 +617,53 @@ def test_check_env_batch_suggestion_reaches_the_effective_batch():
         raw = int(free_gib * 0.7 / _APPROX_GIB_PER_IMAGE)
         got = max((b for b in (32, 64, 128, 256, 512, 1024) if b <= raw), default=16)
         assert got == want, f"{free_gib} GiB -> {got}, docs say {want}"
+
+
+def test_every_parser_flag_reaches_a_real_config_key():
+    """A flag that writes nowhere is the bug this guards.
+
+    build_config used to iterate a hand-written dest -> path map, so adding a
+    top-level flag and forgetting its entry made the flag silently do nothing.
+    It now walks argparse's own namespace and falls back to the dest name, with
+    _CLI_ONLY_DESTS naming the ones build_config handles itself. That inverts
+    the failure: a flag missing from _CLI_ONLY_DESTS writes an unknown
+    top-level key and assert_known_keys rejects it loudly.
+
+    Here we check the other half — every dest that is NOT cli-only resolves to
+    a path that actually exists in default_config().
+    """
+    from pvt_moe.cli import _CLI_ONLY_DESTS, _flag_path, build_parser
+    from pvt_moe.config import default_config
+
+    def exists(cfg, dotted):
+        node = cfg
+        for key in dotted.split("."):
+            if not isinstance(node, dict) or key not in node:
+                return False
+            node = node[key]
+        return True
+
+    cfg = default_config()
+    missing = sorted(
+        f"{d} -> {_flag_path(d)}"
+        for d in vars(build_parser().parse_args([]))
+        if d not in _CLI_ONLY_DESTS and not exists(cfg, _flag_path(d))
+    )
+    assert not missing, f"flags that write to a non-existent config key: {missing}"
+
+
+def test_the_two_ladders_agree_on_the_rows_they_share():
+    """Rows 3, 4, 7, 8, 9 are the same architecture in both ladders — only the
+    budget and the warm start differ. The pretrained ones are DERIVED from the
+    scratch ones (config._upcycled) so they cannot drift; this pins the
+    relationship in case someone inlines them again."""
+    from pvt_moe.config import LADDERS
+
+    for row in (3, 4, 7, 8, 9):
+        a = copy.deepcopy(LADDERS["scratch"][row])
+        b = copy.deepcopy(LADDERS["pretrained"][row])
+        # the two documented differences, and the description
+        assert b.pop("epochs") == 100 and a.pop("epochs") == 90, row
+        assert b["model"].pop("seed_moe_from_dense") is True, row
+        a.pop("_desc"), b.pop("_desc")
+        assert a == b, f"ladder row {row} differs beyond budget and warm start: {a} vs {b}"

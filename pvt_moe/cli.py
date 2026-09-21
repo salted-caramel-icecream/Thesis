@@ -331,16 +331,16 @@ def _nest(dotted: str, value):
     return out
 
 
-#: flag dest -> dotted config path. Only entries whose value is not None are
-#: applied, so an unset flag never shadows the recipe.
+#: flag dest -> dotted config path, for the flags whose config key is NOT
+#: the dest name. Everything else falls back to the dest itself (see
+#: _flag_path), so adding a top-level flag needs no entry here — forgetting
+#: one used to make the flag silently do nothing.
 _FLAG_PATHS = {
     "variant": "model.variant",
-    "epochs": "epochs",
     "base_lr": "optim.base_lr",
     "layer_decay": "optim.layer_decay",
     "img_size": "dataset.img_size",
     "subset_file": "dataset.subset_file",
-    "stop_at_epoch": "stop_at_epoch",
     "lr": "optim.lr",
     "warmup_epochs": "optim.warmup_epochs",
     "weight_decay": "optim.weight_decay",
@@ -362,26 +362,37 @@ _FLAG_PATHS = {
     "backend": "model.moe.backend",
     "shared_expert": "model.moe.shared_expert",
     "upcycle_init": "model.moe.upcycle_init",
-    "mode": "mode",
-    "ckpt_path": "ckpt_path",
     "pretrained_hf_id": "model.pretrained_hf_id",
     "seed_moe_from_dense": "model.seed_moe_from_dense",
     "dataset_name": "dataset.name",
     "repeated_aug": "dataset.repeated_aug",
-    "batch_size": "batch_size",
-    "effective_batch_size": "effective_batch_size",
-    "accumulate_grad_batches": "accumulate_grad_batches",
-    "num_workers": "num_workers",
-    "precision": "precision",
-    "seed": "seed",
-    "run_name": "run_name",
-    "run_suffix": "run_suffix",
-    "checkpoint_root": "checkpoint_root",
-    "log_root": "log_root",
-    "use_wandb": "use_wandb",
-    "use_tensorboard": "use_tensorboard",
-    "deterministic": "deterministic",
 }
+
+
+def _flag_path(dest: str) -> str:
+    """Where a flag writes. A dest with no entry is a top-level key of its
+    own name, which is most of them."""
+    return _FLAG_PATHS.get(dest, dest)
+
+
+#: Flag dests build_config handles ITSELF and must not copy straight into the
+#: config: the CLI's own controls, and the ones that parse JSON or drive the
+#: mode. Everything else in the parsed namespace goes to _flag_path(dest).
+#:
+#: Deriving the rest from argparse's namespace rather than from a second
+#: hand-written list is the point: a new flag needs no bookkeeping, and a flag
+#: that DOES need special handling but is missing here writes an unknown
+#: top-level key, which assert_known_keys rejects loudly rather than silently
+#: ignoring it.
+_CLI_ONLY_DESTS = frozenset({
+    # the CLI's own behaviour, never config keys
+    "check_env", "dry_run", "print_config", "save_config", "overfit_check",
+    "config", "overrides", "ladder", "recipe", "resume_from",
+    # applied separately: these parse JSON
+    "moe_placement", "rope_placement", "grad_checkpointing", "milestones",
+    # applied separately: sets dataset.arrow_dirs for the chosen dataset
+    "data_dir",
+})
 
 
 def build_config(args, verbose: bool = True) -> dict:
@@ -423,10 +434,12 @@ def build_config(args, verbose: bool = True) -> dict:
         # download HF weights, upcycle, and then have all of it overwritten.
         cfg = merge_config(cfg, {"mode": "resume", "ckpt_path": args.resume_from})
 
-    for dest, path in _FLAG_PATHS.items():
-        value = getattr(args, dest, None)
-        if value is not None:
-            cfg = merge_config(cfg, _nest(path, value))
+    # Only values that are not None are applied, so an unset flag never
+    # shadows the recipe.
+    for dest, value in vars(args).items():
+        if value is None or dest in _CLI_ONLY_DESTS:
+            continue
+        cfg = merge_config(cfg, _nest(_flag_path(dest), value))
 
     for dest, path in (("moe_placement", "model.ablation.moe_placement"),
                        ("rope_placement", "model.ablation.rope_placement"),

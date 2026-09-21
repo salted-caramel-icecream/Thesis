@@ -808,57 +808,79 @@ def run_name_parts(cfg: dict) -> dict:
 # Ablation ladders (docs/HPARAMS.md section 4)
 # ---------------------------------------------------------------------------
 
+def _upcycled(arm: dict, desc: str, epochs: int = 100) -> dict:
+    """A scratch ladder row as its `pretrained` twin.
+
+    Rows 3, 4, 7, 8 and 9 are the SAME architecture in both ladders — only the
+    budget and the warm start differ — so the pretrained ones are derived here
+    rather than restated. Written out twice they agreed only by careful
+    editing: change a placement in one and the two ladders silently disagree
+    about what "row 8" means, with nothing to catch it.
+    """
+    row = copy.deepcopy(arm)
+    row["_desc"] = desc
+    row["epochs"] = epochs
+    row.setdefault("model", {})["seed_moe_from_dense"] = True
+    return row
+
+
 #: Overrides for each numbered ladder row, keyed by recipe then row number.
 #: Each entry sets ONLY what the spec's table names for that row; everything
 #: else comes from the recipe and your own flags. ``_note`` is printed when
 #: the row is applied so nothing is silently assumed.
+_SCRATCH_LADDER = {
+    1: {"_desc": "Baseline, conv-FFN intact", "epochs": 90,
+        "model": {"dense_dwconv": True,
+                  "ablation": {"use_moe": False, "use_rope": False}}},
+    2: {"_desc": "Dense, no DWConv + RoPE", "epochs": 90,
+        "_note": "the DWConv is removed from EVERY block, so RoPE is "
+                 "placed in every block too — the architecture edit as a "
+                 "whole. Pass --rope-placement for a narrower arm.",
+        "model": {"dense_dwconv": False,
+                  "ablation": {"use_moe": False, "use_rope": True,
+                               "rope_last_n_stages": 4}}},
+    3: {"_desc": "MoE, no shared", "epochs": 90,
+        "model": {"moe": {"num_experts": 4, "shared_expert": False},
+                  "ablation": {"use_moe": True,
+                               "moe_placement": [[], [], [], [-1]]}}},
+    4: {"_desc": "MoE + shared", "epochs": 90,
+        "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                  "ablation": {"use_moe": True,
+                               "moe_placement": [[], [], [], [-1]]}}},
+    5: {"_desc": "Final, best config", "epochs": 300,
+        "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
+                 "only; carry the winning architecture flags yourself."},
+    6: {"_desc": "Dense, no DWConv, no RoPE", "epochs": 90,
+        "model": {"dense_dwconv": False,
+                  "ablation": {"use_moe": False, "use_rope": False}}},
+    7: {"_desc": "N=8, last stage", "epochs": 90,
+        "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                  "ablation": {"use_moe": True,
+                               "moe_placement": [[], [], [], [-1]]}}},
+    8: {"_desc": "N=4, stages 3 & 4", "epochs": 90,
+        "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                 "(this repo places RoPE where MoE is). Pass "
+                 "--rope-placement to decouple the two axes.",
+        "model": {"moe": {"num_experts": 4, "shared_expert": True},
+                  "ablation": {"use_moe": True,
+                               "moe_placement": [[], [], [-1], [-1]],
+                               "rope_placement": [[], [], [-1], [-1]]}}},
+    9: {"_desc": "N=8, stages 3 & 4", "epochs": 90,
+        "_note": "RoPE moved to stages 3+4 to match the MoE placement "
+                 "(this repo places RoPE where MoE is). Pass "
+                 "--rope-placement to decouple the two axes.",
+        "model": {"moe": {"num_experts": 8, "shared_expert": True},
+                  "ablation": {"use_moe": True,
+                               "moe_placement": [[], [], [-1], [-1]],
+                               "rope_placement": [[], [], [-1], [-1]]}}},
+}
+
 LADDERS = {
-    "scratch": {
-        1: {"_desc": "Baseline, conv-FFN intact", "epochs": 90,
-            "model": {"dense_dwconv": True,
-                      "ablation": {"use_moe": False, "use_rope": False}}},
-        2: {"_desc": "Dense, no DWConv + RoPE", "epochs": 90,
-            "_note": "the DWConv is removed from EVERY block, so RoPE is "
-                     "placed in every block too — the architecture edit as a "
-                     "whole. Pass --rope-placement for a narrower arm.",
-            "model": {"dense_dwconv": False,
-                      "ablation": {"use_moe": False, "use_rope": True,
-                                   "rope_last_n_stages": 4}}},
-        3: {"_desc": "MoE, no shared", "epochs": 90,
-            "model": {"moe": {"num_experts": 4, "shared_expert": False},
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
-        4: {"_desc": "MoE + shared", "epochs": 90,
-            "model": {"moe": {"num_experts": 4, "shared_expert": True},
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
-        5: {"_desc": "Final, best config", "epochs": 300,
-            "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
-                     "only; carry the winning architecture flags yourself."},
-        6: {"_desc": "Dense, no DWConv, no RoPE", "epochs": 90,
-            "model": {"dense_dwconv": False,
-                      "ablation": {"use_moe": False, "use_rope": False}}},
-        7: {"_desc": "N=8, last stage", "epochs": 90,
-            "model": {"moe": {"num_experts": 8, "shared_expert": True},
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
-        8: {"_desc": "N=4, stages 3 & 4", "epochs": 90,
-            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
-                     "(this repo places RoPE where MoE is). Pass "
-                     "--rope-placement to decouple the two axes.",
-            "model": {"moe": {"num_experts": 4, "shared_expert": True},
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [-1], [-1]],
-                                   "rope_placement": [[], [], [-1], [-1]]}}},
-        9: {"_desc": "N=8, stages 3 & 4", "epochs": 90,
-            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
-                     "(this repo places RoPE where MoE is). Pass "
-                     "--rope-placement to decouple the two axes.",
-            "model": {"moe": {"num_experts": 8, "shared_expert": True},
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [-1], [-1]],
-                                   "rope_placement": [[], [], [-1], [-1]]}}},
-    },
+    "scratch": _SCRATCH_LADDER,
+    # Rows 1, 2 and 6 are NOT the scratch rows: 1 is eval-only, 2 names just
+    # "no MoE", and 6 is the random-expert-init control, which exists only
+    # where there is something to upcycle. The rest are the scratch rows,
+    # upcycled.
     "pretrained": {
         1: {"_desc": "Pretrained PVT v2 B1, eval only", "epochs": 0,
             "model": {"dense_dwconv": True,
@@ -869,16 +891,8 @@ LADDERS = {
             "_note": "the spec names only 'no MoE' for this row; dense_dwconv "
                      "and use_rope stay at your flags/defaults. For 2->3 to "
                      "isolate MoE alone, match them to your MoE runs."},
-        3: {"_desc": "MoE upcycled, no shared", "epochs": 100,
-            "model": {"moe": {"num_experts": 4, "shared_expert": False},
-                      "seed_moe_from_dense": True,
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
-        4: {"_desc": "MoE upcycled + shared", "epochs": 100,
-            "model": {"moe": {"num_experts": 4, "shared_expert": True},
-                      "seed_moe_from_dense": True,
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
+        3: _upcycled(_SCRATCH_LADDER[3], "MoE upcycled, no shared"),
+        4: _upcycled(_SCRATCH_LADDER[4], "MoE upcycled + shared"),
         5: {"_desc": "Final, best config", "epochs": 300,
             "_note": "row 5 is 'best config' — it sets the 300-epoch budget "
                      "only; carry the winning architecture flags yourself."},
@@ -889,29 +903,9 @@ LADDERS = {
                                    "moe_placement": [[], [], [], [-1]]}},
             "_note": "seed_moe_from_dense=False — this row IS the upcycling "
                      "claim (replicated vs random expert init)."},
-        7: {"_desc": "N=8, last stage", "epochs": 100,
-            "model": {"moe": {"num_experts": 8, "shared_expert": True},
-                      "seed_moe_from_dense": True,
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [], [-1]]}}},
-        8: {"_desc": "N=4, stages 3 & 4", "epochs": 100,
-            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
-                     "(this repo places RoPE where MoE is). Pass "
-                     "--rope-placement to decouple the two axes.",
-            "model": {"moe": {"num_experts": 4, "shared_expert": True},
-                      "seed_moe_from_dense": True,
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [-1], [-1]],
-                                   "rope_placement": [[], [], [-1], [-1]]}}},
-        9: {"_desc": "N=8, stages 3 & 4", "epochs": 100,
-            "_note": "RoPE moved to stages 3+4 to match the MoE placement "
-                     "(this repo places RoPE where MoE is). Pass "
-                     "--rope-placement to decouple the two axes.",
-            "model": {"moe": {"num_experts": 8, "shared_expert": True},
-                      "seed_moe_from_dense": True,
-                      "ablation": {"use_moe": True,
-                                   "moe_placement": [[], [], [-1], [-1]],
-                                   "rope_placement": [[], [], [-1], [-1]]}}},
+        7: _upcycled(_SCRATCH_LADDER[7], "N=8, last stage"),
+        8: _upcycled(_SCRATCH_LADDER[8], "N=4, stages 3 & 4"),
+        9: _upcycled(_SCRATCH_LADDER[9], "N=8, stages 3 & 4"),
     },
 }
 
