@@ -1,0 +1,90 @@
+# The gate, enforced.
+#
+# CLAUDE.md calls `python tests/run_all.py` "the gate before any GPU run", but
+# until this workflow existed nothing ran it except a person remembering to.
+# A run here costs a few free CPU minutes; a bad arm costs days of GPU.
+#
+# Deliberately NOT here: anything needing a GPU, a real dataset or Tutel. Those
+# are `--check-env` and `tools/check_kernels.py`, and they run on the training
+# machine. This workflow is the CPU half, which is the half that can be
+# automated.
+name: tests
+
+on:
+  push:
+    branches: [main, ssl]        # the long-lived branches
+  pull_request:                  # every feature branch, via its PR
+  workflow_dispatch:             # a branch with no PR yet, on demand
+
+# A second push supersedes the first; don't burn minutes on a stale commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packaging:
+    # Fast and torch-free, so it reports in under a minute rather than after
+    # the suite. This is the check that would have caught the three broken
+    # installs of the 2026 cleanup -- see tools/check_packaging.py.
+    name: wheel ships every package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip setuptools wheel
+      - run: python tools/check_packaging.py
+
+  gate:
+    name: CPU test suite (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40          # the suite is ~5 min; the rest is the install
+    strategy:
+      fail-fast: false           # one version failing should not hide the other
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # CPU wheels explicitly. Plain `pip install torch` on Linux pulls the
+      # CUDA build -- gigabytes of kernels this runner has no GPU to use, and
+      # enough to exhaust its disk. Installed BEFORE the package so the
+      # torch>=2.3 dependency is already satisfied and pip does not re-resolve
+      # it from PyPI.
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the package
+        run: python -m pip install -e .
+
+      # Fails the job if the wheel is CUDA: that would mean the step above
+      # silently fell back to PyPI and the cache is wrong.
+      - name: Show what we are testing
+        run: |
+          python -c "import torch, sys; print('torch', torch.__version__, '| python', sys.version.split()[0]); \
+                     sys.exit('CUDA wheel on a CPU runner' if '+cu' in torch.__version__ else 0)"
+
+      # The gate itself. Must end in "N passed, 0 failed"; run_all.py exits
+      # non-zero otherwise, including when a module fails merely to import.
+      - name: Run the gate
+        run: python tests/run_all.py
+
+      # Torch-free resolution: proves --dry-run still resolves a config without
+      # importing torch, and that the ladder rows all validate. Cheap, and it
+      # is the property the CLI's speed depends on.
+      - name: Resolve every ladder row (no torch)
+        run: |
+          for row in 1 2 3 4 5 6 7 8 9; do
+            python train.py --recipe scratch --ladder "$row" --dry-run > /dev/null
+          done
+          python train.py --recipe pretrained --dry-run > /dev/null
