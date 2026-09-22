@@ -127,12 +127,33 @@ def test_freeze_stages():
 
 
 def test_return_tokens_gives_the_stage4_sequence():
-    """return_tokens is what the k-NN / probe feature extractors consume."""
+    """return_tokens is what the k-NN / probe feature extractors consume.
+
+    ``eval()`` is REQUIRED, not tidiness. This compares two separate forward
+    passes, and ``tiny_config`` sets ``drop_path_rate: 0.1`` while
+    ``build_model`` returns a module in TRAIN mode, so in train mode each pass
+    samples its own stochastic-depth mask and the two disagree by O(1e-2) --
+    a thousand times the tolerance. Measured over 40 seeds: 37/40 exceed
+    atol=1e-5 in train mode (max 2.4e-02), 0/40 in eval mode (max exactly
+    0.0, since it is then the same tensor reduced the same way).
+
+    The test used to omit ``eval()`` and passed only by luck of the RNG state
+    it inherited; it began failing on a different torch build, which looked
+    like a GPU tolerance problem and was not one.
+    """
     cfg = tiny_config()
-    model = build_model(cfg)
+    model = build_model(cfg).eval()
     x = torch.randn(2, 3, 224, 224)
-    tokens, aux = model.forward_features(x, return_tokens=True)
-    assert tokens.shape == (2, 49, cfg["model"]["embed_dims"][-1])
-    pooled, _ = model.forward_features(x)
+    with torch.no_grad():
+        tokens, aux = model.forward_features(x, return_tokens=True)
+        assert tokens.shape == (2, 49, cfg["model"]["embed_dims"][-1])
+        pooled, _ = model.forward_features(x)
     assert pooled.shape == (2, cfg["model"]["embed_dims"][-1])
-    assert torch.allclose(pooled, tokens.mean(dim=1), atol=1e-5)
+    delta = (pooled - tokens.mean(dim=1)).abs().max().item()
+    assert delta <= 1e-5, (
+        f"mean-pooled features disagree with the token mean by {delta:.3e} "
+        f"(atol 1e-5). In eval mode these are the SAME reduction of the same "
+        f"tensor, so any non-zero delta means forward_features is no longer "
+        f"returning x.mean(dim=1), or the module is not deterministic "
+        f"(training={model.training})."
+    )

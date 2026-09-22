@@ -201,7 +201,41 @@ class LitClassifier(pl.LightningModule):
         if n_frozen > 0:
             self.model.freeze_stages(n_frozen)  # re-freeze after .train()
 
+    def on_before_optimizer_step(self, optimizer):
+        """Log the pre-clip gradient norm and whether ``grad_clip`` is binding.
+
+        Lightning calls this ONCE per optimizer step, after accumulation and
+        before clipping, so the norm here is the accumulated (averaged)
+        gradient -- the quantity ``optim.grad_clip`` is actually compared
+        against. Verified: with ``accumulate_grad_batches=8`` the hook fires
+        once per 8 micro-batches, and a norm of 56.0 becomes 1.0 after a
+        ``gradient_clip_val=1.0``.
+
+        Without this, "is clipping binding?" is unanswerable from a finished
+        run: a clip that fires on most steps silently caps the effective LR,
+        which looks exactly like a learning-rate problem.
+        """
+        clip = self.cfg["optim"].get("grad_clip") or 0.0
+        total = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(p.grad.detach())
+                         for p in self.parameters() if p.grad is not None])
+        ) if any(p.grad is not None for p in self.parameters()) else None
+        if total is None:
+            return
+        self._clip_steps = getattr(self, "_clip_steps", 0) + 1
+        clipped = bool(clip) and bool(total > clip)
+        self._clip_hits = getattr(self, "_clip_hits", 0) + int(clipped)
+        self.log("grad_norm", total, on_step=True, on_epoch=True, prog_bar=False)
+        self.log("grad_clipped_frac", float(clipped), on_step=False, on_epoch=True)
+
     def on_train_epoch_end(self):
+        steps = getattr(self, "_clip_steps", 0)
+        if steps:
+            hits = getattr(self, "_clip_hits", 0)
+            clip = self.cfg["optim"].get("grad_clip")
+            print(f"[grad] clip {clip}: binding on {hits}/{steps} optimizer steps "
+                  f"({100.0 * hits / steps:.1f}%) this epoch")
+            self._clip_steps = self._clip_hits = 0
         # Free fragmented CUDA memory between epochs (large-batch runs OOM'd
         # at scheduler transitions without this).
         gc.collect()
