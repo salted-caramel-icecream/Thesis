@@ -201,64 +201,21 @@ Then **compose** it with an ablation arm — `--config` may be repeated, the
 files merge in order and a later file wins on any key both set:
 
 ```bash
-python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml
+python train.py --config configs/my_paths.local.yaml --recipe scratch --ladder 1
 ```
 
 This is the one documented command that needs a file you create first: from
 a clean checkout it stops with `error: --config file not found`, by design.
 
 Never run the paths file alone. It sets no architecture, so alone it resolves
-to the default arm and gets the same `run_name` as
-`configs/scratch_04_moe_shared.yaml` (row 4) — it would write into row 4's
-checkpoint directory. Because a `*.local.yaml` can collide with a ladder row
-like that by construction, the test suite's shipped-config sweep
-(`tests/test_cli.py`, `tests/test_variants.py`) skips `*.local.yaml`; the
-shipped `configs/*.yaml` arms are still checked for run-name collisions.
+to the default arm — ladder row 4 — and would write into that run's
+checkpoint directory. Because a `*.local.yaml` collides with a ladder row like
+that by construction, `shipped_config_files()` excludes `*.local.yaml` and the
+test suite sweeps the **ladder** for run-name collisions
+(`tests/test_cli.py`, `tests/test_variants.py`).
 
 A missing snapshot raises with these instructions rather than silently
 re-downloading 160 GB.
-
-### PASS (SSL pretraining only)
-
-| | |
-|---|---|
-| what | 1,439,588 unlabelled images, **no people**, sourced from YFCC-100M (Asano et al., NeurIPS Datasets & Benchmarks 2021) |
-| licence | CC-BY 4.0 (images and dataset); **not gated, no token** |
-| source | **not the Hub.** `yukimasano/pass` ships a loading script (`pass.py`), `datasets` removed loading-script support in 5.0.0, and the repo has no `refs/convert/parquet` branch to fall back on (at ~167 GB it is past the Hub's auto-conversion limit). The images come from Zenodo (record 6615455) via the dataset's own `download.sh`; this repo converts the extracted folder. Single `train` split, no validation/test |
-| `arrow_dirs` key | `pass` |
-| disk | ~166 GB snapshot, and **~333 GB while building**: the extracted JPEGs (~167 GB) and the snapshot (~166 GB) must coexist, because `save_to_disk` reads the JPEGs to embed them. `imagefolder`'s own Arrow cache holds file *paths*, not pixels, so it costs kilobytes. Delete the JPEGs once the build prints `done` and you are back to ~166 GB |
-| usable with | `task: "ssl"` only — `train.py --task ssl --dataset pass` or `notebooks/03_ssl_pretrain.ipynb` (SimMIM by default, `--ssl-method jepa`). Every supervised recipe refuses it at validate time: the corpus has no labels |
-| validation | none — SSL runs with **no validation loader**; the monitored metric is the training `ssl_loss`, and the evaluation is `evaluate.py` (k-NN, linear probe) plus the intermediate fine-tune on a labelled set (`docs/SIMMIM_GUIDE.md` §6) |
-
-Two steps. First fetch and extract the tars with the dataset's own script —
-delete each tar as it extracts if space is tight, since the tars and the
-extracted JPEGs are each ~167 GB and never need to coexist:
-
-```bash
-git clone https://github.com/yukimasano/PASS
-cd PASS && bash download.sh /data/pass_jpg
-```
-
-Then convert that folder into the snapshot this repo reads:
-
-```bash
-python download_data.py --dataset pass --from-images /data/pass_jpg --out /data/pass_arrow
-rm -rf /data/pass_jpg      # only after it prints `done` — reclaims ~167 GB
-```
-
-`--dataset pass` **without** `--from-images` exits 2 with that route spelled
-out, rather than a traceback from inside `datasets`.
-
-The conversion passes `drop_labels=True` deliberately: `download.sh` extracts
-into numbered subfolders, and `imagefolder` would otherwise read those
-directory names as a `ClassLabel` and hand an unlabelled corpus a fabricated
-ground truth. The snapshot ends up with one `image` column, which is what the
-loader expects — it finds the image column by feature type and never reads the
-creator, date or GPS columns. The build also checks the row count against
-PASS's own 1,439,588 and warns loudly if the extraction came up short.
-
-Because `save_to_disk` embeds the image bytes, the finished snapshot is
-self-contained: the JPEG folder and the `imagefolder` cache can both go.
 
 ### Small downstream sets (`--recipe downstream`)
 
@@ -321,23 +278,21 @@ A **recipe** fills only fields left as `None`, so anything you set wins.
 Unknown keys are rejected with a suggestion — a typo cannot silently become a
 key nothing reads.
 
-### The four recipes (and the SSL task)
+### The three recipes
 
-| | `scratch` | `pretrained` | `ssl_finetune` | `downstream` |
-|---|---|---|---|---|
-| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone) | `ssl_init` from `--ckpt` (any `last.ckpt`) |
-| epochs | 90 (ladder: 90/150/300) | 100 | 100 | fixed per dataset (30 / 50 / 30) |
-| peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) | same |
-| warmup | 5 | 3 | 20 | 5 |
-| layer-wise LR decay | — | — | 0.9 | 0.9 |
-| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 | 0.1 |
-| everything else | identical (batch, aug, MoE, weight decay, clipping) | | | |
+| | `scratch` | `pretrained` | `downstream` |
+|---|---|---|---|
+| init | random | `OpenGVLab/pvt_v2_<variant>` (B1 by default) + upcycled experts | `warm_start` from `--ckpt` (any `last.ckpt`) |
+| epochs | 90 (ladder: 90/150/300) | 100 | fixed per dataset (30 / 50 / 30) |
+| peak LR | 1e-3 (absolute, @ 1024) | 1e-4 | 1.25e-3 per 512, **scaled** to the effective batch (2.5e-3 at 1024) |
+| warmup | 5 | 3 | 5 |
+| layer-wise LR decay | — | — | 0.9 |
+| stochastic depth | the variant's official rate (b0–b2 0.1, b3–b5 0.3), any budget | 0.1 | 0.1 |
+| everything else | identical (batch, aug, MoE, weight decay, clipping) | | |
 
-Self-supervised pretraining is not a recipe but a task: `--task ssl`
-(`ssl.method` simmim | jepa) trains the backbone alone and writes
-`<run_dir>/<method>_backbone.pt`; `docs/SIMMIM_GUIDE.md` has the recipe, the
-chain and the three pretraining paths. `[optim]` / `[ssl]` lines at startup
-name the base LR, the batch it was scaled by and the result.
+The `[optim]` line at startup names the base LR, the batch it was scaled by
+and the result. Self-supervised pretraining is not here: it lives on the
+`ssl` git branch (`docs/SSL_BRANCH.md`).
 
 ### The knobs, in both front ends
 
@@ -357,11 +312,10 @@ name the base LR, the batch it was scaled by and the result.
 | RoPE flavour | `--rope-mode mixed\|axial` (mixed = learnable RoPE-Mixed, default; axial = fixed, run tag `-ax`) | `ablation.rope_mode` |
 | DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
-| norm | `--norm layernorm\|rmsnorm` | `model.norm_type` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
-| MoE backend | `--backend tutel\|native\|megablocks` | `moe.backend` |
-| dataset | `--dataset imagenet-1k\|imagenet-22k` (`pass` is SSL-only and refused here) | `dataset.name` |
+| MoE backend | `--backend tutel\|native` | `moe.backend` |
+| dataset | `--dataset imagenet-1k\|imagenet-22k` | `dataset.name` |
 | anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
 
 Before the first upcycled run on a new box: `python tools/verify_upcycling.py
@@ -380,15 +334,20 @@ without training; `--print-config` dumps the resolved JSON.
 
 ### Ablation arms
 
-Each row of the ladder in `docs/HPARAMS.md` §4 ships as a config file:
+An arm is a **command line**, not a file. `--ladder N` applies the row from
+`docs/HPARAMS.md` §4 and prints what it set:
 
 ```bash
-python train.py --config configs/scratch_04_moe_shared.yaml
-for f in configs/scratch_0*.yaml; do python train.py --config "$f"; done
+python train.py --recipe scratch --ladder 4
+scripts/run_ladder.sh scratch                  # rows 1-4, 6-9 (5 is "best config")
 ```
 
-Equivalently `--ladder 4`, which also prints what it set. Every arm gets a
-distinct run name, so none can overwrite another's checkpoints.
+Every row gets a distinct run name, so none can overwrite another's
+checkpoints — the test suite asserts that over the whole table.
+
+`configs/` holds three annotated examples of the file format, for when you do
+want a file (an arm the ladder does not name, or machine paths). They are not
+arms anyone is expected to run.
 
 ---
 
@@ -435,19 +394,21 @@ Two rules make this safe, both covered by `tests/test_resume.py`:
 Milestones count *completed* epochs: milestone 90 fires when the 90th epoch
 finishes, and the file is `milestone-epoch090.ckpt`.
 
-### Shipped 300-epoch arms
+### The same arm on a 300-epoch budget
 
-Every scratch arm ships twice: the ladder row at its documented 90-epoch
-budget, and a `_300ep_stop100` sibling that builds the cosine for 300 and
-stops at 100.
+Any ladder row runs at any budget: the row is the architecture, the budget is
+a flag. To build the cosine for 300 and stop at 100 — what the old
+`_300ep_stop100` config files did — pass it on the command line.
 
 ```bash
-python train.py --config configs/scratch_01_baseline_conv_ffn.yaml            # 90 ep
-python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml
+python train.py --recipe scratch --ladder 1                          # 90 ep
+python train.py --recipe scratch --ladder 1 --epochs 300 --stop-at 100 \
+                --milestones "[100,150,200,300]"                     # 300-ep cosine, stop at 100
 ```
 
-The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
-`[100, 150, 200, 300]`, so a resume needs no edit. Two consequences:
+The budget is orthogonal to the arm, so it is flags rather than a second file
+per row. Milestones at `[100, 150, 200, 300]` mean a resume needs no edit.
+Two consequences:
 
 - Stochastic depth is **unchanged by the budget**: it is the variant's
   official rate (0.1 for b0–b2), the same as the 90-epoch rows, so the budget
@@ -456,36 +417,32 @@ The siblings carry `epochs: 300`, `stop_at_epoch: 100` and milestones at
 - Run names end in `_scratch300` rather than `_scratch90`, so the two budgets
   never share a checkpoint directory or a W&B name.
 
-Ladder row 4 has **no** `_300ep_stop100` file: row 4 is the default
-architecture, so row 4 at 300 epochs *is* row 5, byte for byte. Stop it at 100
-with the flag instead, and the resume continues the same directory:
+Row 4 at 300 epochs *is* row 5, byte for byte: row 4 is the default
+architecture and row 5 sets only the 300-epoch budget.
 
 ```bash
-python train.py --config configs/scratch_05_final_300ep.yaml --stop-at 100
+python train.py --recipe scratch --ladder 5 --stop-at 100
 ```
 
 ### 5-epoch timing / smoke runs
 
-`configs/bench_*_5ep.yaml` mirrors each scratch arm at a 5-epoch budget with
-validation and logging on, for measuring per-epoch wall clock and proving an
-arm builds, trains and logs before a long run is launched. They log to the
-`pvt-moe-bench` W&B project, never next to thesis results.
-
-`--variant` is a flag, so one file covers every size and each size gets its
-own run name:
+Any arm at a 5-epoch budget, with validation and logging on, measures real
+per-epoch wall clock and proves the arm builds, trains and logs before a long
+run is launched. Send them to a separate W&B project so smoke runs never land
+next to thesis results:
 
 ```bash
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b0
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b1
-python train.py --config configs/bench_04_moe_shared_5ep.yaml --variant b2
+python train.py --recipe scratch --ladder 4 --epochs 5 \
+                --set wandb_project=pvt-moe-bench --variant b0
 ```
 
-The whole matrix, 11 arms x 3 sizes = 33 runs:
+The whole matrix, 8 rows x 3 sizes = 24 runs:
 
 ```bash
 for v in b0 b1 b2; do
-  for c in configs/bench_*_5ep.yaml; do
-    python train.py --config "$c" --variant "$v"
+  for row in 1 2 3 4 6 7 8 9; do
+    python train.py --recipe scratch --ladder "$row" --epochs 5 \
+                    --set wandb_project=pvt-moe-bench --variant "$v"
   done
 done
 ```
@@ -536,9 +493,8 @@ an RTX 5090 with 24 cores on the **full** snapshot, batch 128, B1 dense:
 | real training | 2,287 | 9.3 min/epoch, GPU-bound |
 
 It varies **one** axis at a time, though: `USE_MOE` is a single switch and the
-size is fixed per run. To time every arm instead, use the
-`configs/bench_*_5ep.yaml` sweep above, which logs each arm under its own run
-name.
+size is fixed per run. To time every arm instead, use the 5-epoch ladder
+sweep above, which logs each arm under its own run name.
 
 ---
 
@@ -588,21 +544,21 @@ stays the default because it is what the recorded results were produced with.
 
 Every run prints its full configuration first — recipe, budget, LR, batch
 composition, MoE settings, DWConv/RoPE state — and the run name encodes the
-same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
+same thing (`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`; a B2 run is `sv1_b2_in1k_r224_moe-s4b2-…`), so logs stay
 self-documenting across dozens of arms.
 
-The `r224` field is the input resolution (`dataset.img_size`). It arrived with
-the SSL chain, so a run directory created before that merge is named without
-it: `sv1_b1_in1k_dense_norope_ln_scratch300`, where the same config now derives
-`sv1_b1_in1k_r224_dense_norope_ln_scratch300`. `--resume-from` keeps the derived
+The `r224` field is the input resolution (`dataset.img_size`). It arrived
+later than the first runs, so an early run directory may be named without
+it: `sv1_b1_in1k_dense_norope_scratch300`, where the same config now derives
+`sv1_b1_in1k_r224_dense_norope_scratch300`. `--resume-from` keeps the derived
 name, so a bare resume would load the old `last.ckpt` but write every later
 checkpoint, `results.json` and W&B row into the new directory. Keep the old one
 by passing its name explicitly:
 
 ```bash
-python train.py --config configs/scratch_01_baseline_conv_ffn_300ep_stop100.yaml \
-    --run-name sv1_b1_in1k_dense_norope_ln_scratch300 \
-    --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_ln_scratch300/last.ckpt
+python train.py --recipe scratch --ladder 1 --epochs 300 --stop-at 100 \
+    --run-name sv1_b1_in1k_dense_norope_scratch300 \
+    --resume-from <checkpoint_root>/sv1_b1_in1k_dense_norope_scratch300/last.ckpt
 ```
 
 Check with `--dry-run` first: the printed `run:` line must show the old name.
@@ -617,19 +573,17 @@ Watch for these lines:
 | `[milestone] epoch N: saved full state` | a resumable snapshot exists |
 | `[rope] saved N frequency tensor(s) -> .../rope_freqs_init.pt` | the step-0 RoPE-Mixed frequencies are on disk — the drift plot in §7 needs them |
 | `val_precision_macro` far below `val_acc` | expert/class collapse — check `expert_utilization` |
-| `[chain] simmim_pretrain@pass_r224 -> ssl_finetune+moe@imagenet-1k_r224` | the warm start prepended its parent's stages; this is what `results.json` records as the run's provenance |
+| `[chain] hf_finetune@imagenet-1k_r224 -> downstream+moe@eurosat_r224` | the warm start prepended its parent's stages; this is what `results.json` records as the run's provenance |
 | `[backbone ckpt] ... seeded_moe_blocks=1 ... zeroed_routed_fc2=2` | a dense checkpoint was upcycled (path 3); `already carries the MoE weights ... nothing to upcycle` = path 2, loaded as trained |
-| `[ssl] method simmim \| base_lr 2.00e-04 x (1024 / 512) -> lr 4.00e-04` / `[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03` | the linear scaling rule was applied; `lr ... (absolute; calibrated for batch 1024)` means it was not |
-| `[optimizer] layer_decay 0.9: ... lr 2.50e-03 (head ...) .. 4.16e-04 (stage-1 patch embed ...)` | layer-wise decay is on (ssl_finetune / downstream) |
-| `[mask routing] block4.1.mlp: ... (aux loss counts both)` | MoE pretraining: how masked-position and visible tokens spread over the experts |
+| `[optim] base_lr 1.25e-03 x (1024 / 512) -> lr 2.50e-03` | the linear scaling rule was applied; `lr ... (absolute; calibrated for batch 1024)` means it was not |
+| `[optimizer] layer_decay 0.9: ... lr 2.50e-03 (head ...) .. 4.16e-04 (stage-1 patch embed ...)` | layer-wise decay is on (downstream) |
 | `[config] ckpt_path ... carries no parent tag` | the checkpoint path is not `<root>/<run_name>/<file>`; two warm starts from different parents would share a directory — pass `--run-name` |
 
 Every run directory also holds **`results.json` and `results.md`**,
 rewritten at every epoch boundary: identity and chain, latest / best
 accuracy, measured seconds per epoch, images per second and peak VRAM,
 parameter counts and GFLOPs, expert utilisation, environment, a per-epoch
-history, and (for SSL runs) the note that probe / k-NN accuracy is expected
-to be low under masked image modelling (§8).
+history.
 
 ---
 
@@ -695,16 +649,16 @@ laptop and run it there while the GPU keeps training. Output goes to
 ```bash
 # a finished classifier: top-1 / top-5 on its own validation split
 python evaluate.py --ckpt /data/runs/<run>/last.ckpt --data-dir /data/imagenet_arrow
-# an SSL encoder: k-NN + linear probe on ImageNet-1k (collapse detectors — expected to read low under MIM)
-python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
+# a frozen encoder: k-NN + linear probe (collapse detectors, not the headline)
+python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset imagenet-1k \
     --data-dir /data/imagenet_arrow --knn --probe-epochs 20
 # the downstream test split, once, at the end
 python evaluate.py --ckpt /data/runs/<run>/last.ckpt --dataset eurosat --data-dir /data/eurosat_arrow --split test
 # low-shot subsets: seeded, class-balanced, written once and shared by every arm
 python -m pvt_moe.eval.lowshot --dataset imagenet-1k --data-dir /data/imagenet_arrow \
     --fraction 0.01 --seed 0 --out subsets/imagenet-1k_1pct_seed0.json
-python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
-    --data-dir /data/imagenet_arrow --subset-file subsets/imagenet-1k_1pct_seed0.json
+python train.py --recipe pretrained --data-dir /data/imagenet_arrow \
+    --subset-file subsets/imagenet-1k_1pct_seed0.json
 # one table over every results.json below a root (+ CSV / markdown / a vector-PDF bar chart)
 python tools/compare_runs.py /data/runs --sort best_top1 --csv table.csv --plot figures/top1_by_run.pdf
 ```

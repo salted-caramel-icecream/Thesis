@@ -81,9 +81,9 @@ y = routed_moe(x) + shared_expert(x)          # DeepSeekMoE / Qwen-MoE style
 It is a plain `Mlp` held by `MoEMlp` *outside* `moe_layer`, which has three
 consequences worth stating as invariants:
 
-1. **Backend-agnostic and init-safe.** Tutel and MegaBlocks each initialize
-   their own expert tensors at construction; the shared expert is outside that
-   blast radius, so it is the only branch whose weights are guaranteed to be
+1. **Backend-agnostic and init-safe.** Both backends initialize their own
+   expert tensors at construction; the shared expert is outside that blast
+   radius, so it is the only branch whose weights are guaranteed to be
    whatever we put there.
 2. **It can keep the DWConv** (`moe_block_dwconv`, default True), which
    relaxes the invariant above: a shared-expert MoE block is *not*
@@ -121,7 +121,6 @@ data-parallel parameters, unlike the routed expert tensors.
 |---|---|---|
 | `tutel` | **default** | a CUDA extension built from source (compiler required) |
 | `native` | fallback | nothing beyond torch |
-| `megablocks` | experimental | `megablocks==0.10.0` + `grouped_gemm` |
 
 Tutel stays the default because it produced the recorded results; switching
 would make new runs incomparable to the 72.27%. `native`
@@ -157,33 +156,35 @@ lineage several failed runs to get right):
 1. Every MoE block returns `(x, aux)` from its own forward.
 2. `forward_features` **averages** aux over the number of MoE blocks.
 3. The model returns `(logits, aux)` — `aux is None` iff no MoE block ran.
-4. The training loop (never the model) clamps aux at `loss.aux_clamp`,
-   weights it by `loss.aux_weight`, and drops it for the step if the total
-   loss goes NaN/Inf.
+4. The training loop (never the model) clamps aux at `loss.aux_clamp` and
+   weights it by `loss.aux_weight`. A non-finite total **raises**
+   `FloatingPointError` naming both terms — it does not fall back to CE. The
+   old fallback sat inside the `aux is not None` branch and returned
+   `ce_loss`, so a non-finite CE passed through unchanged: the only thing it
+   could ever hide was a diverging router. A sweep script can catch
+   `FloatingPointError` to mark one arm diverged and continue, while a real
+   crash still stops everything.
 
 **INVARIANT — Tutel gates revert to eval.** After every Lightning validation
 pass, Tutel gate modules set themselves back to eval, silently zeroing
 `gate_noise` — routing then freezes and experts can collapse. The forcing
 code in `engine/classifier.py` (`train()` override + `on_train_epoch_start`)
-must stay. MegaBlocks does not need this (and the forcing is a no-op for it).
+must stay. The native backend needs none of it (plain `self.training` gates
+its noise), and the forcing is a no-op there.
 
-Backend differences:
+Both backends return `(output, aux_loss)` from one call, which is why
+`MoEMlp.forward` needs no per-backend branch at all. A backend that did not
+share that contract would force a second arm — and a clear/collect protocol
+around a global registry — back into this path. Make a new backend meet the
+contract instead.
 
-| | Tutel | MegaBlocks dMoE |
-|---|---|---|
-| capacity_factor | yes (2.0) | **no-op** (dropless) |
-| gate_noise | yes (0.5) | **no-op** (use `moe_jitter_eps` upstream if ever needed) |
-| aux retrieval | returned by the layer | global registry, **training mode only** |
-| expert layout | `batched_fc1_w/…fc2_w (E, hidden, dim)` — fc2 stored transposed | `w1/w2 (E·hidden, dim)` — w2 rows are `fc2.weight.T` |
-| bias | yes | **none** (grouped MLP ignores `bias`; we pass `bias=False` honestly) |
-
-Expert seeding (`seed_moe_experts_from_dense`) recognizes exactly these
-layouts and **raises** on anything else — never let it shape-guess (the
-archived MegaBlocks attempt silently seeded nothing that way).
+Expert seeding (`seed_moe_experts_from_dense`) recognizes exactly the layouts
+listed above and **raises** on anything else — never let it shape-guess (a
+guessing version once silently seeded nothing).
 
 ## 3. RoPE (`models/rope.py`)
 
-2D complex-multiplication RoPE after rope-vit (Heo et al. ECCV'24; reference
+2D RoPE after rope-vit (Heo et al. ECCV'24; reference
 `naver-ai/rope-vit` `deit/models_v2_rope.py` @ 48d8df50), in two flavours
 selected by `model.ablation.rope_mode`:
 
@@ -197,8 +198,8 @@ selected by `model.ablation.rope_mode`:
 | attention | multi-head (the only kind); frequencies are per query head | multi-head |
 
 **Parameter semantics (mixed).** `freqs[0]` is ω_x, `freqs[1]` is ω_y; dim 1
-is the head, dim 2 the frequency channel (`head_dim // 2` complex pairs — the
-adjacent real dims `(2c, 2c+1)` of q and k). Init is `init_mixed_freqs`, a
+is the head, dim 2 the frequency channel (`head_dim // 2` rotation pairs —
+the ADJACENT dims `(2c, 2c+1)` of q and k). Init is `init_mixed_freqs`, a
 port of the reference's `init_random_2d_freqs`: magnitudes
 `1 / theta ** (4k / head_dim)` for `k = 0 … head_dim//4 − 1`, one random
 angle φ_h per head from the global torch RNG (seed it), the first
@@ -210,6 +211,15 @@ stage 4: 8 × 64 = 512).
 
 Invariants, both flavours unless stated:
 
+- **Real `(cos, sin)`, adjacent-channel pairing.** `get()` returns a pair of
+  fp32 tensors, never a complex one, and `apply_rotary_emb` rotates the
+  adjacent dims `(2c, 2c+1)` — the reference / LLaMA-original convention, NOT
+  half-split `rotate_half`. Because the frequency vector is laid out as
+  `cat([x-freqs, y-freqs])`, the two conventions assign the x and y subspaces
+  to **different channels**, so switching would be a model change, not a
+  refactor (`test_adjacent_pairing_is_not_rotate_half` pins this). Nothing
+  complex is stored or checkpointed: the learnable `freqs` parameter and the
+  per-grid cache are all real.
 - Q is rotated on the full (H, W) grid; K on the SR-reduced (H_kv, W_kv)
   grid **expressed in full-grid units** (centered coordinate scaling
   `(i+0.5)·s − 0.5` with `s = H/H_kv`, exact identity at s=1) so q–k relative
@@ -217,12 +227,12 @@ Invariants, both flavours unless stated:
   `sr_ratio > 1`; V never. Mixed frequencies are per *query* head, and K
   carries the same head count by construction (attention is multi-head only).
 - `head_dim % 4 == 0` wherever RoPE is enabled (validated in config).
-- The mixed phase `exp(i(ω_x·x + ω_y·y))` is computed in fp32 with autocast
-  disabled (`compute_mixed_cis`), and the rotation itself runs in fp32 and
-  casts back — intentional under bf16-mixed (complex phase accuracy). The
-  axial cache stays complex64 on-device, keyed by (H, W, scale, device);
-  mixed phases are recomputed every call because the frequencies change
-  every step.
+- The mixed phase `ω_x·x + ω_y·y` is computed in fp32 with autocast disabled
+  (`compute_mixed_cos_sin`), and the rotation itself runs in fp32 and casts
+  back — intentional under bf16-mixed, where the phase needs fp32 accuracy.
+  The axial `(cos, sin)` cache stays fp32 on-device, keyed by
+  (H, W, scale, device); mixed phases are recomputed every call because the
+  frequencies change every step.
 - `*.rope.freqs` is **excluded from weight decay**: `configure_optimizers`
   puts it in the no-decay groups with the biases and norm weights (the
   reference lists `freqs` under `no_weight_decay`). Decaying it pulls every
@@ -247,14 +257,6 @@ Invariants, both flavours unless stated:
   leaves it at its init (`test_hf_loader_leaves_freqs_alone`). A warm start
   therefore always begins with random-angle frequencies — one reason the
   init snapshot exists.
-
-## Norm ablation (`models/norms.py`)
-
-`norm_type: rmsnorm` swaps every norm **except the last stage** (default
-`stage4_keeps_layernorm: True` — the MoE stage stays closest to pretrained LN
-statistics and the router input stays mean-centered; archive precedent).
-RMSNorm has no bias; when loading LN checkpoints the `.bias` keys drop out as
-`dropped_no_target` in the load stats — expected, not a bug.
 
 ## Placement schema
 

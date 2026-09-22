@@ -1,4 +1,4 @@
-"""Warm-start utilities: HF weight remapping, expert seeding, SSL init.
+"""Warm-start utilities: HF weight remapping, expert seeding, checkpoint init.
 
 Three entry points:
 
@@ -8,18 +8,15 @@ Three entry points:
   MoE blocks, and optionally seeds MoE experts from those skipped dense
   weights (sparse upcycling, Komatsuzaki et al. 2023).
 - ``load_backbone_checkpoint(model, path, ...)`` — load a backbone
-  ``state_dict`` saved by this package (e.g. a JEPA-pretrained encoder).
+  ``state_dict`` saved by this package (e.g. a previous run's encoder).
 - ``seed_moe_experts_from_dense(...)`` — copy dense fc1/fc2 into every
-  expert. Layout-aware for both Tutel and MegaBlocks; refuses to guess.
+  expert. Layout-aware for Tutel and the native backend; refuses to guess.
 - ``seed_shared_expert_from_dense(...)`` — copy the dense FFN (fc1/fc2 AND
   the DWConv) into ``MoEMlp.shared_expert``, which is a plain PVT v2 ``Mlp``
   and therefore takes the weights verbatim.
 - ``zero_routed_expert_output(...)`` — zero every routed expert's fc2 so a
   shared-expert block starts out computing EXACTLY the pretrained dense FFN.
 
-Norm-type interop: when the target model uses RMSNorm, LayerNorm ``.bias``
-keys from the source simply have no destination parameter and are dropped
-(reported in the load stats). LN gamma transfers to RMSNorm weight directly.
 
 Every loader returns a stats dict — print it and READ it. A silent
 0-weights-loaded bug cost this project a full failed training run (8.9%
@@ -167,7 +164,7 @@ def load_hf_pretrained(
             dense_mlp_for_seeding[custom_key] = value
             continue
         if custom_key not in model_state:
-            stats["dropped_no_target"] += 1  # e.g. LN bias -> RMSNorm target
+            stats["dropped_no_target"] += 1
             continue
         if model_state[custom_key].shape != value.shape:
             stats["skipped_shape"] += 1
@@ -228,7 +225,7 @@ def moe_block_prefixes_of(model) -> set:
 def upcycle_moe_blocks(model, dense_mlp: dict, moe_block_prefixes, upcycle_init: str,
                        stats: dict | None = None) -> dict:
     """Seed every MoE'd block from the dense FFN it replaced — the ONE
-    upcycling routine, shared by the HF and the ssl_init warm starts.
+    upcycling routine, shared by the HF and the local-checkpoint warm starts.
 
     ``dense_mlp`` maps full dense-model keys (``block4.1.mlp.fc1.weight``,
     ``...mlp.dwconv.dwconv.weight``, ...) to tensors. Per block: the routed
@@ -275,15 +272,15 @@ def seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b) -> int:
     Dense shapes: ``fc1_w (hidden, dim)``, ``fc1_b (hidden,)``,
     ``fc2_w (dim, hidden)``, ``fc2_b (dim,)``.
 
-    Expert layouts handled explicitly (no shape guessing — the archived
-    MegaBlocks attempt silently seeded nothing by guessing):
+    Expert layouts handled explicitly — an unrecognised shape is REPORTED,
+    never guessed at (a guessing version once silently seeded nothing):
 
     - Tutel FusedExpertsNetwork: ``batched_fc1_w (E, hidden, dim)``,
       ``batched_fc2_w (E, hidden, dim)`` (stored TRANSPOSED — it equals
       ``fc2_w.T`` per expert), ``batched_fc1_bias (E, hidden)``-ish,
       ``batched_fc2_bias (..., dim)``.
-    - MegaBlocks GroupedMLP: ``w1 (E*hidden, dim)``, ``w2 (E*hidden, dim)``
-      (``w2`` rows are ``fc2_w.T`` per expert). No biases (bias=False).
+    - The native backend mirrors that layout, plus the ``(E, dim, hidden)``
+      transposed variant.
 
     All experts start identical; the router's noise/jitter breaks symmetry.
     Returns the number of parameters seeded; raises if the layout was not
@@ -306,8 +303,6 @@ def seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b) -> int:
         if ("fc1" in lname or re.search(r"(^|\.)w1$", lname)) and "bias" not in lname:
             if shape == (E, hidden, dim):                     # tutel batched
                 param.copy_(fc1_w.unsqueeze(0).expand_as(param))
-            elif shape == (E * hidden, dim):                  # megablocks flattened
-                param.copy_(fc1_w.repeat(E, 1))
             elif shape == (E, dim, hidden):                   # transposed variant
                 param.copy_(fc1_w.t().unsqueeze(0).expand_as(param))
             else:
@@ -318,8 +313,6 @@ def seed_moe_experts_from_dense(moe_mlp, fc1_w, fc1_b, fc2_w, fc2_b) -> int:
         elif ("fc2" in lname or re.search(r"(^|\.)w2$", lname)) and "bias" not in lname:
             if shape == (E, hidden, dim):                     # tutel: stores fc2.T
                 param.copy_(fc2_w_t.unsqueeze(0).expand_as(param))
-            elif shape == (E * hidden, dim):                  # megablocks: rows are fc2.T
-                param.copy_(fc2_w_t.repeat(E, 1))
             elif shape == (E, dim, hidden):
                 param.copy_(fc2_w.unsqueeze(0).expand_as(param))
             else:
@@ -476,13 +469,13 @@ def zero_routed_expert_output(moe_mlp) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Backbone checkpoints (SSL init, official .pth files, our own saves)
+# Backbone checkpoints (official .pth files, our own saves)
 # ---------------------------------------------------------------------------
 
 def _checkpoint_cfg(ckpt) -> dict | None:
     """The config a checkpoint was trained with, if it carries one.
 
-    ``LitJEPA.save_backbone`` writes ``{"state_dict", "cfg"}``; a Lightning
+    A backbone save writes ``{"state_dict", "cfg"}``; a Lightning
     checkpoint keeps it under ``hyper_parameters["cfg"]``.
     """
     if not isinstance(ckpt, dict):
@@ -573,7 +566,7 @@ def load_backbone_checkpoint(
     ``mlp.*`` tensors for blocks the model converted to MoE are not dropped
     but handed to ``upcycle_moe_blocks`` (when ``seed_moe_experts``), which
     seeds the routed experts and the shared expert and applies
-    ``upcycle_init`` — so a JEPA backbone's own stage-4 FFN is the dense
+    ``upcycle_init`` — so the parent backbone's own stage-4 FFN is the dense
     teacher and the MoE'd block reproduces it at step 0.
 
     With ``expected_cfg`` (the run's validated config) the checkpoint's saved
@@ -594,8 +587,8 @@ def load_backbone_checkpoint(
 
     cleaned = {}
     for k, v in state.items():
-        # "context." covers Lightning checkpoints written by LitJEPA (its
-        # encoder attribute is self.context) and "encoder." those of LitSimMIM;
+        # "context." and "encoder." cover Lightning checkpoints whose module
+        # held the backbone under one of those attribute names;
         # trailing dots keep the prefixes unambiguous. target./predictor./
         # head.0. keys intentionally get no prefix match and drop out.
         for prefix in ("model.", "module.", "backbone.", "context_encoder.", "context.",
@@ -621,9 +614,9 @@ def load_backbone_checkpoint(
             text = "\n  - ".join(problems)
             if check_arch and _checkpoint_cfg(ckpt) is not None:
                 raise ValueError(
-                    f"ssl_init checkpoint {path} was trained with a different architecture:"
+                    f"warm-start checkpoint {path} was trained with a different architecture:"
                     f"\n  - {text}\nMatch the run to the checkpoint (--variant / --rope-mode / "
-                    f"--rope-placement ...) or set model.ssl_init_check_arch: false to load "
+                    f"--rope-placement ...) or set model.warm_start_check_arch: false to load "
                     f"what fits and leave the rest at random init.")
             print(f"[backbone ckpt] WARNING: {text}")
 

@@ -10,7 +10,7 @@ One row per run: identity (variant, dataset, the CHAIN of stages that
 produced the weights), progress, latest / best validation top-1 and top-5,
 parameters, GFLOPs, measured throughput and peak VRAM, the minimum routing
 entropy over MoE blocks, and whatever ``evaluate.py`` merged in (k-NN, linear
-probe, test split). The chain column is what tells a "SimMIM -> ImageNet
+probe, test split). The chain column is what tells an "ImageNet
 fine-tune -> EuroSAT" number apart from a "scratch on EuroSAT" one.
 
 Needs nothing but the standard library (matplotlib only for ``--plot``).
@@ -143,6 +143,8 @@ def plot_top1(rows: list, path: str) -> None:
     ax.set_xticklabels([r["run"] for r in rows], rotation=30, ha="right")
     ax.set_ylabel("best val top-1 (%)")
     ax.grid(True, axis="y", alpha=0.3)
+    out_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)        # figures/ is not tracked; create it
     fig.savefig(path)
     plt.close(fig)
     print(f"saved -> {path}")

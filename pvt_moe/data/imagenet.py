@@ -1,4 +1,4 @@
-"""Image data pipeline (HF Arrow, map-style): ImageNet 1k / 22k, PASS (SSL), small sets.
+"""Image data pipeline (HF Arrow, map-style): ImageNet 1k / 22k and the small sets.
 
 Hard-won rules from this project's history (do not regress):
 
@@ -110,31 +110,23 @@ def _image_column(hf_split) -> str:
 class HFImageDataset(Dataset):
     """Map-style wrapper over a HF Arrow split.
 
-    ``labelled=True`` probes the label column and yields ``(image, label)``.
-    ``labelled=False`` (PASS) keeps ONLY the image column — creator name,
-    date and GPS metadata are never read — and yields ``(image, -1)`` so the
-    batch shape stays what the SSL module expects (it discards the label).
+    Probes the label column and yields ``(image, label)``.
     """
 
-    def __init__(self, hf_split, transform=None, labelled: bool = True):
+    def __init__(self, hf_split, transform=None):
         self.transform = transform
         self.image_key = _image_column(hf_split)
         self.label_key = None
-        self.dropped_columns = []
-        if labelled:
-            columns = set(hf_split.column_names)
-            for key in _LABEL_KEYS:
-                if key in columns:
-                    self.label_key = key
-                    break
-            else:
-                raise KeyError(
-                    f"No label column found; columns={sorted(columns)}, tried {_LABEL_KEYS}"
-                )
-            self.dataset = hf_split
+        columns = set(hf_split.column_names)
+        for key in _LABEL_KEYS:
+            if key in columns:
+                self.label_key = key
+                break
         else:
-            self.dropped_columns = sorted(set(hf_split.column_names) - {self.image_key})
-            self.dataset = hf_split.select_columns([self.image_key])
+            raise KeyError(
+                f"No label column found; columns={sorted(columns)}, tried {_LABEL_KEYS}"
+            )
+        self.dataset = hf_split
 
     def __len__(self):
         return len(self.dataset)
@@ -152,19 +144,11 @@ class HFImageDataset(Dataset):
 def build_datasets(cfg: dict):
     """Load the Arrow snapshot for ``cfg.dataset.name`` -> (train_ds, val_ds).
 
-    ``val_ds`` is None for a corpus with no validation split (PASS has only
-    ``train``): SSL then trains with no validation loader at all — the
-    monitored quantity is the training ``ssl_loss`` and the real evaluation
-    is the linear probe on a LABELLED dataset (docs/JEPA_GUIDE.md §5).
+    ``val_ds`` is None for a corpus with no validation split.
     """
     from pvt_moe.config import DATASETS
 
     ds_cfg = cfg["dataset"]
-    labelled = DATASETS[ds_cfg["name"]]["labelled"]
-    if not labelled and cfg.get("task") != "ssl":
-        # validate_config refuses this already; this is the last line of
-        # defence so an unlabelled corpus never reaches a classifier loader.
-        raise ValueError(f"dataset {ds_cfg['name']!r} is unlabelled: SSL (task 'ssl') only")
     arrow_dir = ds_cfg["arrow_dirs"][ds_cfg["name"]]
     # Check the path BEFORE the heavy import: a missing snapshot should say so,
     # not surface as ModuleNotFoundError on a box where `datasets` is absent.
@@ -200,7 +184,7 @@ def build_datasets(cfg: dict):
 
     raw = DatasetDict.load_from_disk(arrow_dir)
     val_split = next((s for s in ("validation", "val") if s in raw), None)
-    if val_split is None and labelled and "test" in raw:
+    if val_split is None and "test" in raw:
         # A hand-built snapshot with train/test only. The per-epoch metric
         # then IS the test split; with the fixed per-dataset epoch budget
         # nothing is tuned on it, but the top-k checkpoint by val_acc is
@@ -212,80 +196,40 @@ def build_datasets(cfg: dict):
               "validation carve-out) for a clean protocol.")
 
     train_tf, val_tf = build_transforms(cfg)
-    train_ds = HFImageDataset(raw["train"], transform=train_tf, labelled=labelled)
-    val_ds = (HFImageDataset(raw[val_split], transform=val_tf, labelled=labelled)
+    train_ds = HFImageDataset(raw["train"], transform=train_tf)
+    val_ds = (HFImageDataset(raw[val_split], transform=val_tf)
               if val_split is not None else None)
-    if labelled:
-        native = raw["train"][0][train_ds.image_key].size if len(train_ds) else None
-        print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} val={len(val_ds):,} "
-              f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}', "
-              f"val split '{val_split}')")
-        if native is not None and max(native) < ds_cfg["img_size"]:
-            print(f"[data] native {native[0]}x{native[1]} images are UPSAMPLED to "
-                  f"{ds_cfg['img_size']}x{ds_cfg['img_size']} by the transforms: results on "
-                  "this dataset partly measure interpolation (docs/GUIDE.md).")
-        subset = ds_cfg.get("subset_file")
-        if subset:
-            from pvt_moe.eval.lowshot import load_subset
+    native = raw["train"][0][train_ds.image_key].size if len(train_ds) else None
+    print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} val={len(val_ds):,} "
+          f"({ds_cfg['num_classes']} classes, label column '{train_ds.label_key}', "
+          f"val split '{val_split}')")
+    if native is not None and max(native) < ds_cfg["img_size"]:
+        print(f"[data] native {native[0]}x{native[1]} images are UPSAMPLED to "
+              f"{ds_cfg['img_size']}x{ds_cfg['img_size']} by the transforms: results on "
+              "this dataset partly measure interpolation (docs/GUIDE.md).")
+    subset = ds_cfg.get("subset_file")
+    if subset:
+        from pvt_moe.eval.lowshot import load_subset
 
-            indices, meta = load_subset(subset, expect_dataset=ds_cfg["name"],
-                                        expect_len=len(train_ds))
-            train_ds = torch.utils.data.Subset(train_ds, indices)
-            print(f"[data] low-shot subset {subset}: {len(indices):,} of {meta['total']:,} train "
-                  f"images ({meta['fraction']:.1%}, seed {meta['seed']}, class-balanced); the "
-                  "validation split is untouched")
-    else:
-        print(f"[data] {ds_cfg['name']}: train={len(train_ds):,} images, unlabelled | "
-              f"snapshot features: {list(raw['train'].features)} | using only "
-              f"'{train_ds.image_key}', dropped {train_ds.dropped_columns}")
-        if val_ds is None:
-            print("[data] no validation split in this corpus: SSL runs with no "
-                  "validation loader; evaluation is the linear probe on a labelled set")
+        indices, meta = load_subset(subset, expect_dataset=ds_cfg["name"],
+                                    expect_len=len(train_ds))
+        train_ds = torch.utils.data.Subset(train_ds, indices)
+        print(f"[data] low-shot subset {subset}: {len(indices):,} of {meta['total']:,} train "
+              f"images ({meta['fraction']:.1%}, seed {meta['seed']}, class-balanced); the "
+              "validation split is untouched")
     return train_ds, val_ds
 
 
-#: RandomResizedCrop scale range per SSL method. SimMIM: (0.67, 1) with the
-#: default 3/4-4/3 aspect range (microsoft/SimMIM data/data_simmim.py);
-#: JEPA: the wider (0.3, 1) this repo's I-JEPA recipe shipped with.
-SSL_CROP_SCALE = {"simmim": (0.67, 1.0), "jepa": (0.3, 1.0)}
 
-
-def build_ssl_transform(cfg: dict):
-    """Pretraining transform: random resized crop + flip ONLY. Neither method
-    uses heavy augmentation — the masking objective supplies the pressure."""
-    img_size = cfg["dataset"]["img_size"]
-    method = (cfg.get("ssl") or {}).get("method", "simmim")
-    scale = SSL_CROP_SCALE.get(method, SSL_CROP_SCALE["simmim"])
-    return transforms.Compose(
-        [
-            transforms.RandomResizedCrop(img_size, scale=scale, ratio=(3.0 / 4.0, 4.0 / 3.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
-    )
-
-
-def build_dataloaders(cfg: dict, ssl: bool | None = None):
+def build_dataloaders(cfg: dict):
     """(train_loader, val_loader) with the project's stable loader settings.
 
-    ``ssl=True`` (default when ``cfg["task"] == "ssl"``) swaps the train
-    transform for the SSL method's crop + flip recipe (labels are still
-    returned — the SSL module ignores them; the val loader keeps the standard
-    eval transform for linear probing). ``val_loader`` is None when the corpus
-    has no validation split.
+    ``val_loader`` is None when the corpus has no validation split.
     """
-    if ssl is None:
-        ssl = cfg.get("task") == "ssl"
     train_ds, val_ds = build_datasets(cfg)
-    if ssl:
-        base = train_ds.dataset if isinstance(train_ds, torch.utils.data.Subset) else train_ds
-        base.transform = build_ssl_transform(cfg)
 
-    # Repeated augmentation: a sampler, not a transform. Disabled for SSL —
-    # neither SimMIM nor JEPA uses it; the masking objective supplies the
-    # pressure and seeing the same image 3x per batch would weaken the signal.
-    repeats = 1 if ssl else int(cfg["dataset"].get("repeated_aug", 1) or 1)
+    # Repeated augmentation: a sampler, not a transform.
+    repeats = int(cfg["dataset"].get("repeated_aug", 1) or 1)
     train_sampler = None
     if repeats > 1:
         from timm.data.distributed_sampler import RepeatAugSampler  # lazy

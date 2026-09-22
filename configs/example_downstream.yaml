@@ -1,0 +1,23 @@
+# EXAMPLE — see configs/example_scratch.yaml for how configs relate to flags.
+#
+# Final stage: a small labelled set, warm-started from any checkpoint.
+# Equivalent to:
+#
+#   python train.py --recipe downstream --dataset eurosat \
+#                   --ckpt /data/runs/<run>/last.ckpt --data-dir /data/eurosat_arrow
+#
+# The epoch budget comes from the dataset registry (fashionmnist 30, eurosat
+# 50, pathmnist 30) unless you set `epochs` here. `ckpt_path` is required:
+# the recipe's mode is `warm_start`.
+#
+# Machine paths do NOT belong in a committed file. Put them in a gitignored
+# configs/<name>.local.yaml and compose:
+#   python train.py --config configs/example_downstream.yaml \
+#                   --config configs/my_paths.local.yaml
+
+recipe: "downstream"
+ckpt_path: "/data/runs/parent-run/last.ckpt"
+
+dataset:
+  name: "eurosat"
+  img_size: 224                  # upsampled from the native 64 px

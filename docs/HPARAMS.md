@@ -1,14 +1,13 @@
 # Hyperparameters
 
 Transcribed from `PVT_backbone_HParams.docx` and encoded in
-`pvt_moe/config.py`. `tests/test_recipes.py::test_spec_*` assert these values
+`pvt_moe/config/`. `tests/test_recipes.py::test_spec_*` assert these values
 literally — if a default drifts, a test fails by name.
 
 Pick a path with one key:
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})     # "pretrained" | "ssl_finetune" | "downstream"
-cfg = merge_config(default_config(), {"task": "ssl", "dataset": {"name": "pass"}})   # SimMIM pretraining (§3b)
+cfg = merge_config(default_config(), {"recipe": "scratch"})     # "pretrained" | "downstream"
 ```
 
 A recipe fills only fields left as `None`. **Anything you set explicitly
@@ -317,7 +316,20 @@ control and appends `-ax` to the rope fragment:
 | neither | `--no-moe-dwconv --no-rope` | `+sh-plain_norope` |
 | both, fixed axial RoPE | `--moe-dwconv --rope --rope-mode axial` | `+sh_rope-s4b1-ax` |
 
-Ready-made: `configs/scratch_10..12_*.yaml`.
+These are the old ladder "rows 10-12", and they are deliberately NOT rows:
+they are row 4 crossed with two binary flags, so adding them to `LADDERS`
+would rebuild the same permutation explosion the config files had (the next
+cross, x `--rope-mode axial`, would want rows 13-18). Run them as:
+
+```bash
+python train.py --recipe scratch --ladder 4 --no-rope              # was row 10
+python train.py --recipe scratch --ladder 4 --no-moe-dwconv        # was row 11
+python train.py --recipe scratch --ladder 4 --no-moe-dwconv --no-rope   # was row 12
+```
+
+Each differs from the retired YAML in `rope_placement` alone, which
+`build_model` never reads when `use_rope` is False — same model, same run
+name (verified across all 42 retired files).
 
 "Neither" is not degenerate. PVT v2 has no learned or sinusoidal position
 embedding, but its zero-padded patch-embed convs leak absolute position
@@ -383,7 +395,7 @@ stay identical — `test_spec_pretrained_deltas` asserts that.
 | Warmup | 5 | 3 | ViMoE's CIFAR-100 config |
 | Stochastic depth | the variant's official rate, any budget (B0–B2 0.1, B3–B5 0.3) | 0.1 ("as pretraining") | scratch: `pvt_v2_b*.py` (§1). pretrained: CSWin — keeping the training-stage ratio helps fine-tuning |
 | Differential LR for router/experts | n/a | **none** | Sparse Upcycling B.9: modifying expert/router LR generally hurt |
-| Layer-wise LR decay | n/a | none (the SSL chain's `ssl_finetune` / `downstream` recipes use 0.9 — §3b) | Swin V2's classification fine-tune uses none |
+| Layer-wise LR decay | n/a | none (the `downstream` recipe uses 0.9) | Swin V2's classification fine-tune uses none |
 | Weight decay | 0.05 | 0.05 | ViMoE keeps 0.05 |
 | Batch size, optimizer, schedule, aug | — | unchanged | Sparse Upcycling |
 
@@ -409,9 +421,8 @@ departure, not an oversight — set it back explicitly to reproduce v9.)
 |---|---|---|
 | HF path: whole model, dense vs upcycled, < 1e-4 | fake Tutel **and** native, end to end through `load_hf_pretrained` with a complete HF-named state dict (every dense tensor mapped, kv fused, MoE'd FFN diverted and upcycled) | `tests/test_hf_upcycling.py::test_hf_loader_maps_every_dense_tensor_and_preserves_the_function`; `..._reproduces_the_dense_model_under_the_scratch_recipe` pins the config resolution; `tests/test_shared_expert.py::test_upcycled_MODEL_matches_the_dense_checkpoint_in_eval` covers the seeding helpers alone |
 | HF path: block-level, < 1e-5 | fake Tutel; native (real top-1 routing) | `test_shared_expert.py`, `test_native_moe.py::test_R2_*` |
-| ssl_init path: whole model, < 1e-4 (measured 0.0) | fake Tutel **and** native | `tests/test_ssl_init.py::test_ssl_init_upcycled_model_matches_the_dense_backbone_to_1e4` |
 | Real Tutel expert arithmetic (`FusedExpertsNetwork`): seeded expert == dense FFN, zeroed expert == 0 | real Tutel *expert module only* (no `moe_layer` dispatch/combine), CPU, one-off script | not in the suite |
-| Real Tutel `moe_layer` end to end, both paths, 224², GPU | run once on an RTX 5090 with real Tutel: `ssl_init` **0.0**; `hf_pretrained` **1.01, FAILED** — `upcycle_init` had resolved to `none` under the tool's inherited scratch recipe (`seeded_shared=1 zeroed_routed_fc2=0`, the routed experts were never zeroed). Fixed by the fill rule, the `validate_config` guard and the tool's required `--recipe`; re-run pending | `python tools/verify_upcycling.py --variant b1 --recipe pretrained --hf` on the GPU box |
+| Real Tutel `moe_layer` end to end, both paths, 224², GPU | run once on an RTX 5090 with real Tutel: `warm_start` **0.0**; `hf_pretrained` **1.01, FAILED** — `upcycle_init` had resolved to `none` under the tool's inherited scratch recipe (`seeded_shared=1 zeroed_routed_fc2=0`, the routed experts were never zeroed). Fixed by the fill rule, the `validate_config` guard and the tool's required `--recipe`; re-run pending | `python tools/verify_upcycling.py --variant b1 --recipe pretrained --hf` on the GPU box |
 
 The suite always uses the fake Tutel layer even when Tutel is installed, so
 a green suite says nothing about Tutel's dispatch/combine. Run the tool once
@@ -460,7 +471,7 @@ the arms cannot contradict each other:
 |---|---|---|---|
 | `"routed_zero"` | keeps the pretrained FFN | fc2 zeroed | **recipe default** — exact at any top_k |
 | `"shared_zero"` | output projection zeroed | replicate the FFN | the spec's scheme; exact only at top_k > 1 |
-| `"none"` | keeps the FFN | replicate the FFN | both branches copy it — the block would emit ~2x the dense layer at step 0, so `validate_config` **refuses** it whenever experts are seeded from a dense FFN with a shared expert (modes `ssl_init` and `hf_pretrained`); reachable only with `--no-seed-experts`, where nothing is upcycled |
+| `"none"` | keeps the FFN | replicate the FFN | both branches copy it — the block would emit ~2x the dense layer at step 0, so `validate_config` **refuses** it whenever experts are seeded from a dense FFN with a shared expert (modes `warm_start` and `hf_pretrained`); reachable only with `--no-seed-experts`, where nothing is upcycled |
 
 ```bash
 python train.py --recipe pretrained                            # routed_zero
@@ -491,88 +502,6 @@ inheriting one it cannot use resolves rather than failing.
 
 ---
 
-## 3b. The SSL chain: pretraining (`task: "ssl"`), intermediate fine-tune, downstream
-
-Full rationale, the overlapping-stem leak, the three pretraining paths and
-the evaluation protocol: `docs/SIMMIM_GUIDE.md`. Values below are what
-`pvt_moe/config.py` encodes (`SSL_METHOD_DEFAULTS`, `RECIPES["ssl_finetune"]`,
-`RECIPES["downstream"]`, `DATASETS[...]["finetune_epochs"]`); `tests/
-test_cli_ssl.py`, `tests/test_simmim.py` and `tests/test_layer_decay.py`
-assert them.
-
-### SSL pretraining — SimMIM (default) and JEPA
-
-The **linear scaling rule** applies to every SSL LR: `lr = base_lr ×
-effective_batch / lr_reference_batch`, and the same factor scales the warmup
-and final LRs (SimMIM `main_simmim.py`). The module prints the base, the
-factor and the result at startup (`[ssl] method simmim | base_lr 2.00e-04 x
-(1024 / 512) -> lr 4.00e-04 | …`). Set `ssl.lr` explicitly to bypass it.
-
-| Parameter | SimMIM (`ssl.method: "simmim"`) | JEPA (`"jepa"`) | Config key | Basis |
-|---|---|---|---|---|
-| Epochs | **200** (100 quick / 800 paper) | 100 | `ssl.epochs` (`--epochs` under `--task ssl`) | choice for a 25M backbone; SimMIM's Swin-B config is 100, headline 800 |
-| Base LR / reference batch | 2e-4 @ **512** → 4e-4 at 1024 | 1.5e-3 @ 2048 → 7.5e-4 at 1024 | `ssl.base_lr`, `ssl.lr_reference_batch` | SimMIM yaml `BASE_LR`; I-JEPA |
-| Warmup | 10 ep from 1e-6 (scaled) | 15 ep from 0 | `ssl.warmup_epochs`, `ssl.warmup_lr` | SimMIM yaml `WARMUP_EPOCHS`, `WARMUP_LR` |
-| Final LR | 1e-5 (scaled), cosine per step | 1e-6 | `ssl.final_lr` | SimMIM yaml `MIN_LR` |
-| Optimizer | AdamW β (0.9, 0.999), wd 0.05 | AdamW β (0.9, 0.95), wd 0.04 → 0.4 cosine | `ssl.betas`, `ssl.weight_decay` | SimMIM `config.py`; I-JEPA |
-| Gradient clipping | 5.0 | 3.0 | `ssl.grad_clip` | SimMIM `CLIP_GRAD`; I-JEPA |
-| Stochastic depth | **0.0** | 0.0 | `model.drop_path_rate` (derived for `task: ssl` when unset) | SimMIM pretrain yaml `DROP_PATH_RATE 0.0` (0.1 is its fine-tune value); MAE / I-JEPA pretrain without it |
-| Mask | 32-px patches, ratio 0.6, `mask_space` token | multi-block on the 7×7 grid | `ssl.mask_patch_size`, `ssl.mask_ratio`, `ssl.mask_space` | SimMIM `MaskGenerator`; I-JEPA |
-| Head / loss | 1×1 conv + PixelShuffle(32); masked L1 / in_chans | ViT predictor; smooth-L1 on EMA features | — | SimMIM `models/simmim.py`; I-JEPA |
-| Augmentation | RRC (0.67–1) + flip | RRC (0.3–1) + flip | `data.SSL_CROP_SCALE` | SimMIM `SimMIMTransform` |
-| MoE | as configured (dense by default; `--moe` = path 2) | dense only | `model.ablation.use_moe` | `docs/SIMMIM_GUIDE.md` §4 |
-| Resolution | 224 | 224 | `dataset.img_size` | brief: 224 throughout |
-
-### Intermediate fine-tune (`recipe: "ssl_finetune"`) and downstream (`recipe: "downstream"`)
-
-SSL → **supervised ImageNet-1k** → downstream is the chain (SwinV2 §4.2 /
-A2.2, BEiT; `docs/SIMMIM_GUIDE.md` §5). Both recipes use SimMIM's 100-epoch
-fine-tune values (`simmim_finetune__swin_base__img224_window7__100ep.yaml`);
-only the optimization block differs from `scratch` / `pretrained`.
-
-| Parameter | `ssl_finetune` | `downstream` | Config key | Basis |
-|---|---|---|---|---|
-| Init | `ssl_init` from `--ckpt` (SimMIM / JEPA backbone, or any `last.ckpt`) | `ssl_init` from `--ckpt` (usually the fine-tune's `last.ckpt`) | `mode`, `ckpt_path` | |
-| Epochs | 100 | **fixed per dataset**: fashionmnist 30, eurosat 50, pathmnist 30 | `epochs` ← `DATASETS[...]["finetune_epochs"]` | SimMIM 100-ep FT; small sets train in an hour, an open-ended budget overruns |
-| Base LR | 1.25e-3 @ 512 → 2.5e-3 at 1024 | same | `optim.base_lr`, `optim.lr_reference_batch` | SimMIM yaml `BASE_LR 1.25e-3` |
-| Warmup | **10 ep** | 5 ep | `optim.warmup_epochs` | SimMIM §4.1's ablation protocol — "100-epoch training, and a cosine learning rate scheduler with 10-epoch warm-up". **Not** the reference yaml's `WARMUP_EPOCHS 20`, which belongs to the 800-epoch scaling config; short budgets for `downstream` |
-| Layer-wise LR decay | **0.9** | 0.9 | `optim.layer_decay` (`--layer-decay`; 1.0 = off) | SimMIM yaml `LAYER_DECAY 0.9` at 100-ep pretrain; reasoning below |
-| Stochastic depth | 0.1 | 0.1 | `model.drop_path_rate` | `ssl_finetune`: SimMIM finetune yaml. `downstream`: **inherited from `ssl_finetune`** — the same fine-tuning regime one stage later, no separate source |
-| Stage-4 LR multiplier | 1.0 | 1.0 | `optim.stage4_lr_multiplier` | as the other recipes |
-| MoE at fine-tune | path 2 loads the pretrained experts as trained; path 3 upcycles from the encoder's FFN (`routed_zero`) | same | `model.moe.upcycle_init` | `docs/HPARAMS.md` §3, `SIMMIM_GUIDE.md` §4 |
-| Everything else | unchanged (batch 1024, wd 0.05, clip 5, DeiT-1 aug) | unchanged | | |
-
-**Warmup 10, not the yaml's 20.** SimMIM publishes two fine-tuning settings.
-Section 4.1's *ablation* protocol — the one used to compare variants, and the
-one this chain reproduces — is 100 epochs with a 10-epoch warmup. The
-`simmim_finetune__swin_base__img224_window7__100ep.yaml` in the reference repo
-carries `WARMUP_EPOCHS 20`, which belongs to the 800-epoch *scaling* config.
-Earlier versions of this table cited the yaml and used 20; the recipe now uses
-10 and this note records that the two settings differ, so a reader comparing
-against either source knows which one is in force.
-
-**Layer decay 0.9 at 200 epochs.** SimMIM fine-tunes with layer decay 0.9
-after its 100-epoch pretrain and, per its §4.3 ablation, tightens it for the
-800-epoch runs — 0.8 for Swin-B, 0.75 for Swin-L, 0.7 for SwinV2-H: longer
-and larger pretraining, more protection of the early layers. A 200-epoch
-pretrain of a 14–25M backbone is between the two regimes on length and below
-both on size, so the conservative end (0.9) is the consistent choice; it
-scales the stage-1 patch embed's LR by `0.9^(sum(depths)+1)` = 0.39 (B1) /
-0.17 (B2) relative to the head. `LitClassifier.layer_id_of` maps PVT v2's
-attribute names onto the BEiT/SimMIM layer ids (stage-1 embed 0; block *j*
-of stage *i* = 1 + blocks before it; later embeds and stage norms ride the
-last block before them; final norm + head on top).
-
-**Expected effect size.** SimMIM's supervised-vs-pretrained comparison, as
-quoted in the brief (the PDF was not available to re-verify): +2.1 / +2.4
-Swin-B (88M), +2.9 / +3.5 Swin-L (197M), +4.2 / +4.4 SwinV2-H (658M). At
-14–25M a gain below +2.1, or none, is the plausible and publishable outcome
-(`SIMMIM_GUIDE.md` §7).
-
-**Linear probe / k-NN are collapse detectors** for a MIM encoder, expected to
-read low; the headline of an SSL arm is the fine-tuned top-1
-(`SIMMIM_GUIDE.md` §6).
-
 ## 4. Ablation ladders
 
 `#` matches the doc, and `--ladder N` applies row N directly:
@@ -586,7 +515,7 @@ A row sets only what the spec's table names for it; everything else comes from
 the recipe and your own flags, and named flags override the row. Rows print a
 `[ladder]` line naming what they set, plus a note wherever the spec left a
 choice open (marked **(choice)** below). Run names self-document
-(`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
+(`sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`; `sv1` marks the September-2026 architecture edit, the variant follows it, and B2's stage-4 tag reads `s4b2`) and are distinct across
 every row — `tests/test_cli.py::test_run_names_are_distinct_across_both_ladders`
 enforces that, since a collision would mean two runs sharing a checkpoint
 directory and a W&B run.
@@ -761,9 +690,8 @@ room for checkpoints. **ImageNet-22k is roughly 1.3 TB and will not fit** —
 
 | Dataset | `dataset.name` | Snapshot | Free while building | Licence / access | Use |
 |---|---|---|---|---|---|
-| ImageNet-1k | `imagenet-1k` | ~160 GB | ~320 GB | ImageNet terms, gated, `HF_TOKEN` | supervised + SSL + probe |
+| ImageNet-1k | `imagenet-1k` | ~160 GB | ~320 GB | ImageNet terms, gated, `HF_TOKEN` | supervised + probe |
 | ImageNet-22k | `imagenet-22k` | ~1.3 TB | ~2.6 TB | gated, `HF_TOKEN` | supervised |
-| PASS | `pass` | ~166 GB | ~333 GB (staged build; ~500 GB naive) | CC-BY 4.0, not gated | **SSL pretraining only** (`task: "ssl"`); no labels, no val split |
 
 PASS and ImageNet-1k together need ~330 GB of snapshots plus the transient
 build peak of whichever is built second — build one, delete its Arrow cache,

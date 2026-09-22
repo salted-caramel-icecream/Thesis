@@ -6,16 +6,14 @@ from the v9 notebook lineage into an importable package.
 Ablation axes (all driven by the config dict, see `pvt_moe.config`):
   1. Baseline PVT v2         -> model.ablation.use_moe = False
   2. MoE placement           -> model.ablation.moe_placement (per stage & block)
-  3. RMSNorm vs LayerNorm    -> model.norm_type
-  4. RoPE placement          -> model.ablation.rope_placement (per stage & block)
-  5. ImageNet-1k vs 22k      -> dataset.name
+  3. RoPE placement          -> model.ablation.rope_placement (per stage & block)
+  4. ImageNet-1k vs 22k      -> dataset.name
 
 Subpackages
 -----------
 - ``pvt_moe.models``  : architecture (pure torch, no heavy deps)
 - ``pvt_moe.data``    : HF-Arrow ImageNet pipeline (1k / 22k)
 - ``pvt_moe.engine``  : LightningModule + trainer/callback factories
-- ``pvt_moe.ssl``     : JEPA-style self-supervised pretraining
 - ``pvt_moe.utils``   : FLOPs accounting + diagnostics
 """
 

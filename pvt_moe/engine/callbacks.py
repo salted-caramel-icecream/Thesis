@@ -205,7 +205,6 @@ class RoutingMonitor(pl.Callback):
         moe = cfg["model"]["moe"]
         self.capacity_factor = moe["capacity_factor"]
         self.top_k = moe["top_k"]
-        self.dropless = moe["backend"] == "megablocks"   # dMoE never drops
         self.last_stats: dict = {}
         self._acc: dict = {}
         self._handles: list = []
@@ -241,9 +240,8 @@ class RoutingMonitor(pl.Callback):
                 acc["counts"] += counts.double()
                 acc["prob_sum"] += probs.sum(dim=0).double()
                 acc["entropy_sum"] += -(probs.clamp_min(1e-12).log() * probs).sum().double()
-                if not self.dropless:
-                    cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
-                    acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
+                cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
+                acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
                 acc["tokens"] += int(tokens)
             except Exception as e:  # noqa: BLE001 — never kill a run for a diagnostic
                 self._failed = True
@@ -258,7 +256,7 @@ class RoutingMonitor(pl.Callback):
 
         @torch.no_grad()
         def hook(mod, args, output):
-            if not self._active or self._failed or self.dropless:
+            if not self._active or self._failed:
                 return
             layer = getattr(mod, "moe_layer", None)
             acc = self._acc.get(name)
@@ -346,7 +344,6 @@ class RoutingMonitor(pl.Callback):
                 "mean_gate_prob": [round(float(v), 6) for v in mean_p],
                 "imbalance": round(imbalance, 6),
                 "drop_rate": round(float(acc["dropped"].cpu()) / tokens, 6),
-                "dropless": self.dropless,
                 "route_entropy": round(_h(share), 6),
                 "gate_entropy": round(float(acc["entropy_sum"].cpu()) / tokens, 6),
                 "max_entropy": round(math.log(experts), 6),
@@ -515,54 +512,4 @@ def build_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
         # None (the default) means Lightning's own default: every batch.
         **{k: cfg[k] for k in ("limit_train_batches", "limit_val_batches")
            if cfg.get(k) is not None},
-    )
-
-
-def build_ssl_trainer(cfg: dict, extra_callbacks: list | None = None) -> pl.Trainer:
-    """Trainer for SSL pretraining (SimMIM / JEPA): monitors ``ssl_loss``, no
-    val loop. Same checkpoint files as the supervised trainer (``last.ckpt``,
-    milestones, RoPE frequency snapshots, results.json)."""
-    # A resume must not silently change what the checkpoint cannot carry.
-    # Here, not in the CLI: the notebooks call these factories directly.
-    assert_resume_identity(cfg)
-    ckpt_dir = os.path.join(cfg["checkpoint_root"], cfg["run_name"])
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=ckpt_dir,
-        monitor="ssl_loss",
-        mode="min",
-        save_top_k=1,
-        save_last=False,          # last.ckpt: RollingCheckpoint (see its docstring)
-        auto_insert_metric_name=False,
-        filename="epoch{epoch:03d}-loss{ssl_loss:.4f}",
-    )
-    callbacks = [checkpoint_cb, RollingCheckpoint(ckpt_dir), RopeFreqSnapshot(ckpt_dir),
-                 LearningRateMonitor(logging_interval="step")]
-    if _routing_monitor_wanted(cfg):
-        callbacks.append(RoutingMonitor(cfg))
-    callbacks.append(ResultsWriter(cfg, ckpt_dir))
-    if cfg.get("milestones"):
-        callbacks.append(MilestoneCheckpoint(cfg["milestones"], ckpt_dir))
-    if extra_callbacks:
-        callbacks.extend(extra_callbacks)
-    # The schedule is built for ssl.epochs; stop_at_epoch only ends the run
-    # early, exactly as in the supervised trainer.
-    max_epochs = cfg.get("stop_at_epoch") or cfg["ssl"]["epochs"]
-    return pl.Trainer(
-        max_epochs=max_epochs,
-        accelerator="auto",
-        devices=1,
-        precision=cfg["precision"] if torch.cuda.is_available() else 32,
-        gradient_clip_val=cfg["ssl"]["grad_clip"],
-        # micro-batch x this = the effective batch LitJEPA prints; the EMA
-        # update is per optimizer step, so accumulation is safe here.
-        accumulate_grad_batches=cfg.get("accumulate_grad_batches") or 1,
-        # "warn" (not True): True would make PL call
-        # torch.use_deterministic_algorithms without warn_only, turning
-        # nondeterministic-op warnings into mid-run crashes.
-        deterministic=("warn" if cfg["deterministic"] else None),
-        benchmark=not cfg["deterministic"],
-        callbacks=callbacks,
-        logger=build_loggers(cfg),
-        log_every_n_steps=50,
-        **{k: cfg[k] for k in ("limit_train_batches",) if cfg.get(k) is not None},
     )

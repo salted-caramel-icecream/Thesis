@@ -7,12 +7,12 @@ gap let ``mode: hf_pretrained`` under the scratch recipe resolve
 ``model.moe.upcycle_init`` to "none" — shared expert seeded, routed experts
 replicated, nothing zeroed, the block emitting ~2x the pretrained FFN — and
 ``tools/verify_upcycling.py`` reported it as an error of ~1e-1 on the real
-Tutel backend while the ssl path passed at 0.0.
+Tutel backend while the warm-start path passed at 0.0.
 
 Here a tiny dense model's state dict is renamed to HF PvtV2 naming (the
 exact inverse of ``_remap_hf_key``, key/value split back apart), served by a
 stub ``transformers`` module, and loaded into a MoE model. The bar is the
-same as for the ssl_init path: same input, same output, within 1e-4.
+same as for the warm_start path: same input, same output, within 1e-4.
 """
 
 from __future__ import annotations
@@ -229,13 +229,13 @@ def test_hf_upcycling_reproduces_the_dense_model_under_the_scratch_recipe():
 def _resolved(mode, **moe_over):
     over = {"mode": mode, "model": {"moe": {"shared_expert": True, **moe_over},
                                     "ablation": _MOE_LAST_S4}}
-    if mode == "ssl_init":
-        over["ckpt_path"] = "/nonexistent/jepa_backbone.pt"  # only validated at load time
+    if mode == "warm_start":
+        over["ckpt_path"] = "/nonexistent/backbone.pt"     # only validated at load time
     return validate_config(merge_config(default_config(), over))
 
 
 def test_config_fills_routed_zero_for_both_warm_start_modes():
-    for mode in ("ssl_init", "hf_pretrained"):
+    for mode in ("warm_start", "hf_pretrained"):
         cfg = _resolved(mode)
         assert cfg["recipe"] == "scratch"
         assert cfg["model"]["moe"]["upcycle_init"] == "routed_zero", \
@@ -246,7 +246,7 @@ def test_config_fills_routed_zero_for_both_warm_start_modes():
 # --- 4. regression: explicit "none" refused for hf_pretrained ----------------
 
 def test_explicit_none_is_refused_for_hf_pretrained_with_a_shared_expert():
-    for mode in ("hf_pretrained", "ssl_init"):
+    for mode in ("hf_pretrained", "warm_start"):
         try:
             _resolved(mode, upcycle_init="none")
         except ValueError as e:

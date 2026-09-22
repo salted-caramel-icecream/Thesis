@@ -3,37 +3,31 @@
 PVT v2 image classifier (B1 by default; `--variant b0…b5` selects another
 official size) with configurable Mixture-of-Experts, trained on
 ImageNet-1k/22k. This repo is the cleaned, packaged successor of the notebook
-lineage. The two source notebooks are kept untouched in the repo root for
-provenance — see `docs/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
+lineage. The source notebooks are kept untouched under `archive/` for
+provenance — see `archive/NOTEBOOK_TO_PACKAGE.md` for which is canonical and
 where each cell ended up.
 
 ```
 pvt_moe/        the package — ALL logic lives here
-PVT_Tutelmoe_v12_standalone.ipynb
-                the v9 notebook patched in place — SELF-CONTAINED, no
-                dependency on pvt_moe/ (verify: python tests/verify_patched_notebook.py)
-archive/        the original v9 notebook, unmaintained, kept for provenance
-notebooks/      thin launchers — v11_train.ipynb is the current supervised
-                one; 03_ssl_pretrain.ipynb is SSL pretraining (SimMIM / JEPA);
-                quick_bench.ipynb times a few epochs on this machine;
-                01 supervised/Tutel and 02 MegaBlocks are older
+archive/        the v9/v10 notebooks and the process documents that recorded
+                how they became the package; unmaintained, kept for provenance
+notebooks/      thin launchers — v11_train.ipynb trains from a checkout,
+                colab_train.ipynb from a pip install, quick_bench.ipynb times
+                a few epochs on this machine
 tests/          CPU test suite — python tests/run_all.py (no pytest needed)
-configs/        one YAML per ablation arm (--config configs/xxx.yaml)
-                scratch_NN_*.yaml        the 90-epoch ladder rows
-                *_300ep_stop100.yaml     same arm, 300-epoch cosine stopped at 100
-                bench_*_5ep.yaml         5-epoch timing / smoke arms (own W&B project)
-                ssl_NN_*.yaml            SSL pretraining arms (dense / MoE / pixel-space mask / JEPA)
+configs/        three annotated EXAMPLES — an arm is a command line, not a
+                file (see scripts/run_ladder.sh)
+scripts/        run_ladder.sh — the whole ladder, one row per invocation
 docs/           GUIDE.md (how to run: tokens, data, config, resuming, evaluation)
                 HPARAMS.md (the recipe tables), ARCHITECTURE.md (invariants)
-                SIMMIM_GUIDE.md (SSL: recipe, the stem leak, three pretraining
-                paths, the chain, evaluation protocol), JEPA_GUIDE.md (the
-                alternative SSL method), NOTEBOOK_TO_PACKAGE.md
+                SSL_BRANCH.md (where self-supervised pretraining went)
 train.py        terminal entry point (thin shim over pvt_moe/cli.py);
-                --task ssl pretrains, --recipe ssl_finetune / downstream chain
+                --recipe pretrained / downstream chain
 evaluate.py     validation top-1, k-NN, linear probe for any checkpoint -> results.json
-download_data.py  build the ImageNet / PASS / small-dataset Arrow snapshots
-tools/          compare_runs.py (table over results.json files), plot_rope_freqs.py,
-                verify_upcycling.py
+download_data.py  build the ImageNet / small-dataset Arrow snapshots
+tools/          compare_runs.py (one table over many results.json), plot_rope_freqs.py,
+                probe_checkpoint.py, verify_upcycling.py, check_kernels.py,
+                concurrent_worker_sweep.py — see CLAUDE.md for what each is for
 ```
 
 ## Setting up a GPU box from scratch
@@ -102,19 +96,15 @@ on any problem, so it can gate a script.
 
 ### 4. The MoE backend
 
-Tutel compiles a CUDA extension, so it needs a compiler — `build-essential` on
-Linux, **MSVC Build Tools** on Windows:
+Tutel compiles a CUDA extension, so it needs a compiler (`build-essential` on
+Linux, MSVC Build Tools on Windows):
 
 ```bash
 pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
+python train.py --backend native ...     # or skip it: pure PyTorch, no compiler
 ```
 
-If that will not build (common on Windows without MSVC — WSL2 is usually the
-easier path), skip it and use the pure-PyTorch backend, which needs nothing:
-
-```bash
-python train.py --backend native ...
-```
+`docs/GUIDE.md` §5b covers what the native fallback does and does not change.
 
 ### 5. Credentials and data
 
@@ -143,12 +133,13 @@ python download_data.py --out D:/data/imagenet_arrow
 python train.py --data-dir D:/data/imagenet_arrow --checkpoint-root D:/runs ...
 ```
 
-The snapshot settles at ~160 GB but needs **~320 GB free to build** —
-`datasets` keeps the raw download and the Arrow cache at the same time.
-`download_data.py` checks that `HF_TOKEN` is set and that there is enough free
-space before starting, so a 2–3 hour build fails in the first second rather
-than the last (accepting the licence is on you — HF refuses the download
-otherwise). Run it under `tmux` on a remote box. `docs/GUIDE.md` §2 has the detail.
+The snapshot settles at ~160 GB but needs **~320 GB free to build**, and
+`download_data.py` checks both the token and the free space before starting,
+so a 2–3 hour build fails in the first second rather than the last. Run it
+detached. `docs/GUIDE.md` §1–2 has the rest: the small downstream sets,
+`--fraction` for a benchmarking slice, carving a subset out of an existing
+snapshot, and putting the paths in a gitignored `configs/*.local.yaml` so you
+never pass `--data-dir` again.
 
 ### 6. Gate, smoke-test, then train
 
@@ -200,42 +191,49 @@ Start-Process -NoNewWindow -FilePath .\.venv\Scripts\python.exe `
 ```
 
 If it dies — power cut, OOM, a closed laptop — resume from the last milestone
-rather than restarting. Plan for that by asking for milestones up front:
+rather than restarting. Ask for milestones up front so there is one to resume
+from:
 
 ```bash
 python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]"
 python train.py --recipe scratch --epochs 300 \
     --resume-from /data/runs/<run_name>/milestone-epoch090.ckpt
-#   Windows:  --resume-from D:/runs/<run_name>/milestone-epoch090.ckpt
 ```
+
+`docs/GUIDE.md` §4 covers splitting a 300-epoch cosine across machines,
+`--stop-at`, and what a resume does and does not restore.
 
 ### 8. Running the whole ablation ladder
 
 ```bash
 # Linux / WSL2 / macOS
-for f in configs/scratch_0*.yaml; do
-    case "$f" in *_300ep_stop100.yaml) continue ;; esac   # ladder rows only
-    python train.py --config "$f" --data-dir /data/imagenet_arrow || break
-done
+scripts/run_ladder.sh scratch                  # rows 1-4, 6-9 at the recipe's budget
+scripts/run_ladder.sh scratch 300              # the same rows at 300 epochs
+scripts/run_ladder.sh scratch 90 3 4 7         # only rows 3, 4 and 7
+DRY_RUN=1 scripts/run_ladder.sh scratch        # resolve and print, train nothing
 ```
 ```powershell
 # Windows — D: is only an example; substitute your own drive
-foreach ($f in Get-ChildItem configs/scratch_0*.yaml |
-                Where-Object { $_.Name -notlike '*_300ep_stop100.yaml' }) {   # ladder rows only
-    python train.py --config $f.FullName --data-dir D:/data/imagenet_arrow
+foreach ($row in 1,2,3,4,6,7,8,9) {
+    python train.py --recipe scratch --ladder $row --data-dir D:/data/imagenet_arrow
     if ($LASTEXITCODE -ne 0) { break }
 }
 ```
 
-The guard matters: every scratch arm also ships a `_300ep_stop100` sibling
-that matches the same glob, and those are 300-epoch schedules — without the
-skip the loop would launch both budgets.
+The budget is a flag, not a file: `--epochs 300` reruns the same arm on a
+300-epoch schedule, and `--epochs 5 --set wandb_project=pvt-moe-bench` makes
+it a timing smoke run. Rows 10-12 of the scratch ladder are row 4 crossed with
+two binary flags — `--ladder 4 --no-rope`, `--ladder 4 --no-moe-dwconv`,
+`--ladder 4 --no-moe-dwconv --no-rope` — so they need no rows of their own.
+
+Row 5 is skipped by default: it is the "best config" row, which sets the
+300-epoch budget only, so you carry the winning architecture flags yourself.
 
 Each arm has a distinct run name, so they cannot overwrite each other.
 **Budget first**: at an estimated 45–85 min/epoch on a 5070 that loop is
 weeks, not days — see `docs/HPARAMS.md` §5.
 
-### 9. Wave 1: expert count at fixed placement, plus the SSL pair
+### 9. Wave 1: expert count at fixed placement
 
 Four arms, B2 throughout, all from scratch on the shipped 90-epoch ladder
 budget (90 matches ScMoE's comparison budget). No dedicated config files —
@@ -245,10 +243,10 @@ the first step: the run name printed at start-up begins `sv1_b2_`.
 
 | GPU | arm | command | run name |
 |---|---|---|---|
-| 0 | dense baseline | `--config configs/scratch_01_baseline_conv_ffn.yaml` | `sv1_b2_in1k_r224_dense_norope_ln_scratch90` |
-| 1 | MoE E=4 | `--config configs/scratch_03_moe_no_shared.yaml` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_ln_scratch90` |
-| 2 | MoE E=8 | `--config configs/scratch_03_moe_no_shared.yaml --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_ln_scratch90` |
-| 3 | MoE E=8, stages 3+4 | `--config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_ln_scratch90` |
+| 0 | dense baseline | `--recipe scratch --ladder 1` | `sv1_b2_in1k_r224_dense_norope_scratch90` |
+| 1 | MoE E=4 | `--recipe scratch --ladder 3` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
+| 2 | MoE E=8 | `--recipe scratch --ladder 3 --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--recipe scratch --ladder 8 --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -261,33 +259,21 @@ placement.
 COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
         --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
 
-CUDA_VISIBLE_DEVICES=0 python train.py --config configs/scratch_01_baseline_conv_ffn.yaml $COMMON
-CUDA_VISIBLE_DEVICES=1 python train.py --config configs/scratch_03_moe_no_shared.yaml $COMMON
-CUDA_VISIBLE_DEVICES=2 python train.py --config configs/scratch_03_moe_no_shared.yaml --experts 8 $COMMON
-CUDA_VISIBLE_DEVICES=3 python train.py --config configs/scratch_08_moe_s3s4.yaml --experts 8 --no-shared-expert $COMMON
+CUDA_VISIBLE_DEVICES=0 python train.py --recipe scratch --ladder 1 $COMMON
+CUDA_VISIBLE_DEVICES=1 python train.py --recipe scratch --ladder 3 $COMMON
+CUDA_VISIBLE_DEVICES=2 python train.py --recipe scratch --ladder 3 --experts 8 $COMMON
+CUDA_VISIBLE_DEVICES=3 python train.py --recipe scratch --ladder 8 --experts 8 --no-shared-expert $COMMON
 ```
 
 `drop_path` resolves to 0.1 on all four (the variant's official rate). All four
 run names are distinct, so no two arms can share a checkpoint directory.
 
-**No shared expert in any arm** — `scratch_08` ships with it on, so GPU 3
+**No shared expert in any arm** — ladder row 8 has it on, so GPU 3
 passes `--no-shared-expert` to match GPUs 1–2 (the run name carries no `+sh`).
 That keeps both comparisons single-variable: GPU 1 vs GPU 2 prices **expert
 count** at fixed stage-4 placement, GPU 2 vs GPU 3 prices **placement** at
 fixed E=8. It also means no routed block has a DWConv anywhere in the wave,
 since `moe_block_dwconv` feeds only the shared-expert branch.
-
-**The SSL pair — a later wave, not this one.** The SimMIM arms are
-`--task ssl --ssl-method simmim --no-moe --dataset imagenet-1k --epochs 100`
-(`sv1_b2_in1k_r224_dense_rope-s4b2_ln_simmim100`) and the same command with
-`--dataset pass --data-dir /data/pass_arrow`. Running
-ImageNet first gives the PASS arm a reference it otherwise has none of — no
-third-party MIM result on PASS is known — and the pair then isolates the
-pretraining corpus with everything else fixed. MoE is **off on both**: adding
-experts would confound the dataset comparison and put untested parameters into
-a path that has never completed an epoch. `mask_token_routing` therefore emits
-nothing on these arms (it requires `--moe`); it belongs to a later arm, once
-SimMIM is known to work.
 
 **Scope of the RoPE claim.** RoPE is on in both MoE arms and is not varied in
 Wave 1. It is tested later by re-running the winning MoE configuration with
@@ -296,41 +282,18 @@ only** — it does not measure RoPE's effect on a dense model. Any statement
 about RoPE from this ladder has to carry that scope.
 
 Budget: the scratch recipe's 90 epochs. For the 300-epoch cosine stopped
-early, use the `_300ep_stop100` sibling of the same file, or add
-`--epochs 300 --stop-at N --milestones "[...]"`. Repeat an arm without sharing
+early, add `--epochs 300 --stop-at N --milestones "[...]"` to the same
+command. Repeat an arm without sharing
 its checkpoint directory or W&B name: `--run-suffix v2`.
 
 ## Or use a notebook
 
-Three, for different purposes:
-
 | | |
 |---|---|
+| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/` from a checkout. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
+| `notebooks/colab_train.ipynb` | the same, on a machine with **no checkout**: `pip install git+<repo>@<sha>` at a pinned commit, then the same CLI. |
 | `notebooks/quick_bench.ipynb` | **measure before you commit compute** — pick a variant, time a few epochs, read images/s, peak VRAM and the projected 90/150/300-epoch days. No W&B, no real checkpoints. |
-| `notebooks/v11_train.ipynb` | **thin launcher** over `pvt_moe/`. No duplicated logic, so it inherits every fix and the whole CPU test suite. Prefer this. |
-| `PVT_Tutelmoe_v12_standalone.ipynb` | **generated from `pvt_moe/`** by `tools/make_v12_notebook.py` — self-contained (no package import), each code cell a package file inlined verbatim, with "Δ since v10" cells striking through the old lines. Regenerate after package changes; verified by `tests/verify_v12_notebook.py`. |
-| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes) — frozen provenance; superseded by v12. |
-
-The patched v10 carries these fixes into its own class definitions
-(each marked `v10 PATCH`):
-
-- `build_moe_ffn_layer` always passes `activation_fn`, working around Tutel's
-  missing `import torch.nn.functional as F` — and puts `capacity_factor` /
-  `gate_noise` **inside** `gate_type`, where Tutel actually reads them
-- an always-on shared expert, with `moe_block_dwconv` controlling whether the
-  MoE'd block keeps PVT v2's DWConv
-- **upcycling**: v9 discarded the stage-4 dense FFN and put nothing in its
-  place, so every "pretrained" MoE run trained stage 4 from random init. It
-  now seeds the shared expert and zeroes the routed experts' fc2, so the block
-  reproduces the dense FFN exactly at step 0 (verified: max|Δ| = 0.0)
-- gradient accumulation (micro-batch 128 × 8 = 1024 effective, for a 12 GB card)
-- milestone checkpoints + `stop_at_epoch` for resuming a long schedule
-- `weights_only=` removed from `trainer.fit` — not a valid argument, it raised
-  `TypeError` before training started
-- `/` removed from the checkpoint filename template, which was silently
-  creating a nested directory per checkpoint
-- the validation confusion matrix is reset each epoch; it had been
-  accumulating every epoch plus the sanity-check batches
+| `archive/PVT_Tutelmoe_v10_patched.ipynb` | the v9 notebook **patched in place** (31 fixes, listed in `archive/README.md`) — frozen provenance, unmaintained. |
 
 `notebooks/v11_train.ipynb` — same package, same results, edit ONLY the CONFIG
 cell. It prints the equivalent command line, so anything tuned interactively
@@ -367,8 +330,8 @@ python train.py --no-moe --no-dwconv --rope            # a dense ablation arm
 python train.py --set model.moe.gate_noise=0.0         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
-python train.py --config configs/scratch_04_moe_shared.yaml   # one ablation arm
-python train.py --config configs/my_paths.local.yaml --config configs/scratch_01_baseline_conv_ffn.yaml  # paths + arm (create the .local file first)
+python train.py --recipe scratch --ladder 4            # one ablation arm
+python train.py --config configs/my_paths.local.yaml --recipe scratch --ladder 1  # machine paths + arm (create the .local file first)
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
@@ -395,28 +358,28 @@ Every row gets a distinct run name (a test enforces it — colliding names would
 share a checkpoint directory and a W&B run). `--dry-run` resolves the config
 and stops; `--print-config` / `--save-config FILE` dump the resolved JSON.
 
-## Recipes: from scratch, pretrained, or the SSL chain
+## Recipes: from scratch, pretrained, or downstream
 
 One key picks the whole hyperparameter set (`docs/HPARAMS.md` is the source of
 truth; `tests/test_recipes.py::test_spec_*` assert every value):
 
 ```python
-cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "ssl_finetune" | "downstream"
+cfg = merge_config(default_config(), {"recipe": "scratch"})   # "pretrained" | "downstream"
 ```
 
-| | `scratch` (default) | `pretrained` | `ssl_finetune` | `downstream` |
-|---|---|---|---|---|
-| `mode` | `scratch` | `hf_pretrained` | `ssl_init` (`--ckpt <run>/simmim_backbone.pt`) | `ssl_init` (`--ckpt <run>/last.ckpt`) |
-| Epochs | **90** (ablations) / 150 / 300 (final) | 100 | 100 | fixed per dataset (fashionmnist 30, eurosat 50, pathmnist 30) |
-| Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) | same |
-| Warmup epochs | 5 | 3 | 20 | 5 |
-| Layer-wise LR decay | — | — | 0.9 | 0.9 |
-| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 | 0.1 |
-| Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 | 1.0 |
-| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical | identical |
+| | `scratch` (default) | `pretrained` | `downstream` |
+|---|---|---|---|
+| `mode` | `scratch` | `hf_pretrained` | `warm_start` (`--ckpt <run>/last.ckpt`) |
+| Epochs | **90** (ablations) / 150 / 300 (final) | 100 | fixed per dataset (fashionmnist 30, eurosat 50, pathmnist 30) |
+| Peak LR | 1e-3 @ batch 1024 | 1e-4 | 1.25e-3 per 512 × effective/512 (2.5e-3 @ 1024) |
+| Warmup epochs | 5 | 3 | 5 |
+| Layer-wise LR decay | — | — | 0.9 |
+| Stochastic depth | the variant's official rate, any budget (b0–b2 0.1, b3–b5 0.3) | 0.1 ("as pretraining") | 0.1 |
+| Stage-4 LR multiplier | 1.0 | 1.0 | 1.0 |
+| Weight decay / clip / effective batch / aug / MoE | 0.05 / 5.0 / 1024 / DeiT-1 / 4 experts top-1 + shared | identical | identical |
 
-SSL pretraining itself is `--task ssl` (SimMIM by default, `--ssl-method
-jepa`), not a recipe — see "Self-supervised pretraining" below.
+Self-supervised pretraining is not a recipe and is not on this branch — see
+`docs/SSL_BRANCH.md`.
 
 A recipe fills only fields left as `None`, so **anything you set explicitly
 wins**:
@@ -431,25 +394,24 @@ merge_config(default_config(), {
 
 Warmup always starts from an absolute **1e-6** — `optim.warmup_start_factor`
 is derived from your peak LR rather than hand-set, so it stays right when you
-change `lr`. Run names carry the budget: `..._ln_scratch90`, `..._ln_ft100`.
+change `lr`. Run names carry the budget: `..._scratch90`, `..._ft100`.
 
 In `notebooks/v11_train.ipynb` the top of the CONFIG cell exposes `RECIPE`,
 `EPOCHS`, `LR`, `WARMUP_EPOCHS`, `MILESTONES`, `STOP_AT` and `RESUME_FROM`
 directly, and prints the equivalent command line.
 
-## The seven ablation axes
+## The six ablation axes
 
 | # | Axis | Config | Notes |
 |---|------|--------|-------|
 | 1 | Dense baseline | `model.ablation.use_moe: False` | pure PVT v2; attention is plain MHA through SDPA (flash kernel under bf16) — one kv head per query head, no head-count knob |
 | 2 | MoE placement | `model.ablation.moe_placement` — per-stage lists of block indices; the default `[[],[],[],[-1]]` is stage 4's last block only (−1 counts from the end, so it is block 1 in B1 and block 2 in B2). Or `moe_last_n_stages: N` | experts/top-k/etc. under `model.moe` |
-| 3 | Norm | `model.norm_type: "layernorm" \| "rmsnorm"` | fused `nn.RMSNorm` (torch>=2.4); stage 4 keeps LN by default (`stage4_keeps_layernorm`) |
-| 4 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D complex-mul RoPE (rope-vit); needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
-| 5 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` (`"pass"` for SSL only) | `num_classes` derived (1000 / 21841 / 0); Arrow snapshot path per dataset |
-| 6 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
-| 7 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
+| 3 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D RoPE (rope-vit), real `(cos, sin)` form, adjacent-channel pairing; needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
+| 4 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
+| 5 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
+| 6 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
 
-Orthogonal to all seven: **model size**, `model.variant` / `--variant b2`
+Orthogonal to all six: **model size**, `model.variant` / `--variant b2`
 (b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
 pretrained HF checkpoint as one set and rejects a disagreeing explicit value,
 so B2 depths can never load B1 weights. `docs/HPARAMS.md` §1 has the table
@@ -460,150 +422,40 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_ln_scratch90
-└─────────────────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
-│   └─────────────────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
-│   │  └──────────────────────────────────────────────────── dataset (in1k | in22k | pass | fmnist | eurosat | path)
-│   │  │    └─────────────────────────────────────────────── input resolution (dataset.img_size; 224 = default)
-│   │  │    │        └────────────────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
-│   │  │    │        │    └───────────────────────────────── 4 experts, top-1
-│   │  │    │        │    │   └───────────────────────────── shared expert
-│   │  │    │        │    │   │   └───────────────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
-│   │  │    │        │    │   │   │         └─────────────── norm
-│   │  │    │        │    │   │   │         │  └──────────── recipe + epoch budget
+sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
+└──────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
+│   └──────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+│   │  └───────────────────────────────────────── dataset (in1k | in22k | fmnist | eurosat | path)
+│   │  │    └──────────────────────────────────── input resolution (dataset.img_size; 224 = default)
+│   │  │    │        └─────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
+│   │  │    │        │    └────────────────────── 4 experts, top-1
+│   │  │    │        │    │   └────────────────── shared expert
+│   │  │    │        │    │   │   └────────────── RoPE placement (+ "-ax" for axial; RoPE-Mixed is untagged)
+│   │  │    │        │    │   │   │         └──── recipe + epoch budget
 ```
 
-Further markers appear only when they apply: `-nat`/`-mb` (backend),
+Further markers appear only when they apply: `-nat` (the native backend),
 `+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
 theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
 `-randexp` (random expert init), `-szi` (`shared_zero` upcycling init; an explicit
 `none` with seeded experts is refused at validate time, so `-nozi` never appears).
 
-## RoPE frequency diagnostics
+## Where to read more
 
-RoPE-Mixed learns its frequencies, so every run with `use_rope` writes the
-`(2, heads, head_dim//2)` tensor of each RoPE'd block twice, into
-`<checkpoint_root>/<run_name>/`: `rope_freqs_init.pt` at step 0 (kept inside every checkpoint too, so a resume on
-another machine rewrites the true init rather than the restored weights) and
-`rope_freqs_final.pt` (refreshed every epoch; a killed run's latest values are
-also in `last.ckpt`, which the plot tool accepts directly).
+The long-form material lives in `docs/`, once each:
 
-```bash
-python tools/plot_rope_freqs.py <checkpoint_root>/<run_name>/rope_freqs_final.pt \
-    --init <checkpoint_root>/<run_name>/rope_freqs_init.pt --out figures/rope_freqs.pdf
-python tools/plot_rope_freqs.py --selftest          # synthetic spread / collapsed / axial cases
-```
-
-CPU only, torch + matplotlib, no dataset or Tutel — so it runs on a laptop
-while the GPU trains. `docs/GUIDE.md` §7 is the reading guide and
-`docs/HPARAMS.md` §2 the healthy-vs-collapsed table.
-
-## Shared expert (`model.moe.shared_expert`)
-
-An always-on dense FFN evaluated for every token alongside the routed
-experts, `y = routed_moe(x) + shared_expert(x)`. It lives outside the backend
-layer, so it works identically under all three backends and its weights are
-never touched by their own expert initialization.
-
-| Knob | Effect |
-|------|--------|
-| `shared_expert: True` | build the shared branch (costs one extra FFN per token: top-k → top-k+1 active) |
-| `moe_block_dwconv: True` | the MoE'd block keeps PVT v2's DWConv (on the shared branch, the only one with an intact token grid) — so RoPE becomes an independent axis instead of a compensation. **Scoped to `moe_placement`**; dense blocks elsewhere are untouched |
-| `upcycle_init` | which branch starts at zero when upcycling: `"routed_zero"` (default — the block starts out computing *exactly* the pretrained dense FFN), `"shared_zero"` (the spec's scheme), or `"none"`. Resolves to `"none"` with no shared expert |
-
-With `mode: hf_pretrained`, the shared branch is loaded verbatim from the
-pretrained dense FFN — the one place a pretrained FFN survives intact rather
-than being replicated into E experts. Read the
-`seeded_shared=... zeroed_routed_fc2=...` fields of the `[HF pretrained]` line
-to confirm it happened. Run names gain `+sh`.
-
-## MoE backends
-
-- **Native** (`--backend native`): pure PyTorch — no CUDA extension, no NCCL,
-  no compiler. The fallback for boxes where Tutel will not build. Top-1 only,
-  architecturally equivalent, and it mirrors Tutel's parameter layout so
-  checkpoints move between the two. Expert arithmetic is bit-exact against
-  Tutel and the aux loss is numerically identical; see `docs/ARCHITECTURE.md`
-  §2b.
-- **Tutel** (default): builds from source on any torch;
-  top-k gate with capacity factor + gate noise. The Tutel gate train-forcing
-  in `engine/classifier.py` is **load-bearing** (gates revert to eval after
-  Lightning validation, silently disabling gate noise).
-- **MegaBlocks dMoE** (notebook 02): dropless — `capacity_factor`/`gate_noise`
-  are no-ops. Needs `megablocks==0.10.0` (pins torch 2.7.x) +
-  `grouped_gemm==0.3.0` (CUTLASS build; sm_120/RTX 5090 support unverified).
-  The archived first attempt failed on three counts (no grouped_gemm, aux
-  collected in eval, bias=True silently ignored) — all fixed in
-  `pvt_moe/models/ffn.py`; the notebook's sanity cell checks each one.
-
-## Long runs in pieces
-
-Train a 300-epoch schedule across sessions or machines without compressing the
-cosine:
-
-```bash
-python train.py --recipe scratch --epochs 300 --milestones "[90,100,150,200]" --stop-at 90
-python train.py --recipe scratch --epochs 300 --resume-from .../milestone-epoch090.ckpt
-```
-
-`--epochs` is the schedule; `--stop-at` is only where you get off. Milestone
-checkpoints hold model + optimizer + scheduler + epoch and are never pruned by
-`save_top_k`. A stopped-and-resumed run follows an LR trajectory identical to
-one uninterrupted run — `tests/test_resume.py` asserts exactly that. Details
-in `docs/GUIDE.md` §4.
-
-## Hardware sizing (single 12 GB card)
-
-`batch_size` is the **micro**-batch (what fits VRAM); `effective_batch_size`
-is what the LR is calibrated for. Accumulation is derived, so a 12 GB card
-reproduces the paper's optimization exactly:
-
-```
-batch: 128 micro x 8 accum = 1024 effective
-```
-
-OOM? Two levers, neither of which changes the optimization:
-
-```bash
-python train.py --batch-size 64 --accum 16              # smaller micro-batch
-python train.py --grad-checkpointing "[1]" --batch-size 256   # recompute stage 1
-```
-
-Checkpointing saves in proportion to token count, so stage 1 (56×56 = 3136
-tokens) is worth ~64× stage 4 (7×7 = 49). `[1]` or `[1,2]` typically buys a
-2–4× larger micro-batch for ~30% per-stage slowdown.
-
-Starting points — every row is the **same optimization** (1024 effective),
-only the memory strategy differs:
-
-| GPU | VRAM | `--batch-size` | `--accum` | `--num-workers` |
-|---|---|---|---|---|
-| RTX 5070 | 12 GB | **128** (default) | **8** | 8 |
-| RTX 5090 | 32 GB | 512 | 2 | 12 |
-| H100 | 80 GB | 1024 | 1 | 16–32 |
-| H200 | 141 GB | 1024 | 1 | 16–32 |
-| B200 | 180 GB | 1024 | 1 | 16–32 |
-
-Those rows are for B1. **`--variant b2` needs roughly half the micro-batch**
-(~1.9× the activation memory per image): 64 × 16 on 12 GB, 256 × 4 on 32 GB,
-512 × 2 or 1024 × 1 from 80 GB up. **`--variant b0` needs about a quarter**
-(~0.27×): 512 × 2 on 12 GB, 1024 × 1 from 32 GB up. Effective batch stays 1024
-in every case, so the recipe's LR is unchanged. `python train.py --check-env
---variant b2` (or `b0`) computes the suggestion from the VRAM actually free;
-`docs/HPARAMS.md` §5 has the per-variant table.
-
-Estimates, not measurements — `python train.py --check-env` computes the same
-suggestion from the VRAM actually free on your box, and `setup_environment`
-warns before training if the micro-batch looks too large rather than OOM-ing
-an hour into data loading. Above ~40 GB the bottleneck stops being VRAM and
-becomes data loading; don't raise the *effective* batch past 1024 or the
-recipe's LR no longer matches. `docs/HPARAMS.md` §5 has the reasoning.
-
-Windows notes are handled in-code (no `fork`, no `expandable_segments`).
-
-**Budget honestly**: one ImageNet-1k epoch is an estimated 45–85 min on an
-RTX 5070, so a 90-epoch ablation run is 3–6 days and the 8-run ladder is
-4–8 weeks. Measure one epoch before committing. See `docs/HPARAMS.md` §5.
+| | |
+|---|---|
+| Credentials, building the Arrow snapshot, pointing the code at it | `docs/GUIDE.md` §1-2 |
+| Every flag and its notebook equivalent, side by side | `docs/GUIDE.md` §3 |
+| Long runs in pieces: milestones, `--stop-at`, resuming a 300-epoch cosine | `docs/GUIDE.md` §4 |
+| Sizing it for your GPU; what to do if Tutel will not build | `docs/GUIDE.md` §5, §5b |
+| Reading the startup banner and `results.json` | `docs/GUIDE.md` §6 |
+| RoPE-Mixed frequency diagnostics (`tools/plot_rope_freqs.py`) | `docs/GUIDE.md` §7 |
+| Evaluating and comparing runs (k-NN, probe, `compare_runs.py`) | `docs/GUIDE.md` §8 |
+| Every recipe and ladder row with its cited source | `docs/HPARAMS.md` |
+| Model invariants: MoE placement, the shared expert, backends, RoPE, upcycling | `docs/ARCHITECTURE.md` |
+| Where self-supervised pretraining went | `docs/SSL_BRANCH.md` |
 
 ## Datasets
 
@@ -617,14 +469,6 @@ paths in
 `config.dataset.arrow_dirs` (map-style `load_from_disk`; **never**
 `streaming=True` — measured much slower). Missing snapshots raise with build
 instructions instead of silently re-downloading ~160 GB.
-
-**PASS** (`--dataset pass`, SSL pretraining only): 1,439,588 unlabelled
-images, no people, CC-BY 4.0, not gated — `python download_data.py --dataset
-pass --out DIR` (~166 GB, ~333 GB free while building; the script deletes
-only PASS's raw download between the conversion and the save). It has no
-labels and no validation split, so every supervised recipe refuses it;
-`train.py --task ssl` and the SSL notebook use it by default. Evaluation
-still happens on a labelled set (`docs/SIMMIM_GUIDE.md` §6).
 
 **Small downstream sets** (`--recipe downstream`): `fashionmnist` (10
 classes, 28 px grayscale, MIT), `eurosat` (10 classes, 64 px RGB, MIT) and
@@ -640,10 +484,6 @@ with seeded validation / test carve-outs where the source has none;
 - ImageNet: Deng et al., "ImageNet: A large-scale hierarchical image
   database", CVPR 2009; Russakovsky et al., "ImageNet Large Scale Visual
   Recognition Challenge", IJCV 2015.
-- PASS: Asano, Vedaldi, Rupprecht et al., "PASS: An ImageNet replacement for
-  self-supervised pretraining without humans", NeurIPS Datasets and
-  Benchmarks 2021. <https://www.robots.ox.ac.uk/~vgg/research/pass/> —
-  images and dataset CC-BY 4.0; attribution required.
 - Fashion-MNIST: Xiao, Rasul, Vollgraf, "Fashion-MNIST: a Novel Image
   Dataset for Benchmarking Machine Learning Algorithms", arXiv 1708.07747,
   2017 — MIT licence.
@@ -656,46 +496,14 @@ with seeded validation / test carve-outs where the source has none;
   Scientific Data 2023 (MedMNIST+ sizes 64/128/224 in the same release) —
   CC BY 4.0; source data Kather et al., NCT-CRC-HE-100K, 2018, CC BY 4.0.
 
-## Self-supervised pretraining (SimMIM, or JEPA)
-
-`docs/SIMMIM_GUIDE.md` is the reference. The chain for a pyramid backbone
-under masked image modelling is **pretrain → supervised ImageNet-1k
-fine-tune → downstream** (SwinV2 §4.2, BEiT), and every `results.json`
-records which chain produced its numbers:
-
-```bash
-python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200          # dense (paths 1 / 3)
-python train.py --task ssl --dataset pass --data-dir /data/pass_arrow --epochs 200 --moe    # MoE pretrain (path 2)
-python train.py --recipe ssl_finetune --ckpt /data/runs/<run>/simmim_backbone.pt \
-    --dataset imagenet-1k --data-dir /data/imagenet_arrow                                    # intermediate stage
-python train.py --recipe downstream --dataset eurosat --data-dir /data/eurosat_arrow \
-    --ckpt /data/runs/<fine-tune run>/last.ckpt                                             # downstream
-python evaluate.py --ckpt /data/runs/<run>/simmim_backbone.pt --dataset imagenet-1k \
-    --data-dir /data/imagenet_arrow --knn --probe-epochs 20                                 # collapse check
-python tools/compare_runs.py /data/runs                                                     # one table
-```
-
-SimMIM's recipe (32-px patches, ratio 0.6, L1 on masked pixels, base LR
-2e-4 per 512 with the linear scaling rule, wd 0.05, betas (0.9, 0.999),
-clip 5, 224 throughout) is followed exactly where PVT v2 allows it; the one
-place it cannot be is PVT v2's **overlapping** 7×7/stride-4 stem, which lets
-visible tokens see a 3-px band of each masked patch (measured: 6.9 % of the
-masked pixels at ratio 0.6). The real runs use `token` (SimMIM's own
-behaviour; the band is too small to justify leaving the published recipe);
-`--mask-space pixel` removes the band and changes nothing else, kept as the
-control. With `--moe` the load-balancing loss counts the masked positions —
-a stated decision, `docs/SIMMIM_GUIDE.md` §4. Linear-probe / k-NN accuracy
-is **expected to be low** for a MIM encoder; the headline of an SSL arm is
-the fine-tuned top-1.
-
 ## Warm starts (`mode`)
 
 | mode | What happens |
 |------|--------------|
-| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`, LN→RMS handled) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
+| `hf_pretrained` | remap the variant's `OpenGVLab/pvt_v2_b*` (B1 by default; HF's separate k/v fused into `attn.kv`) + seed MoE experts from the dense FFN (sparse upcycling). A checkpoint whose depths/widths do not match the built model is refused |
 | | Set by `recipe: "pretrained"`. The upcycled block starts out computing *exactly* the pretrained dense FFN (`upcycle_init: "routed_zero"`); `--upcycle-init shared_zero` switches to the spec's scheme, which is not exact at `top_k: 1` — `docs/HPARAMS.md` §3 |
 | `scratch` | random init |
-| `ssl_init` | load a SimMIM / JEPA backbone (`<run>/<method>_backbone.pt`) or any `last.ckpt` from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._sslft100_from-dense-simmim200`) |
+| `warm_start` | load any `last.ckpt` or saved backbone from `ckpt_path`; the saved architecture is checked, a dense checkpoint's FFN is upcycled into the MoE'd block, a MoE checkpoint is loaded as trained; the parent's `chain` is prepended and the run name carries the parent (`..._dstr50_from-dense-ft100`) |
 | `resume` | full Lightning resume from `ckpt_path` |
 
 Always read the `[HF pretrained] loaded=...` line: a remap drift once cost a
@@ -712,7 +520,7 @@ full training run that started from random weights (8.9% accuracy).
 
 ## Config management
 
-Plain nested dicts, no framework — see `pvt_moe/config.py`. The config is
+Plain nested dicts, no framework — see `pvt_moe/config/`. The config is
 JSON-serializable by construction (a test enforces it), so it is logged to
 W&B and checkpointed verbatim, and `validate_config` does the domain checks a
 schema library would not give you for free (placement bounds, `head_dim % 4`,

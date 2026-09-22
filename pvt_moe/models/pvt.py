@@ -7,7 +7,6 @@ Baselines with Pyramid Vision Transformer") extended with:
 - per-block Mixture-of-Experts FFN (``pvt_moe.models.ffn.MoEMlp``)
 - per-block 2D RoPE, mixed (learnable per-head frequencies, default) or
   axial (``pvt_moe.models.rope``)
-- a LayerNorm/RMSNorm toggle (``pvt_moe.models.norms``)
 
 The overlapping patch-embedding stems are fixed at the official PVT v2
 geometry — 7x7/stride-4 for stage 1 and 3x3/stride-2 for stages 2-4 — and are
@@ -24,6 +23,7 @@ weighting, and the NaN guard belong to the training loop, not the model.
 from __future__ import annotations
 
 import math
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,6 @@ from torch.nn.init import trunc_normal_
 
 from pvt_moe.models.attention import SRAttention
 from pvt_moe.models.ffn import Mlp, MoEMlp
-from pvt_moe.models.norms import RMSNorm, build_norm_layers
 
 
 def _to_2tuple(x):
@@ -167,7 +166,6 @@ class PyramidVisionTransformerV2(nn.Module):
         drop_path_rate: float = 0.0,
         linear_attention: bool = False,
         norm_layer=nn.LayerNorm,
-        norm_layer_last_stage=None,
         moe_placement=None,
         rope_placement=None,
         moe_cfg: dict | None = None,
@@ -188,20 +186,18 @@ class PyramidVisionTransformerV2(nn.Module):
         rope_placement = rope_placement or [[] for _ in depths]
         self.moe_placement = [list(b) for b in moe_placement]
         self.rope_placement = [list(b) for b in rope_placement]
-        norm_last = norm_layer_last_stage or norm_layer
 
         # Stochastic depth: linear ramp over the full block sequence.
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
 
         for i in range(self.num_stages):
-            stage_norm = norm_last if i == self.num_stages - 1 else norm_layer
             patch_embed = OverlapPatchEmbed(
                 patch_size=7 if i == 0 else 3,
                 stride=4 if i == 0 else 2,
                 in_chans=in_chans if i == 0 else embed_dims[i - 1],
                 embed_dim=embed_dims[i],
-                norm_layer=stage_norm,
+                norm_layer=norm_layer,
             )
             blocks = nn.ModuleList(
                 [
@@ -213,7 +209,7 @@ class PyramidVisionTransformerV2(nn.Module):
                         drop=drop_rate,
                         attn_drop=attn_drop_rate,
                         drop_path=dpr[cur + j],
-                        norm_layer=stage_norm,
+                        norm_layer=norm_layer,
                         sr_ratio=sr_ratios[i],
                         linear_attention=linear_attention,
                         act_layer=act_layer,
@@ -227,7 +223,7 @@ class PyramidVisionTransformerV2(nn.Module):
                     for j in range(depths[i])
                 ]
             )
-            norm = stage_norm(embed_dims[i])
+            norm = norm_layer(embed_dims[i])
             cur += depths[i]
             # PVT-official attribute naming — the HF pretrained remap
             # (pvt_moe.models.pretrained) depends on these names.
@@ -256,7 +252,7 @@ class PyramidVisionTransformerV2(nn.Module):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.LayerNorm, RMSNorm)):
+        elif isinstance(m, nn.LayerNorm):
             if getattr(m, "bias", None) is not None:
                 nn.init.constant_(m.bias, 0)
             if getattr(m, "weight", None) is not None:
@@ -277,7 +273,7 @@ class PyramidVisionTransformerV2(nn.Module):
         The learnable RoPE-Mixed frequencies: decaying them pulls every
         frequency toward zero, i.e. toward position blindness (rope-vit lists
         ``freqs`` under ``no_weight_decay`` for the same reason). Both
-        ``LitClassifier`` and ``LitJEPA`` consult this.
+        ``LitClassifier`` consults this.
         """
         return {n for n, _ in self.named_parameters() if n.endswith("rope.freqs")}
 
@@ -312,8 +308,6 @@ class PyramidVisionTransformerV2(nn.Module):
         self,
         x: torch.Tensor,
         return_tokens: bool = False,
-        stage1_token_mask: torch.Tensor | None = None,
-        mask_token: torch.Tensor | None = None,
     ):
         """Run the 4-stage backbone.
 
@@ -322,10 +316,8 @@ class PyramidVisionTransformerV2(nn.Module):
         ``return_tokens`` — and ``aux`` is the mean MoE load-balancing loss
         over MoE blocks (None when no MoE block ran).
 
-        SSL hooks (used by pvt_moe.ssl): ``stage1_token_mask`` is a (B, N1)
-        bool tensor over the stage-1 token grid; masked tokens are replaced by
-        the learnable ``mask_token`` (C1,) right after the first patch
-        embedding (SimMIM-style masking for hierarchical backbones).
+        ``return_tokens`` is what the k-NN / linear-probe evaluation and the
+        upcycling verifier use (``pvt_moe.eval.features``, ``eval.probe``).
         """
         B = x.shape[0]
         aux_total = 0.0
@@ -337,12 +329,6 @@ class PyramidVisionTransformerV2(nn.Module):
             norm = getattr(self, f"norm{i + 1}")
 
             x, H, W = patch_embed(x)
-            if i == 0 and stage1_token_mask is not None:
-                if mask_token is None:
-                    raise ValueError("stage1_token_mask requires mask_token")
-                x = torch.where(
-                    stage1_token_mask[..., None], mask_token.to(x.dtype).expand_as(x), x
-                )
 
             checkpointed = (
                 self.training
@@ -381,15 +367,12 @@ class PyramidVisionTransformerV2(nn.Module):
 def build_model(cfg: dict) -> PyramidVisionTransformerV2:
     """Construct the backbone from a validated config dict.
 
-    Warm starting (HF weights / SSL checkpoints / expert seeding) is handled
+    Warm starting (HF weights / local checkpoints / expert seeding) is handled
     separately by ``pvt_moe.models.pretrained`` — this builds architecture
     only.
     """
     m = cfg["model"]
     abl = m["ablation"]
-    norm_main, norm_last = build_norm_layers(
-        m["norm_type"], m["norm_eps"], m["stage4_keeps_layernorm"]
-    )
     return PyramidVisionTransformerV2(
         in_chans=m["in_chans"],
         num_classes=cfg["dataset"]["num_classes"],
@@ -403,8 +386,7 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         attn_drop_rate=m["attn_drop_rate"],
         drop_path_rate=m["drop_path_rate"],
         linear_attention=m["linear_attention"],
-        norm_layer=norm_main,
-        norm_layer_last_stage=norm_last,
+        norm_layer=partial(nn.LayerNorm, eps=m["norm_eps"]),
         moe_placement=abl["moe_placement"] if abl["use_moe"] else None,
         rope_placement=abl["rope_placement"] if abl["use_rope"] else None,
         moe_cfg=m["moe"],

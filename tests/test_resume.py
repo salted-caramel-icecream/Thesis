@@ -300,7 +300,7 @@ def test_resume_guards_every_field_that_changes_training_invisibly():
     guarded = {c for c, _ in RESUME_IDENTITY_FIELDS}
     for expected in ("model.drop_path_rate", "effective_batch_size", "loss.aux_weight",
                      "model.moe.capacity_factor", "model.moe.gate_noise",
-                     "optim.grad_clip", "ssl.grad_clip", "ssl.mask_ratio"):
+                     "optim.grad_clip"):
         assert expected in guarded, expected
     assert not any("layer_decay" in c for c in guarded), "guarding a no-op is worse than not"
 
@@ -380,5 +380,51 @@ def test_resume_reports_what_the_checkpoint_overrides():
             unchanged = copy.deepcopy(cfg)
             unchanged["mode"], unchanged["ckpt_path"] = "resume", ckpt
             assert "(same)" in "\n".join(resume_provenance(unchanged, ckpt))
+    finally:
+        undo()
+
+
+def test_rolling_checkpoint_runs_after_model_checkpoint():
+    """``last.ckpt`` must carry THIS epoch's top-k bookkeeping, not last epoch's.
+
+    ``RollingCheckpoint``'s docstring states the invariant two ways and both
+    are load-bearing, so both are pinned here:
+
+    1. It subclasses ``Checkpoint``, which is what makes Lightning run it in
+       the checkpoint pass — i.e. AFTER ``ModelCheckpoint``. Demoting it to a
+       plain ``Callback`` would reorder the two silently, and ``last.ckpt``
+       would record a top-k state one epoch stale.
+    2. ``ModelCheckpoint`` is first in ``build_trainer``'s list, which is what
+       keeps ``trainer.checkpoint_callback`` pointing at the val_acc one
+       rather than at the rolling file.
+
+    Nothing else tests this; it was documented prose only. ``build_trainer``
+    is edited whenever a callback is added or removed, which is exactly when
+    the order slips.
+    """
+    from pytorch_lightning.callbacks import Checkpoint, ModelCheckpoint
+
+    from pvt_moe.engine.callbacks import ResultsWriter, RollingCheckpoint, RoutingMonitor
+
+    assert issubclass(RollingCheckpoint, Checkpoint), \
+        "RollingCheckpoint must subclass Checkpoint or Lightning runs it BEFORE ModelCheckpoint"
+
+    undo = install_fake_tutel_backend()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cfg = tiny_config(checkpoint_root=d, log_root=d, epochs=2,
+                              milestones=[1], use_wandb=False, use_tensorboard=False)
+            trainer = build_trainer(cfg)
+            kinds = [type(c) for c in trainer.callbacks]
+
+            assert ModelCheckpoint in kinds and RollingCheckpoint in kinds
+            model_cbs = [c for c in trainer.callbacks if type(c) is ModelCheckpoint]
+            assert len(model_cbs) == 1, f"expected one ModelCheckpoint, got {len(model_cbs)}"
+            assert trainer.checkpoint_callback is model_cbs[0], \
+                "ModelCheckpoint must come first so trainer.checkpoint_callback is the val_acc one"
+
+            if RoutingMonitor in kinds and ResultsWriter in kinds:
+                assert kinds.index(RoutingMonitor) < kinds.index(ResultsWriter), \
+                    "RoutingMonitor must precede ResultsWriter so results.json gets THIS epoch"
     finally:
         undo()

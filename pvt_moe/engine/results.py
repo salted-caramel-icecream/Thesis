@@ -1,6 +1,6 @@
 """``results.json`` + ``results.md``: one record per run, refreshed every epoch.
 
-Every training run — supervised, intermediate fine-tune, downstream, SSL —
+Every training run — supervised, fine-tune, downstream —
 writes ``<checkpoint_root>/<run_name>/results.json`` at every epoch boundary
 (and once more at the end), so a killed run still leaves its numbers and a
 thesis table never needs a W&B export. ``tools/compare_runs.py`` reads these
@@ -8,17 +8,14 @@ files. The record has five parts:
 
 - ``identity``  — run name, version, variant, task / recipe / mode, dataset
   and resolution, seed, the full ``chain`` of stages that produced the
-  weights (e.g. ``simmim_pretrain@pass_r224 -> ssl_finetune@imagenet-1k_r224
-  -> downstream@eurosat_r224``), the parent checkpoint, the git commit and
-  a hash of the resolved config;
+  weights (e.g. ``hf_finetune@imagenet-1k_r224 -> downstream@eurosat_r224``),
+  the parent checkpoint, the git commit and a hash of the resolved config;
 - ``accuracy``  — the latest and the best validation top-1 / top-5, macro
-  precision / recall, losses; for SSL runs the pretraining losses and an
-  explicit note that probe / k-NN accuracy is expected to be low under MIM;
+  precision / recall, losses;
 - ``efficiency`` — MEASURED: seconds per epoch, images per second, peak VRAM;
   plus parameter counts and GFLOPs (fvcore, when installed);
 - ``moe``       — the aux loss and expert utilisation (token share and
-  routing entropy per MoE block on a few validation batches); for MoE
-  pretraining the mask-vs-visible routing split (``pvt_moe.ssl.diagnostics``);
+  routing entropy per MoE block on a few validation batches);
 - ``environment`` — torch / CUDA / Lightning versions, GPU name, platform.
 
 ``history`` keeps one row per epoch. ``eval`` is reserved for ``evaluate.py``
@@ -64,11 +61,6 @@ AUX_NOTE = ("train_aux is a poor balance metric: aux = E*sum_i f_i*p_i is identi
             ".share, and .gate_entropy (near log E = an undecided router, which is exactly "
             "when aux is pinned) instead.")
 
-MIM_PROBE_NOTE = ("Linear-probe / k-NN accuracy is EXPECTED to be low for a masked-image-"
-                  "modelling encoder (SimMIM, MAE, BEiT all report weak probes and strong "
-                  "fine-tuning); here they are collapse detectors. The headline number of a "
-                  "SimMIM arm is the fine-tuned top-1 (docs/SIMMIM_GUIDE.md §7).")
-
 
 def _float(v):
     if isinstance(v, torch.Tensor):
@@ -113,10 +105,10 @@ def run_identity(cfg: dict) -> dict:
         "dataset": cfg["dataset"]["name"], "img_size": cfg["dataset"]["img_size"],
         "num_classes": cfg["dataset"].get("num_classes"), "seed": cfg.get("seed"),
         "chain": list(cfg.get("chain") or []), "parent_ckpt": cfg.get("ckpt_path"),
-        "epochs": cfg["ssl"]["epochs"] if cfg.get("task") == "ssl" else cfg["epochs"],
+        "epochs": cfg["epochs"],
         "effective_batch_size": cfg.get("effective_batch_size"),
         "precision": cfg.get("precision"),
-        "norm": m["norm_type"], "dense_dwconv": m.get("dense_dwconv", True),
+        "dense_dwconv": m.get("dense_dwconv", True),
         # Stochastic depth leaves NO trace in the checkpoint (DropPath holds no
         # parameters and no buffers) and none in the run name, so this record
         # is the only place a resume can check it against — see
@@ -137,16 +129,20 @@ def run_identity(cfg: dict) -> dict:
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
-    if cfg.get("task") == "ssl":
-        s = cfg["ssl"]
-        ident["ssl"] = {"method": s["method"], "lr": s["lr"], "base_lr": s["base_lr"],
-                        "mask_patch_size": s["mask_patch_size"], "mask_ratio": s["mask_ratio"],
-                        "mask_space": s["mask_space"], "grad_clip": s.get("grad_clip")}
-    else:
-        o = cfg["optim"]
-        ident["optim"] = {"lr": o["lr"], "base_lr": o.get("base_lr"),
-                          "layer_decay": o.get("layer_decay"), "warmup_epochs": o["warmup_epochs"],
-                          "weight_decay": o["weight_decay"], "grad_clip": o.get("grad_clip")}
+    # The two run-name fragments a CHILD run reads back through
+    # config.parent_tag to name its parent, recorded as tokens so nothing has
+    # to re-parse a directory name. See config.run_name_parts.
+    try:
+        from pvt_moe.config import run_name_parts
+
+        parts = run_name_parts(cfg)
+        ident["name_moe"], ident["name_budget"] = parts["moe"], parts["budget"]
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        pass
+    o = cfg["optim"]
+    ident["optim"] = {"lr": o["lr"], "base_lr": o.get("base_lr"),
+                      "layer_decay": o.get("layer_decay"), "warmup_epochs": o["warmup_epochs"],
+                      "weight_decay": o["weight_decay"], "grad_clip": o.get("grad_clip")}
     return ident
 
 
@@ -304,7 +300,7 @@ class ResultsWriter(pl.Callback):
     def record(self, trainer, pl_module, finished: bool, extra: dict | None = None) -> dict:
         cfg = self.cfg
         last = self.history[-1] if self.history else {}
-        budget = cfg["ssl"]["epochs"] if cfg.get("task") == "ssl" else cfg["epochs"]
+        budget = cfg["epochs"]
         accuracy = {k: last.get(k) for k in ("val_acc", "val_acc_top5", "val_precision_macro",
                                              "val_recall_macro", "val_loss", "train_loss",
                                              "train_ce", "train_acc_mixed")}
@@ -332,10 +328,6 @@ class ResultsWriter(pl.Callback):
             "environment": self._static.get("environment") or environment_info(),
             "history": self.history,
         }
-        if cfg.get("task") == "ssl":
-            rec["ssl"] = {"ssl_loss": last.get("ssl_loss"), "recon_loss": last.get("recon_loss"),
-                          "mask_ratio": last.get("mask_ratio"), "target_std": last.get("target_std"),
-                          "note": MIM_PROBE_NOTE}
         if extra:
             for k, v in extra.items():
                 if isinstance(v, dict) and isinstance(rec.get(k), dict):
@@ -371,7 +363,7 @@ def read_results(dirpath: str) -> dict | None:
 #: name — so a resume could silently continue one run under two settings.
 #: Each is compared against the identity block results.json recorded for the
 #: run being resumed; a side that is absent or None is skipped, which is what
-#: makes the MoE-only and SSL-only entries no-ops elsewhere.
+#: makes the MoE-only entries no-ops elsewhere.
 #:
 #: Deliberately NOT here: optim.layer_decay. Changing it between 1.0 and a
 #: decay changes the optimizer's param-group COUNT, which makes
@@ -386,14 +378,12 @@ RESUME_IDENTITY_FIELDS = (
     ("model.moe.gate_noise", "moe.gate_noise"),
     ("loss.aux_weight", "moe.aux_weight"),
     ("optim.grad_clip", "optim.grad_clip"),
-    ("ssl.grad_clip", "ssl.grad_clip"),
-    ("ssl.mask_ratio", "ssl.mask_ratio"),
 )
 
 
 def _dig(node, dotted: str):
     """``_dig(cfg, "model.moe.gate_noise")`` -> the value, or None if any hop
-    is missing or not a dict (an SSL field on a supervised run, say)."""
+    is missing or not a dict (a MoE field on a dense run, say)."""
     for part in dotted.split("."):
         if not isinstance(node, dict):
             return None
@@ -458,8 +448,8 @@ def resume_provenance(cfg: dict, ckpt_path: str) -> list:
             base_lrs += list(sched.get("base_lrs") or [])
     if base_lrs:
         ckpt_lr = max(base_lrs)
-        asked = (cfg["ssl"]["lr"] if cfg.get("task") == "ssl" else cfg["optim"]["lr"])
-        key = "ssl.lr" if cfg.get("task") == "ssl" else "optim.lr"
+        asked = cfg["optim"]["lr"]
+        key = "optim.lr"
         same = asked is not None and abs(ckpt_lr - asked) <= 1e-12 * max(1.0, abs(asked))
         lines.append(
             f"  {key}: this command resolves {asked:.3e}, the checkpoint restores "
@@ -470,7 +460,7 @@ def resume_provenance(cfg: dict, ckpt_path: str) -> list:
         groups = opt_states[0].get("param_groups") or []
         wds = {g.get("weight_decay") for g in groups if isinstance(g, dict)}
         wds.discard(None)
-        asked_wd = (cfg["ssl"] if cfg.get("task") == "ssl" else cfg["optim"]).get("weight_decay")
+        asked_wd = cfg["optim"].get("weight_decay")
         if wds and asked_wd is not None and asked_wd not in wds:
             lines.append(f"  weight_decay: this command resolves {asked_wd}, the checkpoint "
                          f"restores {sorted(wds)}  <-- the checkpoint WINS")
@@ -482,9 +472,9 @@ def resume_provenance(cfg: dict, ckpt_path: str) -> list:
 def assert_resume_identity(cfg: dict) -> list:
     """Raise if a resume would silently change one of those fields.
 
-    Called by ``build_trainer`` / ``build_ssl_trainer`` (so the CLI and the
+    Called by ``build_trainer`` (so the CLI and the
     notebooks are both covered) before any compute. Same shape as the
-    ``ssl_init`` architecture guard: it names the fix and can be switched off
+    ``warm_start`` architecture guard: it names the fix and can be switched off
     with ``model.resume_check_identity: false`` when the change is deliberate.
     """
     if cfg.get("mode") != "resume" or not cfg.get("ckpt_path"):
@@ -547,15 +537,6 @@ def render_markdown(rec: dict) -> str:
               f"{_fmt(acc.get('val_precision_macro'), pct=True)} | "
               f"{_fmt(acc.get('val_recall_macro'), pct=True)} | {_fmt(acc.get('val_loss'), nd=4)} | "
               f"{_fmt(acc.get('train_loss'), nd=4)} |"]
-    if rec.get("ssl"):
-        s = rec["ssl"]
-        lines += ["", "## SSL pretraining", "",
-                  f"ssl_loss {_fmt(s.get('ssl_loss'), nd=4)} | recon {_fmt(s.get('recon_loss'), nd=4)} | "
-                  f"mask ratio {_fmt(s.get('mask_ratio'), nd=3)} measured"
-                  + (f" / {_fmt(s.get('mask_ratio_configured'), nd=3)} configured"
-                     if s.get("mask_ratio_configured") is not None else "")
-                  + (f" | target_std {_fmt(s.get('target_std'), nd=3)}" if s.get("target_std") is not None else ""),
-                  "", f"> {s.get('note', MIM_PROBE_NOTE)}"]
     params, gfl = eff.get("params") or {}, eff.get("gflops") or {}
     lines += ["", "## Measured efficiency", "",
               "| s / epoch | images / s | peak VRAM (GiB) | params (M) | GFLOPs | batch | precision |",
@@ -599,18 +580,6 @@ def render_markdown(rec: dict) -> str:
                                 f"cap {cap}/expert per fwd)" if d else "not measured")
                 lines.append(f"| {name} | {u['share']} | "
                              f"{u['entropy']:.2f} / {u['max_entropy']:.2f} | {dropped} |")
-    mr = rec.get("mask_routing")
-    if mr and "error" not in mr:
-        lines += ["", "## Mask-token vs visible-token routing (MoE pretraining)", "",
-                  "| block | masked share | visible share | H masked / visible / max | concentration | gap |",
-                  "|---|---|---|---|---|---|"]
-        for name, s in mr.items():
-            lines.append(f"| {name} | {s['masked_share']} | {s['visible_share']} | "
-                         f"{s['masked_entropy']:.2f} / {s['visible_entropy']:.2f} / {s['max_entropy']:.2f} | "
-                         f"{s['mask_token_concentration']:.2f} | {s['share_gap']:.2f} |")
-        lines.append("")
-        lines.append("> The load-balancing loss counts the masked positions: every token of the "
-                     "stage is routed, so ~60% of what it balances is mask-token derived.")
     ev = rec.get("eval")
     if ev:
         lines += ["", "## Evaluation (evaluate.py)", "", "```json", json.dumps(ev, indent=2), "```"]

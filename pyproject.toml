@@ -28,18 +28,16 @@ dependencies = [
 pvt-moe-train = "pvt_moe.cli:main"
 
 [project.optional-dependencies]
-# MoE backends are installed separately — see notebooks 01/02 install cells:
+# The Tutel MoE backend is installed separately (the notebooks' install cell):
 #   tutel:      pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
-#   megablocks: pip install --no-build-isolation grouped_gemm==0.3.0 && pip install megablocks==0.10.0
-#               (megablocks 0.10.0 pins torch 2.7.x)
 extras = ["fvcore", "wandb", "tensorboard"]
 
-[tool.setuptools]
-packages = [
-    "pvt_moe",
-    "pvt_moe.models",
-    "pvt_moe.data",
-    "pvt_moe.engine",
-    "pvt_moe.ssl",
-    "pvt_moe.utils",
-]
+# Discovered, not listed. The hand-written list shipped a broken install twice
+# during the 2026 cleanup: once naming a package that had been deleted
+# (pvt_moe.ssl), once omitting one that had just been added (pvt_moe.config).
+# Nothing imports this file, so no test caught either. `find` reads the tree
+# that is actually there, so a new subpackage is installed the moment it has an
+# __init__.py and a deleted one cannot linger.
+[tool.setuptools.packages.find]
+include = ["pvt_moe*"]
+namespaces = false

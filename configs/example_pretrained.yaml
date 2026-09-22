@@ -1,0 +1,21 @@
+# EXAMPLE — see configs/example_scratch.yaml for how configs relate to flags.
+#
+# Warm start from the variant's OpenGVLab/pvt_v2_b* checkpoint, with the dense
+# FFN upcycled into the MoE'd block. Equivalent to:
+#
+#   python train.py --recipe pretrained --ladder 4
+#
+# `--recipe pretrained` sets mode: hf_pretrained and pulls model.pretrained_hf_id
+# from the variant registry; naming another variant's id is rejected.
+
+recipe: "pretrained"
+epochs: 100
+
+model:
+  seed_moe_from_dense: true      # upcycle the pretrained FFN into the experts
+  moe:
+    num_experts: 4
+    shared_expert: true
+  ablation:
+    use_moe: true
+    moe_placement: [[], [], [], [-1]]

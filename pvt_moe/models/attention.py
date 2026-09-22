@@ -103,13 +103,13 @@ class SRAttention(nn.Module):
             # in FULL-grid units (scale_h/scale_w) so q–k relative phases stay
             # geometrically meaningful when sr_ratio > 1 or in linear mode.
             # For sr_ratio == 1 the scales are 1 → identical to v9 behavior.
-            q_cis = self.rope.get(H, W, x.device)
-            q = apply_rotary_emb(q, q_cis)
+            q_cos, q_sin = self.rope.get(H, W, x.device)
+            q = apply_rotary_emb(q, q_cos, q_sin)
             # Same grid (sr_ratio 1, e.g. stage 4): the key phases are the
             # query phases — no second computation.
-            k_cis = q_cis if (H_kv, W_kv) == (H, W) else self.rope.get(
-                H_kv, W_kv, x.device, scale_h=H / H_kv, scale_w=W / W_kv)
-            k = apply_rotary_emb(k, k_cis)
+            k_cos, k_sin = ((q_cos, q_sin) if (H_kv, W_kv) == (H, W) else self.rope.get(
+                H_kv, W_kv, x.device, scale_h=H / H_kv, scale_w=W / W_kv))
+            k = apply_rotary_emb(k, k_cos, k_sin)
 
         dropout_p = self.attn_drop.p if self.training else 0.0
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)

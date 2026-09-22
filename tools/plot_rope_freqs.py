@@ -33,6 +33,19 @@ views per row:
         ladder as '+' on the baseline and the collapse threshold dotted.
 A per-layer summary table is printed to stdout.
 
+THE THESIS FIGURE STYLE, of which this script is the reference implementation.
+Every figure in the thesis follows it; ``tools/compare_runs.py --plot`` does
+too. Vector PDF, matplotlib only — no seaborn, no style sheets, rcParams set
+explicitly in the script:
+
+    font.size 9, axes.titlesize 9, axes.labelsize 9, legend.fontsize 8,
+    xtick.labelsize 8, ytick.labelsize 8, pdf.fonttype 42 (TrueType, so the
+    text stays selectable and embeds), savefig.bbox "tight"
+
+Figure width 7.0 in (double column), height about 2.3 in per row.
+Colour-blind-safe palette only — Okabe-Ito (below) or tab10.
+``--out`` may name a directory that does not exist; it is created.
+
 ``--selftest`` builds synthetic ``(2, 8, 32)`` tensors (head_dim 64, as in
 PVT v2 B1/B2 stage 4), plots them, and asserts on the summary statistics —
 including an oblique case (all angles near 20 degrees) that fails if omega_x

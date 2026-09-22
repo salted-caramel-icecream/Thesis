@@ -9,9 +9,9 @@ the dense FFN at step 0" is made against real routing, capacity and combine.
 
 Two paths, both compared at 224^2 on the requested variant, in eval mode:
 
-  ssl   a dense backbone with the run's flags (the JEPA context encoder
-        shape) is built, saved like ``LitJEPA.save_backbone`` and loaded
-        with ``mode: ssl_init`` into the MoE model;
+  ckpt  a dense backbone with the run's flags is built, saved the way a
+        run saves one, and loaded with ``mode: warm_start`` into the MoE
+        model;
   hf    (``--hf``) ``OpenGVLab/pvt_v2_<variant>`` is loaded into a dense
         model and, via ``load_hf_pretrained``, into the MoE model.
 
@@ -44,7 +44,7 @@ if str(REPO) not in sys.path:
 
 import torch  # noqa: E402
 
-from pvt_moe.config import default_config, merge_config, validate_config  # noqa: E402
+from pvt_moe.config import VALID_BACKENDS, default_config, merge_config, validate_config  # noqa: E402
 from pvt_moe.models import build_model  # noqa: E402
 from pvt_moe.models.pretrained import load_backbone_checkpoint, load_hf_pretrained  # noqa: E402
 
@@ -87,7 +87,7 @@ def _backend_banner(args):
 
 def _seed_stage4_rope_identically(dense, moe):
     """Both models draw random RoPE-Mixed angles at construction; the upcycled
-    model must use the dense one's, exactly as ssl_init/HF loading does."""
+    model must use the dense one's, exactly as warm_start/HF loading does."""
     src = dict(dense.named_parameters())
     with torch.no_grad():
         for n, p in moe.named_parameters():
@@ -95,13 +95,13 @@ def _seed_stage4_rope_identically(dense, moe):
                 p.copy_(src[n])
 
 
-def run_ssl_path(args, device):
+def run_checkpoint_path(args, device):
     torch.manual_seed(args.seed)
     dense = build_model(_cfg(args, use_moe=False)).to(device).eval()
     with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "jepa_backbone.pt")
+        p = os.path.join(d, "backbone.pt")
         torch.save({"state_dict": dense.state_dict(), "cfg": _cfg(args, use_moe=False)}, p)
-        cfg = _cfg(args, use_moe=True, mode="ssl_init", ckpt_path=p)
+        cfg = _cfg(args, use_moe=True, mode="warm_start", ckpt_path=p)
         torch.manual_seed(args.seed)
         moe = build_model(cfg).to(device)
         stats = load_backbone_checkpoint(moe, p, expected_cfg=cfg,
@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recipe", required=True, choices=("scratch", "pretrained"),
                    help="the recipe the compared run trains with; it decides what "
                         "model.moe.upcycle_init resolves to (a resolved 'none' is refused)")
-    p.add_argument("--backend", default="tutel", choices=("tutel", "native", "megablocks"))
+    p.add_argument("--backend", default="tutel", choices=VALID_BACKENDS)
     p.add_argument("--experts", type=int, default=4)
     p.add_argument("--hf", action="store_true", help="also run the HF path (downloads weights)")
     p.add_argument("--tol", type=float, default=1e-4)
@@ -166,8 +166,8 @@ def main(argv=None) -> int:
     print(f"[device] {device} | torch {torch.__version__}")
     _backend_banner(args)
     ok = True
-    dense, moe = run_ssl_path(args, device)
-    ok &= compare("ssl_init", dense, moe, device, args)
+    dense, moe = run_checkpoint_path(args, device)
+    ok &= compare("warm_start", dense, moe, device, args)
     if args.hf:
         dense, moe = run_hf_path(args, device)
         ok &= compare("hf_pretrained", dense, moe, device, args)

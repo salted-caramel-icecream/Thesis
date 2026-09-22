@@ -1,10 +1,8 @@
 """Linear probe: frozen backbone + one linear layer on pooled features.
 
-The standard SSL metric — but read docs/SIMMIM_GUIDE.md §7 before quoting
-it: under masked image modelling (SimMIM, MAE, BEiT) the linear probe is
-known to be weak while fine-tuning is strong, so here it is a COLLAPSE
-DETECTOR (a probe near chance means the encoder learned nothing), not the
-headline number. The headline for a SimMIM arm is the fine-tuned top-1.
+Read it as a COLLAPSE DETECTOR of the frozen representation — a probe near
+chance means the encoder learned nothing — rather than as a headline number;
+the headline is the fine-tuned top-1.
 """
 
 from __future__ import annotations

@@ -117,9 +117,8 @@ def test_drop_rate_is_the_total_variation_distance_from_uniform_at_capacity_one(
         assert abs(s["imbalance"] - tv) < 2e-3
     # full collapse is the maximum: 1 - 1/E
     assert abs(logit_routing_stats(_logits_for([1.0, 0, 0, 0]))["drop_rate"] - (1 - 1 / E)) < 1e-6
-    # a larger capacity factor absorbs the overflow; a dropless backend reports none
+    # a larger capacity factor absorbs the overflow
     assert logit_routing_stats(_logits_for([0.6, 0.2, 0.1, 0.1]), capacity_factor=3.0)["drop_rate"] == 0.0
-    assert logit_routing_stats(_logits_for([1.0, 0, 0, 0]), dropless=True)["drop_rate"] == 0.0
     assert capacity_of(400, 4, 1.0) == 100 and capacity_of(400, 4, 0.0) == 400
 
 

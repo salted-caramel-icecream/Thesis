@@ -4,9 +4,7 @@ No pytest dependency — plain functions named ``test_*`` in ``test_*.py``
 files. Exits non-zero on any failure. These tests are the gate before ANY
 GPU run: if they fail, do not upload / launch training.
 
-Version guards: the suite runs on torch >= 2.3 (the RMSNorm fused kernel is
-exercised only when the local torch has it; the fallback is exercised
-otherwise — both paths are correct).
+The suite runs on torch >= 2.3.
 """
 
 from __future__ import annotations
@@ -35,7 +33,17 @@ def main() -> int:
     passed, failed, errors = 0, 0, []
 
     for mod_name in modules:
-        module = importlib.import_module(mod_name)
+        try:
+            module = importlib.import_module(mod_name)
+        except BaseException:          # noqa: BLE001
+            # A module that fails to IMPORT used to kill the runner outright:
+            # no summary, no other module's results, and the traceback buried
+            # under whatever had already printed. Count it as one failure and
+            # carry on, the same way a failing test is handled below.
+            failed += 1
+            errors.append((mod_name, "<import>", traceback.format_exc()))
+            print(f"\n== {mod_name} ==\n  FAIL <import>")
+            continue
         tests = [
             (name, fn)
             for name, fn in vars(module).items()

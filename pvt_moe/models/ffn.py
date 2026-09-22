@@ -4,7 +4,7 @@ Two implementations sit behind one interface:
 
 - ``Mlp``    — dense: fc1 -> DWConv (depthwise 3x3, PVT v2's positional
   encoding) -> GELU -> fc2. Returns a tensor.
-- ``MoEMlp`` — sparse: a Tutel or MegaBlocks expert layer replacing the whole
+- ``MoEMlp`` — sparse: a Tutel or native expert layer replacing the whole
   FFN. Returns ``(tensor, aux_loss)``.
 
 ARCHITECTURAL INVARIANT: the routed MoE branch has **no DWConv**, so an MoE
@@ -44,18 +44,6 @@ Tutel (default):
     pass, silently disabling gate_noise. ``pvt_moe.engine.classifier`` forces
     them back to train mode — that code is load-bearing.
 
-MegaBlocks (dMoE, dropless — no capacity factor, no token dropping):
-  - requires megablocks==0.10.0 (pins torch 2.7.x) + grouped_gemm==0.3.0;
-    ``mlp_impl='grouped'`` is the only viable impl on modern torch (the
-    'sparse' path was disabled upstream in v0.8.0).
-  - ``bias`` is silently ignored by the grouped expert MLP, so we honestly
-    set ``bias=False`` (the archive's failed attempt passed bias=True and
-    silently lost all FFN biases).
-  - the load-balancing loss lives in a module-global registry that is ONLY
-    populated in training mode; the archive crashed by collecting it during
-    Lightning's validation sanity check. We collect it only when
-    ``self.training``.
-  - ``capacity_factor`` and ``gate_noise`` from the config are no-ops here.
 """
 
 from __future__ import annotations
@@ -118,11 +106,11 @@ class Mlp(nn.Module):
 
 
 class MoEMlp(nn.Module):
-    """Mixture-of-experts FFN (Tutel or MegaBlocks behind one interface).
+    """Mixture-of-experts FFN (Tutel or native behind one interface).
 
     ``forward`` returns ``(output, aux_loss)`` where ``aux_loss`` is the
-    load-balancing loss for THIS layer (a scalar tensor; zero in eval mode
-    for the megablocks backend).
+    load-balancing loss for THIS layer (a scalar tensor). Both backends share
+    that contract, which is why ``forward`` needs no per-backend branch.
     """
 
     def __init__(
@@ -138,7 +126,7 @@ class MoEMlp(nn.Module):
         self.num_experts = moe_cfg["num_experts"]
         self.top_k = moe_cfg["top_k"]
         # Kept for the drop accounting in utils.diagnostics: Tutel's layer does
-        # not expose the capacity it enforces, and megablocks has none at all.
+        # not expose the capacity it enforces.
         self.capacity_factor = moe_cfg.get("capacity_factor")
         self.in_features = in_features
         self.hidden_features = hidden_features
@@ -161,10 +149,6 @@ class MoEMlp(nn.Module):
             self.moe_layer = self._build_tutel(in_features, hidden_features, moe_cfg, act_layer)
         elif self.backend == "native":
             self.moe_layer = self._build_native(in_features, hidden_features, moe_cfg, act_layer)
-        elif self.backend == "megablocks":
-            self.moe_layer, self.mb_args = self._build_megablocks(
-                in_features, hidden_features, moe_cfg, act_layer
-            )
         else:
             raise ValueError(f"Unknown MoE backend: {self.backend!r}")
 
@@ -219,38 +203,6 @@ class MoEMlp(nn.Module):
             gate_noise=moe_cfg.get("gate_noise", 0.0),
         )
 
-    @staticmethod
-    def _build_megablocks(dim: int, hidden: int, moe_cfg: dict, act_layer):
-        from megablocks.layers.arguments import Arguments  # lazy
-        from megablocks.layers.dmoe import dMoE
-
-        args = Arguments(
-            hidden_size=dim,
-            ffn_hidden_size=hidden,
-            moe_num_experts=moe_cfg["num_experts"],
-            moe_top_k=moe_cfg["top_k"],
-            # Raw loss; the training loop applies loss.aux_weight itself.
-            moe_loss_weight=1.0,
-            # Grouped expert MLPs create no bias parameters; say so honestly.
-            bias=False,
-            activation_fn=act_layer(),
-            mlp_impl="grouped",
-            # One registry entry per layer — matches the clear/collect pattern
-            # in forward() below.
-            num_layers=1,
-            # Arguments defaults to fp16=True (Megatron heritage) — wrong for
-            # this pipeline. bf16 params match bf16-mixed autocast activations
-            # (grouped_gemm kernels do not run fp32, so fp16=False alone would
-            # still mismatch). MoE forwards must run under bf16 autocast.
-            fp16=False,
-            bf16=True,
-            # Arguments' device default_factory CALLS torch.cuda.current_device()
-            # at construction — crashes CPU-only boxes and silently puts expert
-            # params on cuda:0 while the rest of the model is on CPU. Build on
-            # CPU like every other module; Lightning/.to(device) moves it.
-            device=torch.device("cpu"),
-        )
-        return dMoE(args), args
 
     # -- upcycling ------------------------------------------------------------
 
@@ -315,23 +267,7 @@ class MoEMlp(nn.Module):
         B, N, C = x.shape
         x_flat = x.reshape(B * N, C).contiguous()
 
-        if self.backend in ("tutel", "native"):
-            out, aux = self.moe_layer(x_flat)
-        else:  # megablocks
-            from megablocks.layers.moe import (  # lazy
-                batched_load_balancing_loss,
-                clear_load_balancing_loss,
-            )
-
-            clear_load_balancing_loss()
-            out = self.moe_layer(x_flat)
-            if self.training:
-                # Registry is only populated in training mode; collecting it
-                # in eval crashes (the archive attempt's failure mode).
-                aux = batched_load_balancing_loss(self.mb_args)
-            else:
-                aux = torch.zeros((), device=x.device, dtype=x.dtype)
-            clear_load_balancing_loss()
+        out, aux = self.moe_layer(x_flat)
 
         out = out.reshape(B, N, C)
         if self.shared_expert is not None:

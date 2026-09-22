@@ -1,5 +1,5 @@
 """RoPE-Mixed (learnable per-head 2D frequencies): the port of rope-vit's
-``init_random_2d_freqs`` / ``compute_mixed_cis`` and its plumbing.
+``init_random_2d_freqs`` / ``compute_mixed_cos_sin`` and its plumbing.
 
 What is pinned here, and why:
 
@@ -39,16 +39,18 @@ from pvt_moe.models.rope import (
     RotaryEmbedding2D,
     _init_t_xy,
     apply_rotary_emb,
-    compute_axial_cis,
-    compute_mixed_cis,
+    compute_axial_cos_sin,
+    compute_mixed_cos_sin,
     init_mixed_freqs,
 )
 
 MIXED_S3_S4 = {"use_rope": True, "rope_mode": "mixed", "rope_placement": [[], [], [0], [0, 1]]}
 
 
-def _real(c: torch.Tensor) -> torch.Tensor:
-    return torch.view_as_real(c)
+def _real(cs) -> torch.Tensor:
+    """A (cos, sin) pair as one real tensor, so two phase sets compare in one
+    call — the real-form stand-in for torch.view_as_real(cis)."""
+    return torch.stack(cs, dim=-1) if isinstance(cs, tuple) else cs
 
 
 def _close(a: torch.Tensor, b: torch.Tensor, atol: float = 1e-5) -> bool:
@@ -68,11 +70,12 @@ def test_mixed_with_zero_rotation_equals_axial():
     freqs = init_mixed_freqs(16, 4, theta=50.0, rotate=False)
     assert freqs.shape == (2, 4, 8)
     t_x, t_y = _init_t_xy(7, 7)
-    mixed = compute_mixed_cis(freqs, t_x, t_y)                # (4, 49, 8)
-    axial = compute_axial_cis(16, 7, 7, 50.0)                 # (49, 8)
-    assert mixed.shape == (4, 49, 8) and mixed.dtype == torch.complex64
+    mixed = compute_mixed_cos_sin(freqs, t_x, t_y)            # (4, 49, 8) x2
+    axial = compute_axial_cos_sin(16, 7, 7, 50.0)             # (49, 8) x2
+    assert mixed[0].shape == (4, 49, 8) and mixed[0].dtype is torch.float32
     for h in range(4):
-        assert _close(mixed[h], axial), f"head {h}: max diff {(_real(mixed[h]) - _real(axial)).abs().max()}"
+        head = (mixed[0][h], mixed[1][h])
+        assert _close(head, axial), f"head {h}: max diff {(_real(head) - _real(axial)).abs().max()}"
 
     # Through the module: a mixed module whose freqs are the unrotated init
     # must produce the axial module's cache, on the full grid ...
@@ -83,19 +86,20 @@ def test_mixed_with_zero_rotation_equals_axial():
     dev = torch.device("cpu")
     got = rope_mixed.get(7, 7, dev)
     want = rope_axial.get(7, 7, dev)
-    assert got.shape == (4, 49, 8) and want.shape == (49, 8)
+    assert got[0].shape == (4, 49, 8) and want[0].shape == (49, 8)
     for h in range(4):
-        assert _close(got[h], want), f"module path, head {h}"
+        assert _close((got[0][h], got[1][h]), want), f"module path, head {h}"
 
     # ... and on the SR-reduced key grid (2x2 cells of a 8x8 grid, scale 4):
     # both modes must place the reduced cells at the same full-grid centres.
     got_k = rope_mixed.get(2, 2, dev, scale_h=4.0, scale_w=4.0)
     want_k = rope_axial.get(2, 2, dev, scale_h=4.0, scale_w=4.0)
-    assert got_k.shape == (4, 4, 8) and want_k.shape == (4, 8)
+    assert got_k[0].shape == (4, 4, 8) and want_k[0].shape == (4, 8)
     for h in range(4):
-        assert _close(got_k[h], want_k), f"scaled key grid, head {h}"
+        assert _close((got_k[0][h], got_k[1][h]), want_k), f"scaled key grid, head {h}"
     # and the scaled grid is genuinely different from the unscaled 2x2 one
-    assert not _close(got_k[0], rope_mixed.get(2, 2, dev)[0], atol=1e-3)
+    unscaled = rope_mixed.get(2, 2, dev)
+    assert not _close((got_k[0][0], got_k[1][0]), (unscaled[0][0], unscaled[1][0]), atol=1e-3)
 
 
 # --- 2. parameter shape / layout / init --------------------------------------
@@ -122,12 +126,14 @@ def test_freqs_parameter_shape_layout_and_init():
     assert t_x.tolist() == [0, 1, 2, 0, 1, 2] and t_y.tolist() == [0, 0, 0, 1, 1, 1]
     fx = torch.zeros(2, 1, 4); fx[0, 0, 2] = 1.0
     fy = torch.zeros(2, 1, 4); fy[1, 0, 2] = 1.0
-    cis_x = compute_mixed_cis(fx, t_x, t_y)[0]     # (6, 4)
-    cis_y = compute_mixed_cis(fy, t_x, t_y)[0]
-    assert _close(cis_x[:, 2], torch.polar(torch.ones(6), t_x))
-    assert _close(cis_y[:, 2], torch.polar(torch.ones(6), t_y))
+    cx, sx = (t[0] for t in compute_mixed_cos_sin(fx, t_x, t_y))   # (6, 4)
+    cy, sy = (t[0] for t in compute_mixed_cos_sin(fy, t_x, t_y))
+    assert _close((cx[:, 2], sx[:, 2]), (t_x.cos(), t_x.sin()))
+    assert _close((cy[:, 2], sy[:, 2]), (t_y.cos(), t_y.sin()))
     # untouched channels have zero phase
-    assert _close(cis_x[:, [0, 1, 3]], torch.ones(6, 3, dtype=torch.complex64))
+    # untouched channels: phase 0 => cos 1, sin 0
+    assert _close((cx[:, [0, 1, 3]], sx[:, [0, 1, 3]]),
+                  (torch.ones(6, 3), torch.zeros(6, 3)))
 
     # Init: magnitudes are the axial ladder 1/theta**(4k/head_dim), repeated
     # for the two halves; the halves sit π/2 apart; one random angle per head.
@@ -170,13 +176,13 @@ def test_freqs_parameter_shape_layout_and_init():
 def test_mixed_rotation_preserves_norm_and_dtype():
     torch.manual_seed(0)
     rope = RotaryEmbedding2D(16, theta=10.0, mode="mixed", num_heads=4)
-    cis = rope.get(7, 7, torch.device("cpu"))
-    assert cis.shape == (4, 49, 8) and cis.dtype == torch.complex64
-    assert torch.allclose(cis.abs(), torch.ones_like(cis.abs()), atol=1e-5)   # unit modulus
+    cos, sin = rope.get(7, 7, torch.device("cpu"))
+    assert cos.shape == (4, 49, 8) and cos.dtype is torch.float32
+    assert torch.allclose(cos**2 + sin**2, torch.ones_like(cos), atol=1e-5)   # unit modulus
 
     for dtype in (torch.float32, torch.bfloat16):
         x = torch.randn(2, 4, 49, 16).to(dtype)
-        out = apply_rotary_emb(x, cis)
+        out = apply_rotary_emb(x, cos, sin)
         assert out.shape == x.shape and out.dtype == dtype, (out.shape, out.dtype)
         tol = 1e-4 if dtype == torch.float32 else 5e-2
         assert torch.allclose(out.float().norm(dim=-1), x.float().norm(dim=-1), atol=tol, rtol=tol)
@@ -184,16 +190,16 @@ def test_mixed_rotation_preserves_norm_and_dtype():
         assert not torch.allclose(out[:, :, 0].float(), out[:, :, 1].float(), atol=1e-3)
         # Per-head frequencies: the same input rotates differently per head.
         same = x[:, :1].expand(-1, 4, -1, -1)
-        rot = apply_rotary_emb(same, cis)
+        rot = apply_rotary_emb(same, cos, sin)
         assert not torch.allclose(rot[:, 0].float(), rot[:, 1].float(), atol=1e-3)
 
     # A per-head cache with the wrong head count is refused, not broadcast.
     try:
-        apply_rotary_emb(torch.randn(1, 2, 49, 16), cis)
+        apply_rotary_emb(torch.randn(1, 2, 49, 16), cos, sin)
     except ValueError as e:
         assert "heads" in str(e)
     else:
-        raise AssertionError("4-head cis applied to 2-head x must raise")
+        raise AssertionError("4-head cos/sin applied to 2-head x must raise")
 
 
 # --- 4. fp32 phase under autocast -------------------------------------------
@@ -206,10 +212,10 @@ def test_mixed_phase_is_fp32_under_autocast():
     with torch.autocast("cpu", dtype=torch.bfloat16):
         under = rope.get(7, 7, dev)
         under_k = rope.get(2, 2, dev, scale_h=3.5, scale_w=3.5)
-        assert under.dtype == torch.complex64, under.dtype
-        assert under_k.dtype == torch.complex64, under_k.dtype
+        assert under[0].dtype is torch.float32, under[0].dtype
+        assert under_k[0].dtype is torch.float32, under_k[0].dtype
         # the rotated tensor follows the input dtype, the phase does not
-        out = apply_rotary_emb(torch.randn(1, 4, 49, 16, dtype=torch.bfloat16), under)
+        out = apply_rotary_emb(torch.randn(1, 4, 49, 16, dtype=torch.bfloat16), *under)
         assert out.dtype == torch.bfloat16
     assert torch.allclose(_real(under), _real(plain), atol=1e-6, rtol=0)
     assert torch.allclose(_real(under_k), _real(rope.get(2, 2, dev, scale_h=3.5, scale_w=3.5)),
@@ -218,8 +224,8 @@ def test_mixed_phase_is_fp32_under_autocast():
     # the phase is still computed in fp32 from an fp32 upcast.
     t_x, t_y = _init_t_xy(7, 7)
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        cis = compute_mixed_cis(rope.freqs.detach(), t_x, t_y)
-    assert cis.dtype == torch.complex64 and torch.allclose(_real(cis), _real(plain), atol=1e-6)
+        again = compute_mixed_cos_sin(rope.freqs.detach(), t_x, t_y)
+    assert again[0].dtype is torch.float32 and torch.allclose(_real(again), _real(plain), atol=1e-6)
 
 
 # --- 5. gradient reaches freqs ------------------------------------------------
@@ -561,24 +567,6 @@ def test_cross_directory_resume_keeps_the_true_init():
             assert os.path.exists(os.path.join(c, cfg3["run_name"], "rope_freqs_final.pt"))
 
 
-def test_jepa_excludes_freqs_from_weight_decay():
-    import types
-    from pvt_moe.ssl.jepa import LitJEPA
-    jepa = LitJEPA(tiny_config(model={"ablation": MIXED_S3_S4}))
-    jepa.__dict__["_trainer"] = types.SimpleNamespace(estimated_stepping_batches=10)
-    opt = jepa.configure_optimizers()
-    optimizer = opt["optimizer"] if isinstance(opt, dict) else opt[0][0]
-    ids = {id(p) for n, p in jepa.context.named_parameters() if n.endswith("rope.freqs")}
-    assert ids, "the SSL context encoder should carry mixed RoPE frequencies"
-    seen = 0
-    for g in optimizer.param_groups:
-        for p in g["params"]:
-            if id(p) in ids:
-                seen += 1
-                assert g["weight_decay"] == 0.0 and not g.get("use_wd_schedule", False)
-    assert seen == len(ids)
-
-
 def test_frozen_stages_keep_freqs_trainable():
     model = build_model(tiny_config(model={"ablation": MIXED_S3_S4}))
     model.freeze_stages(3)
@@ -596,13 +584,13 @@ def test_coordinate_cache_and_shared_key_phases_do_not_change_outputs():
     rope = RotaryEmbedding2D(16, theta=10.0, mode="mixed", num_heads=4)
     a = rope.get(7, 7, torch.device("cpu"))
     b = rope.get(7, 7, torch.device("cpu"))
-    assert torch.equal(torch.view_as_real(a), torch.view_as_real(b)) and len(rope._cache) == 1
-    fresh = compute_mixed_cis(rope.freqs, *_init_t_xy(7, 7))
-    assert torch.allclose(torch.view_as_real(a), torch.view_as_real(fresh))
+    assert torch.equal(_real(a), _real(b)) and len(rope._cache) == 1
+    fresh = compute_mixed_cos_sin(rope.freqs, *_init_t_xy(7, 7))
+    assert torch.allclose(_real(a), _real(fresh))
     with torch.no_grad():
         rope.freqs.mul_(1.7)                          # learnable: phases must follow
     c = rope.get(7, 7, torch.device("cpu"))
-    assert not torch.allclose(torch.view_as_real(a), torch.view_as_real(c))
+    assert not torch.allclose(_real(a), _real(c))
     # attention: sr_ratio 1 (shared phases) vs sr_ratio 2 (separate k grid)
     for sr in (1, 2):
         attn = SRAttention(16, num_heads=4, sr_ratio=sr, use_rope=True,
@@ -622,7 +610,7 @@ def test_saved_config_rederives_run_name_and_theta():
         saved = json.load(open(path))
         assert saved["run_name"] is None and saved["model"]["ablation"]["rope_theta"] is None
         c = _cli("--config", path, "--rope-mode", "axial")
-        assert c["run_name"].endswith("rope-s4b1-ax_ln_scratch90") and c["model"]["ablation"]["rope_theta"] == 50.0
+        assert c["run_name"].endswith("rope-s4b1-ax_scratch90") and c["model"]["ablation"]["rope_theta"] == 50.0
         # an explicit run name survives the round trip
         assert main(["--dry-run", "--no-wandb", "--run-name", "mine", "--save-config", path]) == 0
         assert json.load(open(path))["run_name"] == "mine"

@@ -18,6 +18,7 @@ import contextlib
 import io
 import math
 import tempfile
+import warnings
 
 import pytorch_lightning as pl
 import torch
@@ -187,3 +188,89 @@ def test_overfit_check_fits_one_real_batch_and_reports_pass():
         # PASS must say exactly what it cleared and what it deliberately bypassed
         assert "does NOT cover" in out and "check_kernels" in out and "label names" in out, \
             "the PASS message must state its coverage and name the next checks"
+
+
+class _ConstLoss(torch.nn.Module):
+    """A loss that always returns the same scalar (nn.Module: LitClassifier
+    holds train_loss_fn as a child module, so a lambda cannot be assigned)."""
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, *args, **kwargs):
+        return torch.tensor(self.value)
+
+
+class _NanAux(torch.nn.Module):
+    """Wraps the backbone and poisons only the aux term — the exact failure the
+    old fallback swallowed."""
+
+    def __init__(self, inner, value=float("nan")):
+        super().__init__()
+        self.inner = inner
+        self.value = value
+
+    def forward(self, x):
+        logits, _ = self.inner(x)
+        return logits, torch.tensor(self.value)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.inner, name)
+
+
+def test_a_non_finite_loss_raises_instead_of_being_silently_dropped():
+    """A diverging router must stop the run, not cost one quiet step.
+
+    Until this test existed the branch was entirely uncovered: `training_step`
+    caught a NaN/Inf total and fell back to `ce_loss`, which left a non-finite
+    CE unchanged — so the ONLY thing it could hide was a non-finite aux, i.e.
+    the router gate diverging. Its only trace was `train_loss == train_ce` for
+    that step while `train_aux` read large, which nobody watches.
+
+    FloatingPointError, not RuntimeError: a sweep over the ladder can catch it
+    to mark one arm diverged and carry on, while a genuine crash still stops
+    everything. Nothing in this repo catches RuntimeError around training, so
+    the narrower type costs nothing.
+    """
+    undo = install_fake_tutel_backend()
+    try:
+        # training_step calls self.log(), and these modules are never attached
+        # to a Trainer — Lightning warns about that and it is not the point.
+        warnings.filterwarnings("ignore", message=".*self.log().*")
+        x, y = _separable(4, seed=1)[:4]
+
+        # 1. A finite step is unaffected.
+        with contextlib.redirect_stdout(io.StringIO()):
+            model = LitClassifier(_cfg())
+        assert torch.isfinite(model.training_step((x, y), 0))
+
+        # 2. A non-finite CE. The OLD guard could not catch this at all: its
+        #    fallback was `loss = ce_loss`, so the NaN passed straight through.
+        for bad in (float("nan"), float("inf")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                model = LitClassifier(_cfg())
+            model.train_loss_fn = _ConstLoss(bad)
+            try:
+                model.training_step((x, y), 7)
+            except FloatingPointError as e:
+                assert "batch 7" in str(e) and "ce=" in str(e), str(e)
+            else:
+                raise AssertionError(f"a {bad} ce must raise, not be swallowed")
+
+        # 3. A non-finite aux on a real MoE block — what the fallback hid.
+        with contextlib.redirect_stdout(io.StringIO()):
+            model = LitClassifier(_cfg(model={"ablation": {
+                "use_moe": True, "moe_placement": [[], [], [], [-1]]}}))
+            model.model = _NanAux(model.model)
+        try:
+            model.training_step((x, y), 3)
+        except FloatingPointError as e:
+            assert "batch 3" in str(e) and "aux=nan" in str(e), str(e)
+        else:
+            raise AssertionError("a NaN aux must raise, not be silently dropped")
+    finally:
+        undo()

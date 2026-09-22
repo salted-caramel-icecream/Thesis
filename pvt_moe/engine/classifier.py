@@ -4,25 +4,27 @@ Carries the v9 lineage's load-bearing training semantics:
 
 - **Aux loss handling**: model returns ``(logits, aux)`` with aux already
   averaged over MoE blocks; here it is clamped (spike guard), weighted by
-  ``loss.aux_weight``, added to the CE loss, and dropped for the step if the
-  total goes NaN/Inf.
+  ``loss.aux_weight`` and added to the CE loss. A non-finite total **raises**
+  ``FloatingPointError`` naming both terms. It used to fall back to plain CE
+  for that step, which could only ever hide a non-finite *aux* — a bad CE
+  survived the fallback unchanged — so the one thing it did was mask router
+  instability, silently and untested.
 - **Tutel gate train-forcing**: Tutel gate modules revert themselves to eval
   mode after Lightning's validation pass, silently disabling ``gate_noise``
   (and with it the exploration that keeps experts balanced). ``train()`` is
   overridden and ``on_train_epoch_start`` re-forces every gate. Do not
-  remove. (MegaBlocks needs none of this — plain ``self.training`` gates its
-  loss registry.)
+  remove. (The native backend needs none of this: its gate reads
+  ``self.training`` directly.)
 - **Discriminative LR + weight-decay hygiene**: 4 parameter groups —
   {stages 1-3, stage 4 + head} x {decay, no-decay}, where the no-decay split
   is the timm rule (``p.ndim <= 1``: biases and all norm weights).
-- **Layer-wise LR decay** (``optim.layer_decay`` < 1, the ssl_finetune /
-  downstream recipes): every block's LR is the peak scaled by
+- **Layer-wise LR decay** (``optim.layer_decay`` < 1, the downstream recipe): every block's LR is the peak scaled by
   ``decay ** (top - layer_id)`` compounding from the head down, the scheme of
   BEiT / SimMIM fine-tuning (``microsoft/SimMIM optimizer.py
   get_swin_layer``, mapped onto PVT v2's attribute names in
   ``layer_id_of``). ``1.0`` keeps the 4-group layout above byte-for-byte.
 - **Chain provenance**: a warm start prepends the parent checkpoint's
-  ``chain`` (an SSL run's stage tag) or the HF id to ``cfg["chain"]`` BEFORE
+  ``chain`` (its stage tag) or the HF id to ``cfg["chain"]`` BEFORE
   the hyperparameters are saved, so the checkpoint and results.json name the
   whole path that produced the run.
 
@@ -140,10 +142,10 @@ class LitClassifier(pl.LightningModule):
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"),
             )
             self._extend_chain([f"hf_pretrained@{cfg['model']['pretrained_hf_id']}"])
-        elif mode == "ssl_init":
+        elif mode == "warm_start":
             stats = load_backbone_checkpoint(
                 self.model, cfg["ckpt_path"], skip_head=True, expected_cfg=cfg,
-                check_arch=cfg["model"].get("ssl_init_check_arch", True),
+                check_arch=cfg["model"].get("warm_start_check_arch", True),
                 seed_moe_experts=cfg["model"]["seed_moe_from_dense"],
                 upcycle_init=cfg["model"]["moe"].get("upcycle_init", "none"))
             self._extend_chain(stats.get("parent_chain") or [])
@@ -349,11 +351,21 @@ class LitClassifier(pl.LightningModule):
         if aux is not None:
             aux = torch.clamp(aux, max=self.aux_clamp)  # load-balancing spike guard
             loss = ce_loss + self.aux_weight * aux
-            if torch.isnan(loss) or torch.isinf(loss):
-                loss = ce_loss  # drop aux for this step rather than poison the run
         else:
-            loss = ce_loss
             aux = torch.zeros((), device=logits.device)
+            loss = ce_loss
+
+        # One check after the branch, so a non-finite CE fails too. The guard
+        # this replaced lived INSIDE the aux branch and fell back to ce_loss,
+        # which left a non-finite CE untouched — it could only ever hide a bad
+        # aux, i.e. exactly the router divergence worth stopping for.
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"non-finite training loss at batch {batch_idx}: "
+                f"total={loss.item()} ce={ce_loss.item():.6g} aux={aux.item():.6g} "
+                f"(aux clamped at {self.aux_clamp}, weight {self.aux_weight}). "
+                f"A non-finite aux is the router gate diverging; a non-finite ce "
+                f"is the model or the data.")
 
         self.log("train_loss_step", loss, on_step=True, on_epoch=False)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)

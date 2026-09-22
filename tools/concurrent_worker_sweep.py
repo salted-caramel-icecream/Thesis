@@ -60,7 +60,7 @@ Reading the numbers
   from whatever earlier ones left resident. If you have root, drop caches
   between settings (``--pause-between`` gives you the window):
       sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
-* The PASS arm is CHEAPER per image than the ImageNet arms: SimMIM's transform
+* An unlabelled/crop-only arm is CHEAPER per image than the ImageNet arms: its transform
   is crop + flip + normalize, while the supervised stack adds RandAugment and
   random erasing. Do not read the four per-arm numbers as four samples of one
   quantity — compare each arm against itself across settings.
@@ -107,8 +107,6 @@ def _build_cfg(args, dataset: str, task: str, num_workers: int, seed: int) -> di
         "use_wandb": False,
         "use_tensorboard": False,
     }
-    if task == "ssl":
-        over["ssl"] = {"method": "simmim", "epochs": 100}
     return validate_config(merge_config(default_config(), over))
 
 
