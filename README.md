@@ -40,6 +40,9 @@ for any card — only the torch build and the micro-batch change.
 ```bash
 git clone https://github.com/salted-caramel-icecream/Thesis.git
 cd Thesis
+
+(if you do not have a docker image &/or wish to create a virtual environment to isolate the code:,
+However please make sure the venv uses cuda 13+)
 python -m venv .venv && source .venv/bin/activate     # Linux / WSL2 / macOS
 ```
 
@@ -101,6 +104,7 @@ Linux, MSVC Build Tools on Windows):
 
 ```bash
 pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
+
 python train.py --backend native ...     # or skip it: pure PyTorch, no compiler
 ```
 
@@ -125,12 +129,18 @@ then build the Arrow snapshot once:
 
 ```bash
 # Linux / WSL2 / macOS
+mkdir -p /data
+tmux new -s dataprep
+
+## paste this inside the tmux window
 python download_data.py --out /data/imagenet_arrow
-python train.py --data-dir /data/imagenet_arrow --checkpoint-root /data/runs ...
+
+# Ctrl-B then D to detach
+# to attach again to view download status etc, enter this in the terminal:
+tmux attach -I dataprep
 
 # Windows — D: is only an example; substitute your own drive
 python download_data.py --out D:/data/imagenet_arrow
-python train.py --data-dir D:/data/imagenet_arrow --checkpoint-root D:/runs ...
 ```
 
 The snapshot settles at ~160 GB but needs **~320 GB free to build**, and
@@ -171,6 +181,8 @@ python train.py --recipe scratch --epochs 90
 
 ### 7. Runs that outlive the terminal
 
+## this section is only an example of how the train command looks like. 
+## To run waves from the actual ablation ladder go to §9 directly
 A 90-epoch run is days. Detach it, and keep a log:
 
 ```bash
