@@ -102,9 +102,15 @@ def test_spec_augmentation_stack():
     assert ds["randaugment"] == "rand-m9-mstd0.5-inc1"
     assert ds["repeated_aug"] == 3
     assert ds["random_erasing"] == 0.25
+    # bilinear = the pre-sv2 pipeline. DeiT / PVT v2 train and evaluate with
+    # bicubic; it is opt-in (--set dataset.interpolation=bicubic) until a
+    # dense pilot has run with it.
+    assert ds["interpolation"] == "bilinear"
     loss = _cfg()["loss"]
     assert loss["mixup_alpha"] == 0.8
     assert loss["cutmix_alpha"] == 1.0
+    # DeiT and PVT v2 main.py: --mixup-prob default 1.0 (sv1 ran 0.8).
+    assert loss["mixup_prob"] == 1.0
     assert loss["label_smoothing"] == 0.1
 
 
@@ -113,7 +119,15 @@ def test_spec_moe_block():
     moe, abl = c["model"]["moe"], c["model"]["ablation"]
     assert moe["num_experts"] == 4
     assert moe["top_k"] == 1
-    assert moe["capacity_factor"] == 1.0
+    # sv2 router = Swin-MoE's: yaml CAPACITY_FACTOR 1.25 / IS_GSHARD_LOSS
+    # False, swin_transformer_moe.py gate_noise=1.0 / use_bpr=True. sv1 ran
+    # Tutel's defaults (1.0, gshard, no BPR) with gate_noise 0.5.
+    assert moe["capacity_factor"] == 1.25
+    assert moe["gate_noise"] == 1.0
+    assert moe["batch_prioritized_routing"] is True
+    assert moe["balance_loss"] == "load_importance"
+    assert moe["backend"] == "tutel"      # the sv2 router is Tutel-only
+    assert c["version"] == "sv2"
     assert moe["shared_expert"] is True
     assert c["loss"]["aux_weight"] == 0.01
     # stage 4, last block only == exactly one MoE layer
@@ -326,6 +340,68 @@ def test_train_transform_produces_a_normalized_tensor():
     out = train_tf(img)
     assert out.shape == (3, 224, 224) and out.dtype == torch.float32
     assert val_tf(img).shape == (3, 224, 224)
+
+
+def _resamplers(train_tf, val_tf):
+    """(RandomResizedCrop mode, val Resize mode, {resample of every timm op})."""
+    from timm.data.auto_augment import RandAugment
+    from torchvision import transforms
+
+    rrc = next(t for t in train_tf.transforms
+               if isinstance(t, transforms.RandomResizedCrop))
+    resize = next(t for t in val_tf.transforms if isinstance(t, transforms.Resize))
+    ra = next(t for t in train_tf.transforms if isinstance(t, RandAugment))
+    return rrc.interpolation, resize.interpolation, {op.kwargs["resample"] for op in ra.ops}
+
+
+def test_interpolation_bilinear_is_the_unchanged_pipeline():
+    """The default must build exactly what every sv1 run trained with:
+    torchvision's default (bilinear) crop and resize, and timm drawing
+    bilinear-or-bicubic at random per RandAugment op. Only "bicubic" pins a
+    filter anywhere."""
+    from timm.data.auto_augment import _RANDOM_INTERPOLATION
+    from torchvision import transforms
+
+    from pvt_moe.data.imagenet import build_transforms
+
+    rrc, resize, ops = _resamplers(*build_transforms(_cfg()))
+    assert rrc is transforms.InterpolationMode.BILINEAR
+    assert resize is transforms.InterpolationMode.BILINEAR
+    assert ops == {_RANDOM_INTERPOLATION}, ops
+    # A config from before the key existed (an sv1 checkpoint's saved config)
+    # gets the same transforms, not a KeyError.
+    legacy = _cfg()
+    del legacy["dataset"]["interpolation"]
+    assert _resamplers(*build_transforms(legacy)) == (rrc, resize, ops)
+
+
+def test_interpolation_bicubic_reaches_crop_randaugment_and_val_resize():
+    """DeiT's setting has to land in all three places at once: features for
+    k-NN / the probe are extracted with val_tf, so a filter that differed
+    between train and eval would bias every downstream number."""
+    from PIL import Image
+    from torchvision import transforms
+
+    from pvt_moe.data.imagenet import build_transforms
+
+    rrc, resize, ops = _resamplers(*build_transforms(_cfg(dataset={"interpolation": "bicubic"})))
+    assert rrc is transforms.InterpolationMode.BICUBIC
+    assert resize is transforms.InterpolationMode.BICUBIC
+    assert ops == {Image.BICUBIC}, ops
+    # torchvision fallback (no timm string) honours it too
+    tv = build_transforms(_cfg(dataset={"interpolation": "bicubic", "randaugment": None}))[0]
+    ra = next(t for t in tv.transforms if isinstance(t, transforms.RandAugment))
+    assert ra.interpolation is transforms.InterpolationMode.BICUBIC
+
+
+def test_interpolation_is_validated():
+    for bad in ("nearest", "BICUBIC", 3):
+        try:
+            _cfg(dataset={"interpolation": bad})
+        except ValueError as e:
+            assert "dataset.interpolation" in str(e), e
+        else:
+            raise AssertionError(f"{bad!r} accepted")
 
 
 def test_repeat_aug_sampler_works_without_a_process_group():

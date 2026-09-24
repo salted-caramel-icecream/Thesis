@@ -13,6 +13,12 @@ import torch.nn as nn
 
 from pvt_moe.config import default_config, merge_config, validate_config
 
+#: The native backend implements the gshard loss and token-order routing only;
+#: the sv2 router defaults (Swin-MoE's) are Tutel-only and validate_config
+#: refuses them there. Every native-backend test config merges this.
+NATIVE_MOE = {"backend": "native", "balance_loss": "gshard",
+              "batch_prioritized_routing": False}
+
 
 def tiny_config(**overrides) -> dict:
     """A CPU-sized config (tiny dims, MoE/RoPE off by default)."""
@@ -72,7 +78,10 @@ def install_fake_tutel_backend():
     """Monkeypatch MoEMlp's tutel builder with the fake layer. Returns undo fn."""
     from pvt_moe.models import ffn
 
-    original = ffn.MoEMlp._build_tutel
+    # __dict__, not attribute access: MoEMlp._build_tutel would hand back
+    # the bare function, and restoring THAT turns the staticmethod into a
+    # method that receives `self` as a fifth argument.
+    original = ffn.MoEMlp.__dict__["_build_tutel"]
 
     @staticmethod
     def fake_build(dim, hidden, moe_cfg, act_layer):

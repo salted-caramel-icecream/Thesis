@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python train.py --variant b2 --recipe pretrained\n"
             "  python train.py --recipe pretrained --lr 5e-5\n"
             "  python train.py --recipe scratch --ladder 4 --dry-run\n"
-            "  python train.py --set model.moe.gate_noise=0.0\n"
+            "  python train.py --set model.moe.gate_noise=0.5\n"
         ),
     )
 
@@ -237,7 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "--config configs/example_scratch.yaml")
     g.add_argument("--set", metavar="KEY=VALUE", action="append", default=[],
                    dest="overrides",
-                   help="dotted override, e.g. --set model.moe.gate_noise=0.0 "
+                   help="dotted override, e.g. --set model.moe.gate_noise=0.5 "
                         "(value parsed as JSON, else kept as a string). Repeatable")
     g.add_argument("--overfit-check", type=int, metavar="N", dest="overfit_check",
                    help="BISECT A RUN THAT WILL NOT LEARN. Take ONE real training "
@@ -495,6 +495,8 @@ def describe(cfg: dict) -> str:
             f"  MoE: {moe['num_experts']} experts top-{moe['top_k']} "
             f"({moe['backend']}) | shared {moe['shared_expert']} "
             f"| cap {moe['capacity_factor']} | noise {moe['gate_noise']} "
+            f"| bpr {'on' if moe.get('batch_prioritized_routing') else 'off'} "
+            f"| loss {moe.get('balance_loss') or 'gshard'} "
             f"| placement {abl['moe_placement']}"
         )
         if cfg["mode"] in ("hf_pretrained", "warm_start"):
@@ -505,7 +507,9 @@ def describe(cfg: dict) -> str:
     else:
         lines.append("  MoE: off (dense arm)")
     aug = (
-           f"{cfg['dataset']['randaugment']} x{cfg['dataset']['repeated_aug']} repeats")
+           f"{cfg['dataset']['randaugment']} x{cfg['dataset']['repeated_aug']} repeats "
+           f"| interp {cfg['dataset'].get('interpolation') or 'bilinear'} "
+           f"| mixup p={cfg['loss']['mixup_prob']}")
     lines.append(f"  RoPE: {abl['rope_placement'] if abl['use_rope'] else 'off'}"
                  f"{' ' + abl['rope_mode'] + ' theta ' + str(abl['rope_theta']) if abl['use_rope'] else ''} "
                  f"| aug {aug}")
@@ -638,8 +642,10 @@ def check_environment(variant: str = "b1") -> int:
         state = "OK" if importlib.util.find_spec(mod) is not None else "absent"
         print(f"  {mod:<12} {state:<7} {why}")
     if importlib.util.find_spec("tutel") is None:
-        print("                 tutel absent -> pass --backend native, or build it "
-              "(needs a compiler; see README)")
+        print("                 tutel absent -> pass --backend native with "
+              "--set model.moe.balance_loss=gshard --set "
+              "model.moe.batch_prioritized_routing=false (the sv2 router is "
+              "Tutel-only), or build it (needs a compiler; see README)")
 
     import os
 

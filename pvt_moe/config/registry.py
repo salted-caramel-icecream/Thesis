@@ -98,6 +98,27 @@ VALID_ROPE_MODES = ("mixed", "axial")
 ROPE_THETA_DEFAULT = {"mixed": 10.0,   # rope-vit RoPE-Mixed models
                       "axial": 50.0}   # this repo's axial choice (7x7 stage-4 grid)
 
+#: Resampling filter for the train crop, the RandAugment ops and the val
+#: resize (``dataset.interpolation``). "bilinear" is this repo's pipeline as
+#: it has always been (torchvision's default; timm RandAugment left to pick
+#: bilinear or bicubic at random per op). "bicubic" is what DeiT and PVT v2
+#: train AND evaluate with (``--train-interpolation bicubic``; DeiT
+#: ``datasets.py`` eval ``Resize(..., interpolation=3)``) and is applied to
+#: all three places. Not the default until a dense pilot has run with it.
+VALID_INTERPOLATIONS = ("bilinear", "bicubic")
+
+#: Router load-balancing loss (``model.moe.balance_loss``), Tutel's two:
+#:   "gshard"          - ``E * sum_i f_i * p_i`` (Tutel's default,
+#:                       ``is_gshard_loss=True``); reads ~1.0 at balance.
+#:   "load_importance" - Shazeer et al.'s importance + load CV^2, averaged
+#:                       (``tutel/impls/losses.py::load_importance_loss``,
+#:                       ``is_gshard_loss=False``); reads ~0 at balance. What
+#:                       Swin-MoE trains with (yaml ``IS_GSHARD_LOSS: False``).
+#:                       Tutel asserts ``gate_noise > 0`` for it: the load
+#:                       term is a normal CDF whose sigma is gate_noise / E.
+#: The native backend implements "gshard" only.
+VALID_BALANCE_LOSSES = ("gshard", "load_importance")
+
 #: Sanctioned epoch budgets for the from-scratch ablation ladder.
 #: 90 = ablation runs, 300 = final run (PVT v2's own recipe); 150 is the
 #: middle budget. Other values are allowed but are off-ladder.

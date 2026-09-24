@@ -50,9 +50,17 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 _LABEL_KEYS = ("label", "labels", "cls", "fine_label")
 
 
+def _interpolation(ds: dict) -> str:
+    """``dataset.interpolation`` with the pre-sv2 behaviour for a config that
+    predates the key (an sv1 checkpoint's saved config is evaluated as is,
+    never merged onto today's defaults — pvt_moe.eval.runner)."""
+    return ds.get("interpolation") or "bilinear"
+
+
 def _build_randaugment(ds: dict):
     """RandAugment op: timm's config string when given, else torchvision."""
     spec = ds.get("randaugment")
+    interp = _interpolation(ds)
     if isinstance(spec, str):
         from timm.data import rand_augment_transform  # lazy
 
@@ -61,21 +69,43 @@ def _build_randaugment(ds: dict):
             "translate_const": int(ds["img_size"] * 0.45),
             "img_mean": tuple(round(255 * c) for c in IMAGENET_MEAN),
         }
+        # "bilinear" passes NO interpolation on purpose: timm then draws
+        # bilinear or bicubic at random per op, which is what every run so
+        # far trained with. "bicubic" pins every op, as timm's own factory
+        # does for DeiT (`aa_params['interpolation'] = str_to_pil_interp(..)`
+        # -- a PIL constant, not a string).
+        if interp == "bicubic":
+            from PIL import Image
+
+            hparams["interpolation"] = Image.BICUBIC
         return rand_augment_transform(spec, hparams)
+    tv_interp = transforms.InterpolationMode.BICUBIC if interp == "bicubic" else None
     if isinstance(spec, (list, tuple)):  # legacy [ops, magnitude] form
-        return transforms.RandAugment(*spec)
-    return transforms.RandAugment(
-        ds.get("randaugment_ops", 2), ds.get("randaugment_magnitude", 9)
-    )
+        return (transforms.RandAugment(*spec, interpolation=tv_interp)
+                if tv_interp else transforms.RandAugment(*spec))
+    ops, mag = ds.get("randaugment_ops", 2), ds.get("randaugment_magnitude", 9)
+    return (transforms.RandAugment(ops, mag, interpolation=tv_interp)
+            if tv_interp else transforms.RandAugment(ops, mag))
 
 
 def build_transforms(cfg: dict):
-    """(train, val) transforms — the DeiT-1 stack PVT v2 uses."""
+    """(train, val) transforms — the DeiT-1 stack PVT v2 uses.
+
+    ``dataset.interpolation`` selects the resampling filter of the train crop,
+    the RandAugment ops and the val resize together, so features extracted for
+    k-NN / the probe see the same filter the run trained with. "bilinear"
+    builds the exact pre-sv2 transforms (torchvision defaults, nothing passed).
+    """
     ds = cfg["dataset"]
     img_size = ds["img_size"]
+    interp = _interpolation(ds)
+    # torchvision: pass nothing for bilinear so the objects are built exactly
+    # as before; only bicubic names its filter.
+    tv = ({"interpolation": transforms.InterpolationMode.BICUBIC}
+          if interp == "bicubic" else {})
     train_tf = transforms.Compose(
         [
-            transforms.RandomResizedCrop(img_size),
+            transforms.RandomResizedCrop(img_size, **tv),
             transforms.RandomHorizontalFlip(),
             # RandAugment runs on the PIL image, before ToTensor.
             _build_randaugment(ds),
@@ -86,7 +116,7 @@ def build_transforms(cfg: dict):
     )
     val_tf = transforms.Compose(
         [
-            transforms.Resize(int(img_size / ds["crop_pct"])),
+            transforms.Resize(int(img_size / ds["crop_pct"]), **tv),
             transforms.CenterCrop(img_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),

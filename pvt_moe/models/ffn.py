@@ -186,13 +186,35 @@ class MoEMlp(nn.Module):
             # Single-node training: exclude expert params from allreduce.
             scan_expert_func=lambda name, param: setattr(param, "skip_allreduce", True),
             result_func=lambda output: (output, output.l_aux),
+            # Router policy (sv2 = Swin-MoE's). moe_layer KEYWORDS, not
+            # gate_type keys: tutel/impls/moe_layer.py `def __init__(...,
+            # batch_prioritized_routing=False, normalize_gate=True,
+            # is_gshard_loss=True, ...)`, and it raises "Unrecognized
+            # argument" on any other name, so a wrong one fails at build.
+            # Getter defaults = Tutel's own, i.e. what an sv1 config (no key)
+            # trained with.
+            batch_prioritized_routing=bool(moe_cfg.get("batch_prioritized_routing") or False),
+            is_gshard_loss=(moe_cfg.get("balance_loss") or "gshard") == "gshard",
         )
 
     @staticmethod
     def _build_native(dim: int, hidden: int, moe_cfg: dict, act_layer):
-        """Pure-PyTorch fallback — same contract, no Tutel, no NCCL."""
+        """Pure-PyTorch fallback — same contract, no Tutel, no NCCL.
+
+        Implements the gshard loss and token-order routing only; the sv2
+        router defaults (load_importance, batch-prioritized routing) are
+        refused here as well as in validate_config, for a hand-built moe_cfg.
+        """
+        from pvt_moe.config.validate import NATIVE_ROUTER_FIX
         from pvt_moe.models.moe_native import NativeMoEFFN  # lazy, symmetry
 
+        loss = moe_cfg.get("balance_loss") or "gshard"
+        bpr = bool(moe_cfg.get("batch_prioritized_routing") or False)
+        if loss != "gshard" or bpr:
+            raise ValueError(
+                f"the native MoE backend implements the gshard loss and token-order "
+                f"routing only, got balance_loss={loss!r}, batch_prioritized_routing="
+                f"{bpr}. Pass {NATIVE_ROUTER_FIX}, or use backend 'tutel'.")
         return NativeMoEFFN(
             model_dim=dim,
             hidden_size_per_expert=hidden,

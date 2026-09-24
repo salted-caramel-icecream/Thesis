@@ -12,12 +12,13 @@ from pvt_moe.config import (
     resolve_placement,
     validate_config,
 )
+from helpers import NATIVE_MOE
 
 
 def test_default_config_validates():
     cfg = validate_config(default_config())
     assert cfg["dataset"]["num_classes"] == 1000
-    assert cfg["run_name"] == "sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90"
+    assert cfg["run_name"] == "sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90"
     assert cfg["model"]["ablation"]["moe_placement"] == [[], [], [], [1]]
 
 
@@ -60,11 +61,11 @@ def test_run_tag_variants():
     cfg = merge_config(default_config(), {
         "model": {"ablation": {"use_moe": False, "use_rope": False}},
     })
-    assert build_run_tag(validate_config(cfg)) == "sv1_b1_in1k_r224_dense_norope_scratch90"
+    assert build_run_tag(validate_config(cfg)) == "sv2_b1_in1k_r224_dense_norope_scratch90"
 
     cfg2 = merge_config(default_config(), {
         "model": {"ablation": {"moe_placement": [[], [], [1], [0, 1]]},
-                  "moe": {"backend": "native"}},
+                  "moe": dict(NATIVE_MOE)},
     })
     tag = build_run_tag(validate_config(cfg2))
     assert "moe-s3b1+s4" in tag and "-nat" in tag, tag

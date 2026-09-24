@@ -41,9 +41,9 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 
 ## Run names and checkpoints
 
-`sv1_{variant}_{in1k|in22k|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{scratch90|ft100|dstr50|eval}[_from-{dense|moe}-{parent budget}]`,
-e.g. `sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`,
-`sv1_b1_eurosat_r224_moe-s4b1-e4k1+sh_rope-s4b1_dstr50_from-dense-ft100`.
+`sv2_{variant}_{in1k|in22k|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{scratch90|ft100|dstr50|eval}[_from-{dense|moe}-{parent budget}]`,
+e.g. `sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`,
+`sv2_b1_eurosat_r224_moe-s4b1-e4k1+sh_rope-s4b1_dstr50_from-dense-ft100`.
 `r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived
 later than the first runs, so an old run directory may have no `_r224_`.
 `--resume-from` keeps the derived name, so resume such a run with
@@ -51,8 +51,12 @@ later than the first runs, so an old run directory may have no `_r224_`.
 (`--run-suffix v2`) appends a repeat marker to the DERIVED name so one arm
 can be rerun without sharing a checkpoint directory or a W&B name; an
 explicit `run_name` replaces the derived name entirely instead.
-The `sv1` prefix (`config/defaults.py` `"version"`) is bumped on every architecture
-change so old and new runs never share a W&B name or a checkpoint directory.
+The version prefix (`config/defaults.py` `"version"`) is bumped on every architecture
+or training-default change (`sv2` = Swin-MoE's router — capacity 1.25, gate_noise 1.0,
+batch-prioritized routing, load+importance loss, Tutel only — and mixup_prob 1.0; an
+`sv1` run resumes with `--run-name <its sv1 name>` plus the sv1 values passed explicitly,
+since results.json from sv1 does not record them for the resume guard), so old
+and new runs never share a W&B name or a checkpoint directory.
 Two configs that differ in anything that changes the model must give
 different names (tests enforce it); a `warm_start` run is also named after its
 parent (`config.parent_tag`, read from the parent's `results.json`, never by

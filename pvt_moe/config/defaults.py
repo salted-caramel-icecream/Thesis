@@ -15,11 +15,16 @@ from pvt_moe.config.registry import DATASETS  # noqa: F401  (referenced in comme
 # ---------------------------------------------------------------------------
 
 _DEFAULT: dict = {
-    # Run-name prefix. "sv1" = the September 2026 edit of the architecture
-    # (variants, MHA-by-default, depth-independent placement); the earlier
-    # code arch was "v10". Bump it when the architecture changes so old and
-    # new runs never share a W&B name or checkpoint directory.
-    "version": "sv1",
+    # Run-name prefix. Bump it when the architecture or a training default
+    # changes so old and new runs never share a W&B name or checkpoint
+    # directory.
+    #   "v10" - the earlier code arch
+    #   "sv1" - the September 2026 edit (variants, MHA-by-default,
+    #           depth-independent placement); Tutel's default router
+    #   "sv2" - Swin-MoE's router (capacity 1.25, gate_noise 1.0,
+    #           batch-prioritized routing, load+importance loss) and DeiT's
+    #           mixup_prob 1.0. The architecture is unchanged.
+    "version": "sv2",
     # Which recipe fills the fields left as None below (see RECIPES).
     #   "scratch"    - full from-scratch training, PVT v2 recipe
     #   "pretrained" - warm start from the variant's OpenGVLab/pvt_v2_b*
@@ -34,7 +39,7 @@ _DEFAULT: dict = {
     # Derived by validate_config() from the ablation flags when left as None.
     "run_name": None,
     # Appended to the DERIVED run name, e.g. run_suffix "v2" ->
-    # sv1_b2_in1k_r224_dense_norope_scratch90_v2. For repeats of one arm
+    # sv2_b2_in1k_r224_dense_norope_scratch90_v2. For repeats of one arm
     # (a rerun, another seed, a second attempt) that must not share a
     # checkpoint directory or a W&B name with the first. Ignored when
     # run_name is set explicitly, which replaces the derived name entirely.
@@ -126,6 +131,12 @@ _DEFAULT: dict = {
         "repeated_aug": 3,
         "random_erasing": 0.25,
         "crop_pct": 0.875,                # val resize = img_size / crop_pct
+        # Resampling filter for the train crop, the RandAugment ops and the
+        # val resize (VALID_INTERPOLATIONS). "bilinear" = the pipeline every
+        # run so far used. DeiT / PVT v2 use "bicubic" for both training and
+        # evaluation; it is available as --set dataset.interpolation=bicubic
+        # and becomes the default only once a dense pilot has run with it.
+        "interpolation": "bilinear",
         # Low-shot fine-tuning: a JSON index list written by
         # `python -m pvt_moe.eval.lowshot` (seeded, class-balanced 1% / 10% of
         # the train split). None = the whole train split. Never applied to
@@ -215,8 +226,27 @@ _DEFAULT: dict = {
             # Tutel: SwinV2-B scores 85.5 at both k=1 and k=2, with k=2 costing
             # +25% activated params and ~17% train speed.
             "top_k": 1,
-            "capacity_factor": 1.0,       # tutel only
-            "gate_noise": 0.5,            # tutel only
+            # --- Router: Swin-MoE's settings (sv2) ---------------------------
+            # Sources: Swin-MoE yaml swin_moe_small_patch4_window12_192_32expert
+            # _32gpu_22k (CAPACITY_FACTOR 1.25, IS_GSHARD_LOSS False) and
+            # models/swin_transformer_moe.py (gate_noise=1.0, use_bpr=True,
+            # passed as moe_layer(batch_prioritized_routing=...)). sv1 ran
+            # Tutel's defaults instead: capacity 1.0, gshard loss, no BPR, and
+            # gate_noise 0.5 (the v9 lineage's value).
+            "capacity_factor": 1.25,
+            # Gaussian noise on the gate logits while training, std
+            # gate_noise / num_experts (0.25 at E=4). Must be > 0 under
+            # balance_loss "load_importance".
+            "gate_noise": 1.0,
+            # Batch-prioritized routing: when an expert is over capacity, keep
+            # the tokens with the HIGHEST gate score rather than the first in
+            # token order. Changes which tokens drop, never how many. Tutel
+            # only.
+            "batch_prioritized_routing": True,
+            # "gshard" | "load_importance" (VALID_BALANCE_LOSSES). Tutel only
+            # for "load_importance". Under it train_aux reads ~0 at balance
+            # (a CV^2), not ~1.0 as under gshard.
+            "balance_loss": "load_importance",
 
             # --- Shared expert (DeepSeekMoE / Qwen-MoE style) --------------
             # An always-on dense FFN added to the routed experts' output for
@@ -312,7 +342,10 @@ _DEFAULT: dict = {
         "label_smoothing": 0.1,
         "mixup_alpha": 0.8,
         "cutmix_alpha": 1.0,
-        "mixup_prob": 0.8,
+        # Probability of applying mixup/cutmix to a batch. 1.0 is DeiT's and
+        # PVT v2's value (both main.py: `--mixup-prob`, default 1.0); the 0.8
+        # every sv1 run trained with came from the v9 lineage, unsourced.
+        "mixup_prob": 1.0,
         "mixup_switch_prob": 0.5,
     },
 }

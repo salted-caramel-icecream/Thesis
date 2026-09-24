@@ -125,8 +125,15 @@ def run_identity(cfg: dict) -> dict:
                  "backend": moe["backend"], "upcycle_init": moe.get("upcycle_init"),
                  "capacity_factor": moe.get("capacity_factor"),
                  "gate_noise": moe.get("gate_noise"),
+                 # None = a config from before the key (sv1): gshard, no BPR.
+                 "batch_prioritized_routing": moe.get("batch_prioritized_routing"),
+                 "balance_loss": moe.get("balance_loss"),
                  "aux_weight": (cfg.get("loss") or {}).get("aux_weight")}
                 if abl["use_moe"] and any(abl["moe_placement"]) else None),
+        # Neither leaves a trace in the weights or the name; recorded so a
+        # resume cannot switch them halfway (RESUME_IDENTITY_FIELDS).
+        "interpolation": cfg["dataset"].get("interpolation"),
+        "mixup_prob": (cfg.get("loss") or {}).get("mixup_prob"),
         "git_commit": git_commit(), "config_sha1": config_hash(cfg),
     }
     # The two run-name fragments a CHILD run reads back through
@@ -212,7 +219,9 @@ class ResultsWriter(pl.Callback):
         moe_cfg = cfg["model"]["moe"]
         block = {"aux_weight": cfg["loss"]["aux_weight"],
                  "capacity_factor": moe_cfg.get("capacity_factor"),
-                 "gate_noise": moe_cfg.get("gate_noise")}
+                 "gate_noise": moe_cfg.get("gate_noise"),
+                 "batch_prioritized_routing": moe_cfg.get("batch_prioritized_routing"),
+                 "balance_loss": moe_cfg.get("balance_loss")}
         # Per-epoch training-time routing stats (RoutingMonitor), and the
         # warning that goes with the aux number so a reader of this file
         # cannot mistake a pinned 1.0 for a healthy router.
@@ -365,6 +374,14 @@ def read_results(dirpath: str) -> dict | None:
 #: run being resumed; a side that is absent or None is skipped, which is what
 #: makes the MoE-only entries no-ops elsewhere.
 #:
+#: KNOWN GAP: a record written before a field existed (every sv1 run for the
+#: router keys, mixup_prob and interpolation) is skipped too, so resuming an
+#: sv1 run under sv2 defaults switches those silently -- pass the sv1 values
+#: explicitly (--set loss.mixup_prob=0.8 --set dataset.interpolation=bilinear,
+#: and for MoE --set model.moe.balance_loss=gshard
+#: --set model.moe.batch_prioritized_routing=false). capacity_factor and
+#: gate_noise WERE recorded, so those two are refused as before.
+#:
 #: Deliberately NOT here: optim.layer_decay. Changing it between 1.0 and a
 #: decay changes the optimizer's param-group COUNT, which makes
 #: ``load_state_dict`` raise on its own; changing it between two decays is a
@@ -376,7 +393,11 @@ RESUME_IDENTITY_FIELDS = (
     ("effective_batch_size", "effective_batch_size"),
     ("model.moe.capacity_factor", "moe.capacity_factor"),
     ("model.moe.gate_noise", "moe.gate_noise"),
+    ("model.moe.batch_prioritized_routing", "moe.batch_prioritized_routing"),
+    ("model.moe.balance_loss", "moe.balance_loss"),
     ("loss.aux_weight", "moe.aux_weight"),
+    ("loss.mixup_prob", "mixup_prob"),
+    ("dataset.interpolation", "interpolation"),
     ("optim.grad_clip", "optim.grad_clip"),
 )
 
@@ -550,7 +571,9 @@ def render_markdown(rec: dict) -> str:
         lines += ["", "## MoE", "", f"aux weight {moe.get('aux_weight')} | train_aux "
                   f"{_fmt(acc.get('train_aux') if 'train_aux' in acc else (rec['history'][-1].get('train_aux') if rec.get('history') else None), nd=4)}"]
         lines[-1] += (f" | capacity_factor {moe.get('capacity_factor')} "
-                      f"| gate_noise {moe.get('gate_noise')}")
+                      f"| gate_noise {moe.get('gate_noise')} "
+                      f"| bpr {moe.get('batch_prioritized_routing')} "
+                      f"| balance_loss {moe.get('balance_loss') or 'gshard'}")
         routing = moe.get("routing") or {}
         if routing:
             lines += ["", "Training-token routing (RoutingMonitor) — the metrics `train_aux` "

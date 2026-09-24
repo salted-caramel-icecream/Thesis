@@ -105,7 +105,7 @@ Linux, MSVC Build Tools on Windows):
 ```bash
 pip install -v -U --no-build-isolation git+https://github.com/microsoft/tutel@main
 
-python train.py --backend native ...     # or skip it: pure PyTorch, no compiler
+python train.py --backend native --set model.moe.balance_loss=gshard --set model.moe.batch_prioritized_routing=false ...   # or skip it: pure PyTorch, no compiler; gshard router only
 ```
 
 `docs/GUIDE.md` §5b covers what the native fallback does and does not change.
@@ -339,7 +339,7 @@ it is the default arm and would share row 4's checkpoint directory.
 python train.py --recipe scratch --epochs 300          # final run
 python train.py --recipe pretrained --lr 5e-5 --warmup-epochs 5
 python train.py --no-moe --no-dwconv --rope            # a dense ablation arm
-python train.py --set model.moe.gate_noise=0.0         # anything without a flag
+python train.py --set model.moe.gate_noise=0.5         # anything without a flag
 python train.py --recipe scratch --ladder 4 --dry-run  # resolve and print, no training
 
 python train.py --recipe scratch --ladder 4            # one ablation arm
@@ -347,7 +347,7 @@ python train.py --config configs/my_paths.local.yaml --recipe scratch --ladder 1
 python train.py --data-dir /mnt/imagenet_arrow --checkpoint-root /mnt/runs
 python train.py --data-dir D:/imagenet_arrow --checkpoint-root D:/runs    # same on Windows (D: is an example)
 python train.py --variant b2 --recipe pretrained       # PVT v2 B2 (25 M, 82.0% official)
-python train.py --backend native                       # no-Tutel fallback
+python train.py --backend native --set model.moe.balance_loss=gshard --set model.moe.batch_prioritized_routing=false   # no-Tutel fallback (gshard router)
 python train.py --grad-checkpointing "[1]" --batch-size 256    # trade speed for VRAM
 python train.py --no-moe-dwconv --rope                 # position-encoding arm
 python train.py --rope-mode axial                      # fixed-frequency (axial) RoPE control, run tag -ax

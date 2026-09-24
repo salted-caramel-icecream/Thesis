@@ -116,7 +116,7 @@ def parent_tag(ckpt_path: str | None) -> str | None:
 
 
 def build_run_tag(cfg: dict) -> str:
-    """The run name: ``sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90``."""
+    """The run name: ``sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90``."""
     return run_name_parts(cfg)["name"]
 
 def run_name_parts(cfg: dict) -> dict:

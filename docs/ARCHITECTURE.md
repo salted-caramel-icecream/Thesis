@@ -283,7 +283,7 @@ T_max when a resumed run extends `epochs`.
 ## Training recipe (defaults = the known-good v9 recipe)
 
 AdamW (0.9, 0.999), wd 5e-2, lr 1e-4 (+10× stage 4), warmup 7, bf16-mixed,
-grad-clip 5.0, batch 1024, Mixup 0.8 / CutMix 1.0 (p=0.8) + label smoothing
+grad-clip 5.0, batch 1024, Mixup 0.8 / CutMix 1.0 (p=1.0 since sv2; 0.8 before) + label smoothing
 0.1 + SoftTargetCE, RandAugment(2,9), RandomErasing 0.25, drop-path 0.2.
 
 `train_acc_mixed` is measured against argmax of mixup'd soft targets — it

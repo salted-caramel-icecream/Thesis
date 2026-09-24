@@ -20,7 +20,7 @@ import tempfile
 import torch
 import torch.nn as nn
 
-from helpers import install_fake_tutel_backend, tiny_config
+from helpers import NATIVE_MOE, install_fake_tutel_backend, tiny_config
 from pvt_moe.engine.callbacks import RoutingMonitor, _routing_monitor_wanted, build_trainer
 from pvt_moe.engine.classifier import LitClassifier
 from pvt_moe.engine.results import AUX_NOTE, read_results
@@ -250,7 +250,9 @@ def test_the_gate_stays_fp32_under_autocast_so_the_aux_is_not_quantised():
 def _moe_cfg(**over):
     base = {"model": {"pretrained_hf_id": None,
                       "ablation": {"use_moe": True, "moe_placement": [[], [], [], [-1]]},
-                      "moe": {"backend": "native", "gate_noise": 0.0}},
+                      # capacity pinned: the monitor reads it from the
+                      # config, the layers under test are built at 1.0.
+                      "moe": {**NATIVE_MOE, "gate_noise": 0.0, "capacity_factor": 1.0}},
             "batch_size": 4, "effective_batch_size": 4, "num_workers": 0,
             "use_wandb": False, "use_tensorboard": False, "epochs": 1,
             "optim": {"warmup_epochs": 0}, "dataset": {"img_size": 64, "repeated_aug": 1}}

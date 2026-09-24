@@ -221,7 +221,8 @@ re-downloading 160 GB.
 
 Three labelled sets for the last stage of the chain, all far below 224 px
 natively. `dataset.img_size` (224 by default) **upsamples them in the
-transforms** (`RandomResizedCrop` / `Resize` on the PIL image), so accuracy
+transforms** (`RandomResizedCrop` / `Resize` on the PIL image, with the
+filter `dataset.interpolation` names — bilinear by default), so accuracy
 on these partly measures interpolation of the upsampled input — say so when
 reporting them. The loader converts grayscale to RGB; the fine-tune budget is
 **fixed per dataset** in `config.DATASETS` so an open-ended run cannot overrun
@@ -316,7 +317,7 @@ and the result. Self-supervised pretraining is not here: it lives on the
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |
 | MoE backend | `--backend tutel\|native` | `moe.backend` |
 | dataset | `--dataset imagenet-1k\|imagenet-22k` | `dataset.name` |
-| anything else | `--set model.moe.gate_noise=0.0` | edit `overrides` directly |
+| anything else | `--set model.moe.gate_noise=0.5` | edit `overrides` directly |
 
 Before the first upcycled run on a new box: `python tools/verify_upcycling.py
 --variant b1 --recipe pretrained --hf` checks, on the real MoE backend, that
@@ -526,14 +527,21 @@ Tutel compiles a CUDA extension and needs a compiler (build-essential on
 Linux, MSVC Build Tools on Windows). When that is not available:
 
 ```bash
-python train.py --backend native      # pure PyTorch, no extension, no NCCL
+python train.py --backend native --set model.moe.balance_loss=gshard --set model.moe.batch_prioritized_routing=false
 ```
 
+Pure PyTorch, no extension, no NCCL — and the GShard router only. The sv2
+default router is Swin-MoE's (batch-prioritized routing, load+importance
+loss), which only Tutel implements, so the native backend needs those two
+`--set`s and `validate_config` refuses it without them.
+
 Architecturally equivalent at `top_k: 1`, and it shares Tutel's parameter
-layout — so a run started on one backend **resumes on the other**:
+layout — so a run started on one backend with the GShard router **resumes on
+the other** (an sv2-default Tutel run does not: the resume guard refuses the
+router change):
 
 ```bash
-python train.py --backend native --resume-from .../milestone-epoch090.ckpt
+python train.py --backend native --set model.moe.balance_loss=gshard --set model.moe.batch_prioritized_routing=false --resume-from .../milestone-epoch090.ckpt
 ```
 
 Run names carry `-nat`, so the two never share a checkpoint directory. Tutel
