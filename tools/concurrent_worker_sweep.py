@@ -18,9 +18,10 @@ actually run.
 What it does, for each ``--workers`` value:
 
   1. optionally times ONE arm alone (``--solo-baseline``), so you can compare;
-  2. starts four arm processes — by default three on ImageNet-1k with the
-     supervised transform and one on PASS with the SSL transform, each pinned
-     to its own GPU through ``CUDA_VISIBLE_DEVICES``;
+  2. starts four arm processes — by default four on ImageNet-1k with the
+     supervised transform (Wave 1), each pinned to its own GPU through
+     ``CUDA_VISIBLE_DEVICES``. PASS / SSL arms (``--arms 3:1``) need the
+     ``ssl`` git branch: ``main`` is supervised only and refuses them;
   3. each arm builds the REAL loader (``pvt_moe.data.build_dataloaders``), so
      the augmentation stack, the repeated-augmentation sampler, pin_memory,
      persistent_workers and prefetch_factor are the ones training uses;
@@ -45,8 +46,8 @@ Examples
 
     # the real sweep
     python concurrent_worker_sweep.py \
-        --in1k-dir /data/imagenet_arrow --pass-dir /data/pass_arrow \
-        --workers 8,16,24,32,48 --seconds 60 --batch-size 256 \
+        --in1k-dir /data/imagenet_arrow \
+        --workers 8,16,24,32,48 --seconds 60 --batch-size 128 \
         --out /data/runs/worker_sweep.json
 
     # same, with each arm confined to its own 48-core block
@@ -81,23 +82,21 @@ import time
 
 # --- arm specs -------------------------------------------------------------
 
-#: (label, dataset name, task). Three supervised ImageNet arms + one SSL PASS
-#: arm — Wave 1's steady state. --arms overrides the mix.
-DEFAULT_ARMS = [
-    ("in1k-sup-0", "imagenet-1k", "supervised"),
-    ("in1k-sup-1", "imagenet-1k", "supervised"),
-    ("in1k-sup-2", "imagenet-1k", "supervised"),
-    ("pass-ssl-3", "pass", "ssl"),
-]
+#: What an SSL / PASS arm needs and main does not have (docs/SSL_BRANCH.md).
+SSL_BRANCH_ONLY = ("PASS / SSL arms need the 'ssl' git branch (docs/SSL_BRANCH.md): "
+                   "main is supervised only. Use --arms N:0 here.")
 
 
 def _build_cfg(args, dataset: str, task: str, num_workers: int, seed: int) -> dict:
     """The resolved config for one arm, with the repo's own defaults."""
     from pvt_moe.config import default_config, merge_config, validate_config
 
-    data_dir = args.pass_dir if dataset == "pass" else args.in1k_dir
+    # main has no `task` key and no PASS dataset: the config validator rejects
+    # both, so every arm died at config time before touching the data.
+    if dataset == "pass" or task != "supervised":
+        raise ValueError(SSL_BRANCH_ONLY)
+    data_dir = args.in1k_dir
     over = {
-        "task": task,
         "dataset": {"name": dataset, "arrow_dirs": {dataset: data_dir},
                     "img_size": args.img_size},
         "model": {"variant": args.variant},
@@ -313,8 +312,8 @@ def main(argv=None) -> int:
     ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--variant", default="b2")
     ap.add_argument("--gpus", default="0,1,2,3", help="one GPU per arm, in order")
-    ap.add_argument("--arms", default="3:1", metavar="N_IN1K:N_PASS",
-                    help="arm mix, e.g. 3:1 (default) or 4:0")
+    ap.add_argument("--arms", default="4:0", metavar="N_IN1K:N_PASS",
+                    help="arm mix (default 4:0, Wave 1). N_PASS > 0 needs the ssl branch")
     ap.add_argument("--solo-baseline", action=argparse.BooleanOptionalAction, default=True,
                     help="also time ONE arm alone at each setting, for the contention ratio")
     ap.add_argument("--affinity", action="store_true",
@@ -335,6 +334,8 @@ def main(argv=None) -> int:
     worker_values = [int(w) for w in args.workers.split(",") if w.strip()]
     gpus = [int(g) for g in args.gpus.split(",") if g.strip()] or [None]
     n_in1k, n_pass = (int(x) for x in args.arms.split(":"))
+    if n_pass and not args.self_test:
+        ap.error(SSL_BRANCH_ONLY)
 
     arms = []
     specs = ([("in1k-sup", "imagenet-1k", "supervised")] * n_in1k
@@ -380,6 +381,11 @@ def main(argv=None) -> int:
               f"{aggregate:>14,.0f}" +
               (f"{solo:>10,.0f}" if solo else f"{'-':>10}") +
               (f"{ratio:>8.2f}" if ratio else f"{'-':>8}"))
+        # Say WHY, once per setting: a bare FAILED row hides a config error
+        # that no amount of re-running will change.
+        failed = [r for r in results if not r.get("ok")]
+        if failed:
+            print(f"{'':>8}  {len(failed)} arm(s) failed: {failed[0].get('error')}")
 
         record["settings"].append({
             "num_workers": w, "aggregate_images_per_second": aggregate,
