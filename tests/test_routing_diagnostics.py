@@ -412,6 +412,64 @@ def test_the_realised_count_is_read_from_tutels_dispatch_count_when_present():
     assert "train_drop_rate_realised" not in logged2
 
 
+def _bpr_style_dispatch_count(scores):
+    """What Tutel stores as dispatch_count under batch-prioritized routing,
+    verbatim from tutel/impls/fast_dispatch.py (extract_critical with
+    compute_sorted_location, top_k 1): ``locations1[-1] + 1`` -- the LAST
+    token's rank row, not the per-expert counts."""
+    idx = scores.argmax(dim=1)
+    mask = torch.zeros_like(scores, dtype=torch.long).scatter_(1, idx[:, None], 1)
+    imp = -1 * scores.max(dim=1)[0]
+    sorted_x = mask[imp.argsort(dim=0)]
+    sorted_cumsum = (torch.cumsum(sorted_x, dim=0) - 1) * sorted_x
+    loc1 = sorted_cumsum[imp.argsort(dim=0).argsort(dim=0)]
+    return loc1[-1] + 1, mask.sum(0)
+
+
+def test_under_bpr_tutels_dispatch_count_is_never_read_as_counts():
+    """The pilots logged 'drops 1.4% (realised 9.4%)' in every run and epoch:
+    under BPR Tutel's dispatch_count is the last token's rank row (e.g.
+    [1, 1, 1, 534] for true counts ~1560 each), and reading it as counts
+    invents ~9% drops. With BPR on, the monitor must ignore it and estimate the
+    realised figure from a noise draw -- which, at gate_noise 0, is exactly
+    the policy figure."""
+    from pvt_moe.utils.diagnostics import capacity_of
+
+    torch.manual_seed(0)
+    scores = torch.softmax(torch.randn(6272, E) * 0.5, dim=1)
+    bogus, true_counts = _bpr_style_dispatch_count(scores)
+    assert int(bogus.sum()) < 1000 < int(true_counts.min()), (bogus, true_counts)
+    cap = capacity_of(int(bogus.sum()), E, 1.25, 1)
+    assert float((bogus - cap).clamp(min=0).sum()) / 6272 > 0.02   # what was reported
+
+    undo = install_fake_tutel_backend()
+    try:
+        moe = MoEMlp(DIM, 8, moe_cfg={"backend": "tutel", "num_experts": E, "top_k": 1,
+                                      "capacity_factor": 1.0, "gate_noise": 0.0,
+                                      "shared_expert": True, "moe_block_dwconv": True})
+    finally:
+        undo()
+    with torch.no_grad():                   # a skewed router, so drops are real
+        moe.moe_layer.gate_wg.zero_()
+        moe.moe_layer.gate_wg[0, 0] = 5.0
+    moe.moe_layer.dispatch_count = torch.tensor([1., 1., 1., 150.])
+    moe.train()
+    bpr = {"backend": "tutel", "batch_prioritized_routing": True,
+           "balance_loss": "gshard", "gate_noise": 0.0, "capacity_factor": 1.0}
+    stats, logged = _run_monitor(moe, torch.randn(4, 64, DIM), _moe_cfg(model={"moe": bpr}))
+    (_, s), = stats.items()
+    assert s["drop_rate"] > 0.1, s                                  # real drops exist
+    assert s["drop_rate_realised"] == s["drop_rate"], s             # noise 0: identical
+    assert s.get("drop_rate_realised_estimated") is True
+    assert logged["train_drop_rate_realised"] == s["drop_rate_realised"]
+
+    # with noise the estimate moves but stays a rate, and is still an estimate
+    stats, _ = _run_monitor(moe, torch.randn(4, 64, DIM),
+                            _moe_cfg(model={"moe": {**bpr, "gate_noise": 1.0}}))
+    (_, s), = stats.items()
+    assert 0.0 <= s["drop_rate_realised"] <= 1.0 and s["drop_rate_realised_estimated"]
+
+
 def test_a_broken_gate_disables_the_monitor_instead_of_killing_the_run():
     torch.manual_seed(0)
     cfg = _moe_cfg()
