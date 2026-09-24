@@ -196,6 +196,17 @@ class RoutingMonitor(pl.Callback):
     once per epoch; the realised figure is simply absent for a backend that
     exposes neither.
 
+    **Under batch-prioritized routing Tutel's dispatch_count is NOT the
+    per-expert counts** (``fast_dispatch.extract_critical`` returns
+    ``locations1[-1] + 1``: with BPR the location matrix is masked and
+    re-permuted, so its last row is the LAST TOKEN's rank, e.g. ``[1, 1, 1,
+    534]`` for true counts ~1560 each). Read as counts it reports ~9% drops
+    where none occur. So with BPR on the monitor never reads it: the realised
+    figure is ESTIMATED instead, from the same gate logits plus an independent
+    draw of Tutel's noise (``logits + gate_noise * randn / E``) -- an unbiased
+    estimate of the expected drop rate, flagged ``drop_rate_realised_estimated``
+    and printed as ``realised~``.
+
     A failure inside the hook disables the monitor for the rest of the run with
     a warning: a diagnostic must never take a training run down with it.
     """
@@ -205,6 +216,10 @@ class RoutingMonitor(pl.Callback):
         moe = cfg["model"]["moe"]
         self.capacity_factor = moe["capacity_factor"]
         self.top_k = moe["top_k"]
+        # BPR makes Tutel's dispatch_count unusable as counts (class docstring);
+        # the realised figure is then estimated from a noise draw instead.
+        self.bpr = bool(moe.get("batch_prioritized_routing"))
+        self.gate_noise = float(moe.get("gate_noise") or 0.0)
         self.last_stats: dict = {}
         self._acc: dict = {}
         self._handles: list = []
@@ -243,6 +258,20 @@ class RoutingMonitor(pl.Callback):
                 cap = capacity_of(tokens, experts, self.capacity_factor, self.top_k)
                 acc["dropped"] += (counts - cap).clamp(min=0).sum().double()
                 acc["tokens"] += int(tokens)
+                if self.bpr:
+                    # Tutel's own noise, drawn independently (tutel/impls/
+                    # moe_layer.py: logits + gate_noise * randn_like / E).
+                    # BPR changes WHICH tokens drop, never how many, so the
+                    # count needs only the noisy argmax.
+                    noisy = logits
+                    if self.gate_noise > 0 and mod.training:
+                        noisy = logits + self.gate_noise * torch.randn_like(logits) / experts
+                    ncounts = torch.bincount(noisy.argmax(dim=-1), minlength=experts)
+                    acc.setdefault("realised", torch.zeros((), dtype=torch.double,
+                                                           device=logits.device))
+                    acc["realised"] += (ncounts - cap).clamp(min=0).sum().double()
+                    acc["realised_seen"] = acc.get("realised_seen", 0) + 1
+                    acc["realised_estimated"] = True
             except Exception as e:  # noqa: BLE001 — never kill a run for a diagnostic
                 self._failed = True
                 print(f"[routing] monitor disabled after an error in {name}: "
@@ -260,8 +289,8 @@ class RoutingMonitor(pl.Callback):
                 return
             layer = getattr(mod, "moe_layer", None)
             acc = self._acc.get(name)
-            if layer is None or acc is None:
-                return
+            if layer is None or acc is None or self.bpr:
+                return                     # under BPR the pre-hook estimates it
             dropped = getattr(layer, "_dropped", None)          # native backend
             if dropped is None:
                 counts = getattr(layer, "dispatch_count", None)  # tutel: per-expert counts
@@ -352,6 +381,8 @@ class RoutingMonitor(pl.Callback):
             if acc.get("realised_seen"):
                 stats[name]["drop_rate_realised"] = round(
                     float(acc["realised"].cpu()) / tokens, 6)
+                if acc.get("realised_estimated"):
+                    stats[name]["drop_rate_realised_estimated"] = True
         self.last_stats = stats
         n = len(stats)
         for key in ("drop_rate", "imbalance", "route_entropy", "gate_entropy",
@@ -363,7 +394,8 @@ class RoutingMonitor(pl.Callback):
                           torch.tensor(sum(present) / len(present)),
                           on_step=False, on_epoch=True)
         for name, s in stats.items():
-            realised = (f" (realised {s['drop_rate_realised']:.1%})"
+            realised = (f" (realised{'~' if s.get('drop_rate_realised_estimated') else ''} "
+                        f"{s['drop_rate_realised']:.1%})"
                         if "drop_rate_realised" in s else "")
             print(f"[routing] {name}: share {[f'{v:.3f}' for v in s['share']]} | "
                   f"drops {s['drop_rate']:.1%}{realised} | imbalance {s['imbalance']:.3f} | "

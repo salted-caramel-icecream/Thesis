@@ -14,8 +14,9 @@ from pvt_moe.config.defaults import _DEFAULT, default_config
 from pvt_moe.config.naming import build_run_tag, parent_tag, resolve_placement, stage_tag
 from pvt_moe.config.recipes import LADDERS, ladder_overrides, resolve_lr
 from pvt_moe.config.registry import (
-    DATASETS, NUM_CLASSES, SMALL_DATASETS, VALID_BACKENDS, VALID_MODES,
-    VALID_RECIPES, VALID_ROPE_MODES, VALID_UPCYCLE_INITS, VALID_VARIANTS,
+    DATASETS, NUM_CLASSES, SMALL_DATASETS, VALID_BACKENDS, VALID_BALANCE_LOSSES,
+    VALID_INTERPOLATIONS,
+    VALID_MODES, VALID_RECIPES, VALID_ROPE_MODES, VALID_UPCYCLE_INITS, VALID_VARIANTS,
     VARIANTS, ROPE_THETA_DEFAULT, LR_REFERENCE_BATCH,
 )
 from pvt_moe.config.resolve import apply_recipe, apply_variant
@@ -183,6 +184,46 @@ def assert_json_safe(cfg: dict) -> None:
         ) from e
 
 
+#: What a native-backend run must pass, since the router defaults are Tutel-only.
+NATIVE_ROUTER_FIX = ("--set model.moe.balance_loss=gshard "
+                     "--set model.moe.batch_prioritized_routing=false")
+
+
+def _check_router(moe: dict, builds_router: bool) -> None:
+    """The router keys: types always, combinations only where a router is built.
+
+    Absent / None keys are a config from before they existed (an sv1
+    checkpoint's saved config) and mean what that code did: gshard loss, no
+    batch-prioritized routing — so they are accepted and never rewritten.
+    Combination checks are skipped for a dense arm, which builds no router.
+    """
+    loss, bpr = moe.get("balance_loss"), moe.get("batch_prioritized_routing")
+    if loss is not None and loss not in VALID_BALANCE_LOSSES:
+        raise ValueError(
+            f"model.moe.balance_loss must be one of {VALID_BALANCE_LOSSES}, got {loss!r}")
+    if bpr is not None and not isinstance(bpr, bool):
+        raise ValueError(
+            f"model.moe.batch_prioritized_routing must be true or false, got {bpr!r}")
+    if not builds_router:
+        return
+    if loss == "load_importance" and not (moe.get("gate_noise") or 0) > 0:
+        # Tutel asserts this at the first forward (tutel/impls/losses.py:
+        # "`gate_noise` must be > 0 for normalization in
+        # load_importance_loss()") -- on the GPU, after the model is built.
+        raise ValueError(
+            f"model.moe.balance_loss 'load_importance' needs gate_noise > 0 (got "
+            f"{moe.get('gate_noise')!r}): its load term is a normal CDF with sigma "
+            f"gate_noise / num_experts. Use a positive gate_noise, or "
+            f"--set model.moe.balance_loss=gshard for a noise-free router.")
+    if moe.get("backend") == "native" and (loss == "load_importance" or bpr):
+        raise ValueError(
+            f"the native MoE backend implements the gshard loss and token-order "
+            f"routing only, but this config asks for balance_loss={loss!r}, "
+            f"batch_prioritized_routing={bpr!r} (the sv2 defaults, which are "
+            f"Swin-MoE's and need Tutel). Pass {NATIVE_ROUTER_FIX} to run the "
+            f"native backend, or use backend 'tutel'.")
+
+
 def validate_config(cfg: dict) -> dict:
     """Validate and normalize a config in place (returns it for chaining).
 
@@ -219,6 +260,12 @@ def validate_config(cfg: dict) -> dict:
     if ds["name"] not in DATASETS:
         raise ValueError(f"dataset.name must be one of {tuple(DATASETS)}, got {ds['name']!r}")
     ds["num_classes"] = NUM_CLASSES[ds["name"]]
+    # None = a config from before the key existed (an sv1 checkpoint's saved
+    # config); the transforms then build exactly as they did (bilinear).
+    if ds.get("interpolation") is not None and ds["interpolation"] not in VALID_INTERPOLATIONS:
+        raise ValueError(
+            f"dataset.interpolation must be one of {VALID_INTERPOLATIONS}, "
+            f"got {ds['interpolation']!r}")
 
     budget = cfg["epochs"]
     field = "epochs"
@@ -283,6 +330,8 @@ def validate_config(cfg: dict) -> dict:
     # After resolution the convenience fields have been consumed.
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
+
+    _check_router(moe, builds_router=bool(abl["use_moe"] and any(abl["moe_placement"])))
 
     # RoPE flavour and its theta; head_dim % 4 == 0 wherever it is enabled.
     if abl.get("rope_mode") not in VALID_ROPE_MODES:

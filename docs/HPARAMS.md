@@ -126,6 +126,8 @@ B2-Linear is not a variant: linear (pooling) attention is `model.linear_attentio
 | Repeated augmentation | 3 repeats | `dataset.repeated_aug` |
 | Mixup | 0.8 | `loss.mixup_alpha` |
 | CutMix | 1.0 | `loss.cutmix_alpha` |
+| Mixup / CutMix probability | 1.0 — DeiT and PVT v2 `main.py`, `--mixup-prob` default 1.0. Every sv1 run trained at 0.8 (the v9 lineage's value, unsourced) | `loss.mixup_prob` |
+| Interpolation | `bicubic` — DeiT and PVT v2 for training (`--train-interpolation`) and evaluation (DeiT `datasets.py`, `Resize(..., interpolation=3)`), applied to the train crop, every RandAugment op and the val resize. sv1 and the sv2 pilots ran `bilinear` (torchvision's default for the crop and the val resize; timm RandAugment picks bilinear or bicubic at random per op), which `--set dataset.interpolation=bilinear` rebuilds exactly | `dataset.interpolation` |
 | Random erasing | 0.25 | `dataset.random_erasing` |
 | Label smoothing | 0.1 | `loss.label_smoothing` |
 
@@ -175,27 +177,30 @@ Not applied automatically — pass --lr.
 | top-k | 1 | `model.moe.top_k` | Tutel: SwinV2-B is 85.5 at both k=1 and k=2; k=2 costs +25% activated params, ~17% train speed |
 | Placement | stage 4, last layer only — 1 MoE layer | `ablation.moe_placement: [[],[],[],[-1]]` (−1 = the stage's last block whatever the variant's depth: block 1 in B1, block 2 in B2) | ViMoE's representative config is L=1; Sparse Upcycling finds last-consecutive-layer conversion gives the smallest initial drop |
 | Shared expert | 1, always-on, added to routed output | `model.moe.shared_expert` | ViMoE 83.9 → 84.2; ScMoE 79.53 vs 78.95 (top-1) |
-| Capacity factor | 1.0 | `model.moe.capacity_factor` | Tutel's default; their Table 12 gives 38.5 @ 892 img/s vs 38.6 @ 839 for f=1.25 |
+| Capacity factor | 1.25 (sv2; sv1 ran 1.0) | `model.moe.capacity_factor` | Swin-MoE yaml `CAPACITY_FACTOR: 1.25`. Tutel's own default is 1.0; its Table 12 gives 38.5 @ 892 img/s at 1.0 vs 38.6 @ 839 at 1.25 |
+| Batch-prioritized routing | on (sv2; sv1 off) | `model.moe.batch_prioritized_routing` | Swin-MoE `swin_transformer_moe.py` `use_bpr=True` → `moe_layer(batch_prioritized_routing=...)`. Over capacity, the highest-gate-score tokens keep their slot rather than the first in token order: changes which tokens drop, never how many. Tutel only |
+| Balance loss | `load_importance` (sv2; sv1 `gshard`) | `model.moe.balance_loss` | Swin-MoE yaml `IS_GSHARD_LOSS: False` → Tutel `load_importance_loss`: (importance CV² + load CV²) / 2, **reads ≈0 at balance** (gshard reads ≈1.0). Needs `gate_noise > 0` (the validator refuses 0). Tutel only; the native backend implements `gshard` and refuses the sv2 router |
 | Aux loss coefficient | 0.01 | `loss.aux_weight` | Tutel, ScMoE, ViMoE, Sweet Spot — unanimous |
 | Gate | linear + softmax | Tutel `top` gate | ViMoE, Sweet Spot, Tutel (GShard) |
 | Expert module | plain MLP at mlp_ratio 4 (stage 4) | — | every paper's expert is a plain MLP |
 
-**`gate_noise` is not specified by the doc** and stays at the v9 lineage's
-0.5. The "linear + softmax" row is about the gate *function* (vs cosine / L2),
-not about noise. Tutel's own default is 0.0. Set it deliberately.
+**`gate_noise` is 1.0 since sv2** — Swin-MoE's (`swin_transformer_moe.py`
+`gate_noise=1.0`); sv1 ran the v9 lineage's 0.5 and Tutel's own default is
+0.0. The "linear + softmax" row is about the gate *function* (vs cosine /
+L2), not about noise. The load+importance loss needs it above zero.
 
 Tutel adds **Gaussian** noise scaled by `gate_noise / num_experts`
 (`tutel/impls/moe_layer.py`: `logits + gate_noise * randn_like(logits) /
-num_global_experts`), i.e. σ = 0.125 at the defaults — *not* Gumbel, so there
+num_global_experts`), i.e. σ = 0.25 at the sv2 default (0.125 at sv1's 0.5) — *not* Gumbel, so there
 is no Gumbel-max "sampling from the softmax" interpretation. Against the
 measured stage-4 logit spread at init (std ≈ 0.44–0.58, median top-1/top-2 gap
-≈ 0.34) that flips only **11–13% of routing decisions**; uniform routing would
+≈ 0.34) sv1's σ = 0.125 flipped only **11–13% of routing decisions** (not re-measured at 0.25); uniform routing would
 flip 1 − 1/E = 75%, and you would need `gate_noise` ≈ 32 to get there. The
 noisy scores are used for the aux loss *and* for the combine weight, and at
 `top_k: 1` the combine weight is the raw unnormalised softmax probability
 (≈0.25–0.30 at init), so the routed branch is attenuated roughly 4× relative
 to the shared expert early on. `pvt_moe/models/moe_native.py` mirrors all of
-this exactly.
+this exactly under `balance_loss: gshard` (the only loss it implements).
 
 ### Reading the MoE diagnostics — `train_aux` is not the balance metric
 

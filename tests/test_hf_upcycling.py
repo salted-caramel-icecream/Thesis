@@ -28,10 +28,17 @@ import types
 
 import torch
 
-from helpers import install_fake_tutel_backend, tiny_config
+from helpers import NATIVE_MOE, install_fake_tutel_backend, tiny_config
+
 from pvt_moe.config import default_config, merge_config, validate_config
 from pvt_moe.models import build_model
 from pvt_moe.models.pretrained import _remap_hf_key, load_hf_pretrained
+
+
+def _backend(name: str) -> dict:
+    """The moe block for one backend (native cannot take the Tutel-only router)."""
+    return dict(NATIVE_MOE) if name == "native" else {"backend": name}
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "verify_upcycling.py"
@@ -167,7 +174,7 @@ def test_hf_loader_maps_every_dense_tensor_and_preserves_the_function():
                 assert ours in dense_state, (hf_key, ours)
 
         moe_cfg = tiny_config(model={"ablation": {**_NO_ROPE, **_MOE_LAST_S4},
-                                     "moe": {"backend": backend, "shared_expert": True,
+                                     "moe": {**_backend(backend), "shared_expert": True,
                                              "upcycle_init": "routed_zero"}})
         moe = _moe_model(moe_cfg)
         with _serving(dense_cfg["model"]["depths"], dense_cfg["model"]["embed_dims"], hf_state):
@@ -209,7 +216,7 @@ def test_hf_upcycling_reproduces_the_dense_model_under_the_scratch_recipe():
         # — with mode hf_pretrained and NO recipe set (default: scratch)
         moe_cfg = tiny_config(mode="hf_pretrained",
                               model={"ablation": {**_NO_ROPE, **_MOE_LAST_S4},
-                                     "moe": {"backend": backend, "shared_expert": True}})
+                                     "moe": {**_backend(backend), "shared_expert": True}})
         assert moe_cfg["recipe"] == "scratch", moe_cfg["recipe"]
         assert moe_cfg["model"]["moe"]["upcycle_init"] == "routed_zero", \
             f"mode hf_pretrained under the scratch recipe resolved upcycle_init " \

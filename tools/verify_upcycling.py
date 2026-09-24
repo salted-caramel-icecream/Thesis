@@ -60,7 +60,12 @@ def _cfg(args, use_moe: bool, mode: str = "scratch", ckpt_path=None):
         "mode": mode, "ckpt_path": ckpt_path, "use_wandb": False, "use_tensorboard": False,
         "model": {"variant": args.variant,
                   "moe": {"backend": args.backend, "num_experts": args.experts,
-                          "shared_expert": True},
+                          "shared_expert": True,
+                          # native implements gshard + token order only; on
+                          # tutel the sv2 defaults (BPR, load+importance) are
+                          # exactly what this tool must build for real.
+                          **({"balance_loss": "gshard", "batch_prioritized_routing": False}
+                             if args.backend == "native" else {})},
                   "ablation": {"use_moe": use_moe, "moe_placement": [[], [], [], [-1]],
                                "use_rope": True, "rope_last_n_stages": 1}},
     }))

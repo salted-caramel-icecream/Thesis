@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from helpers import tiny_config
+from helpers import NATIVE_MOE, tiny_config
 from pvt_moe.config import VALID_BACKENDS, default_config
 from pvt_moe.models.ffn import Mlp, MoEMlp
 from pvt_moe.models.moe_native import BatchedExperts, NativeMoEFFN, Top1Router
@@ -277,8 +277,8 @@ def test_R4_both_backends_build_the_same_architecture():
     for backend in ("tutel", "native"):
         cfg = tiny_config(model={
             "ablation": {"use_moe": True, "moe_placement": [[], [], [], [1]]},
-            "moe": {"backend": backend, "num_experts": E, "top_k": 1,
-                    "shared_expert": True}})
+            "moe": {**(NATIVE_MOE if backend == "native" else {"backend": backend}),
+                    "num_experts": E, "top_k": 1, "shared_expert": True}})
         if backend == "tutel":
             from helpers import install_fake_tutel_backend
             undo = install_fake_tutel_backend()
@@ -309,7 +309,7 @@ def test_R4_backends_get_distinct_run_names():
     only appears when MoE is actually on — asserted below.)"""
     names = {b: tiny_config(model={
                  "ablation": {"use_moe": True, "moe_placement": [[], [], [], [1]]},
-                 "moe": {"backend": b}})["run_name"]
+                 "moe": NATIVE_MOE if b == "native" else {"backend": b}})["run_name"]
              for b in VALID_BACKENDS}
     assert len(set(names.values())) == len(VALID_BACKENDS), names
     assert "-nat" in names["native"] and "-nat" not in names["tutel"]

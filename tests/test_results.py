@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
-from helpers import install_fake_tutel_backend, tiny_config
+from helpers import NATIVE_MOE, install_fake_tutel_backend, tiny_config
 from pvt_moe.data import build_dataloaders
 from pvt_moe.engine.callbacks import build_trainer
 from pvt_moe.engine.classifier import LitClassifier
@@ -226,7 +226,7 @@ def test_results_record_the_knobs_that_change_routing_and_the_tokens_capacity_dr
 
     # 2. the measurement is EXACT against the layer that does the dropping.
     for capacity_factor, expect_drops in ((1.0, True), (0.25, True), (0.0, False)):
-        c = tiny_config(model={"moe": {"backend": "native", "num_experts": 4, "top_k": 1,
+        c = tiny_config(model={"moe": {**NATIVE_MOE, "num_experts": 4, "top_k": 1,
                                        "capacity_factor": capacity_factor, "gate_noise": 0.0,
                                        "shared_expert": False},
                                "ablation": {"use_moe": True, "moe_placement": [[], [], [], [-1]]}})
