@@ -251,14 +251,14 @@ Four arms, B2 throughout, all from scratch on the shipped 90-epoch ladder
 budget (90 matches ScMoE's comparison budget). No dedicated config files —
 each supervised arm is a shipped ladder row plus `--variant b2`, resolving
 byte-for-byte to what a pinned file would give. The size is visible before
-the first step: the run name printed at start-up begins `sv1_b2_`.
+the first step: the run name printed at start-up begins `sv2_b2_`.
 
 | GPU | arm | command | run name |
 |---|---|---|---|
-| 0 | dense baseline | `--recipe scratch --ladder 1` | `sv1_b2_in1k_r224_dense_norope_scratch90` |
-| 1 | MoE E=4 | `--recipe scratch --ladder 3` | `sv1_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
-| 2 | MoE E=8 | `--recipe scratch --ladder 3 --experts 8` | `sv1_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
-| 3 | MoE E=8, stages 3+4 | `--recipe scratch --ladder 8 --experts 8 --no-shared-expert` | `sv1_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
+| 0 | dense baseline | `--recipe scratch --ladder 1` | `sv2_b2_in1k_r224_dense_norope_scratch90` |
+| 1 | MoE E=4 | `--recipe scratch --ladder 3` | `sv2_b2_in1k_r224_moe-s4b2-e4k1_rope-s4b2_scratch90` |
+| 2 | MoE E=8 | `--recipe scratch --ladder 3 --experts 8` | `sv2_b2_in1k_r224_moe-s4b2-e8k1_rope-s4b2_scratch90` |
+| 3 | MoE E=8, stages 3+4 | `--recipe scratch --ladder 8 --experts 8 --no-shared-expert` | `sv2_b2_in1k_r224_moe-s3b5+s4b2-e8k1_rope-s3b5+s4b2_scratch90` |
 
 Both MoE arms are stage 4's last block, top-1, **no shared expert** — which is
 also why the routed block has no DWConv: `moe_block_dwconv` feeds only the
@@ -267,9 +267,21 @@ shared-expert branch, and the routed experts never carry one (an
 The two differ **only** in expert count, so the pair prices E at fixed
 placement.
 
+**The schedule is NOT the bare `scratch` recipe.** The recipe's 1e-3 peak
+collapsed B1 from scratch in this setup (full data at the 1e-3 epoch;
+reproduced on the 25% subset from the 8e-4 epoch on: learning through warmup,
+then chance), and B2 was never run above 5e-4. Wave 1 passes
+the pilot-validated schedule explicitly: peak 5e-4 (MoGE's), warmup 10 epochs
+from peak/1000, cosine floor peak/100 (the ratios of PVT v2, Swin, Swin-MoE
+and ScMoE), weight decay 0.05, grad clip 3.0 (Swin-MoE's). Every arm needs
+`$SCHED`; without it an arm silently runs the collapsing schedule.
+
 ```bash
-COMMON="--variant b2 --batch-size 256 --accum 4 --num-workers 16 \
-        --data-dir /data/imagenet_arrow --checkpoint-root /data/runs"
+SCHED="--lr 5e-4 --set optim.warmup_epochs=10 --set optim.warmup_start_factor=1e-3 \
+       --set optim.eta_min=5e-6 --set optim.weight_decay=0.05 --set optim.grad_clip=3.0"
+COMMON="--variant b2 --batch-size 128 --num-workers 16 $SCHED \
+        --data-dir /data/imagenet_arrow --checkpoint-root /data/runs \
+        --set experiment_group=wave1"
 
 CUDA_VISIBLE_DEVICES=0 python train.py --recipe scratch --ladder 1 $COMMON
 CUDA_VISIBLE_DEVICES=1 python train.py --recipe scratch --ladder 3 $COMMON
@@ -279,6 +291,8 @@ CUDA_VISIBLE_DEVICES=3 python train.py --recipe scratch --ladder 8 --experts 8 -
 
 `drop_path` resolves to 0.1 on all four (the variant's official rate). All four
 run names are distinct, so no two arms can share a checkpoint directory.
+Micro-batch 128 (x 8 accumulation = 1024) is what the pilots ran on a 5090;
+the effective batch, and so the LR, is the same at any micro-batch that fits.
 
 **No shared expert in any arm** — ladder row 8 has it on, so GPU 3
 passes `--no-shared-expert` to match GPUs 1–2 (the run name carries no `+sh`).
@@ -434,9 +448,9 @@ Run names are derived from the flags — every W&B run self-documents its
 ablation, and no two arms can share a checkpoint directory (tests enforce it):
 
 ```
-sv1_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
-└──────────────────────────────────────────────── version: s = September-2026 architecture edit (was v10)
-│   └──────────────────────────────────────────── variant (b0…b5; a B2 run is sv1_b2_…)
+sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
+└──────────────────────────────────────────────── version: sv2 = Swin-MoE router + DeiT data defaults (sv1: Sept-2026 arch edit; v10 before)
+│   └──────────────────────────────────────────── variant (b0…b5; a B2 run is sv2_b2_…)
 │   │  └───────────────────────────────────────── dataset (in1k | in22k | fmnist | eurosat | path)
 │   │  │    └──────────────────────────────────── input resolution (dataset.img_size; 224 = default)
 │   │  │    │        └─────────────────────────── stage 4, block 1 — the LAST block; s4b2 in B2
