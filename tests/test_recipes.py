@@ -102,10 +102,10 @@ def test_spec_augmentation_stack():
     assert ds["randaugment"] == "rand-m9-mstd0.5-inc1"
     assert ds["repeated_aug"] == 3
     assert ds["random_erasing"] == 0.25
-    # bilinear = the pre-sv2 pipeline. DeiT / PVT v2 train and evaluate with
-    # bicubic; it is opt-in (--set dataset.interpolation=bicubic) until a
-    # dense pilot has run with it.
-    assert ds["interpolation"] == "bilinear"
+    # DeiT / PVT v2 train and evaluate with bicubic (--train-interpolation
+    # bicubic; DeiT datasets.py eval Resize(..., interpolation=3)). sv1 and
+    # the sv2 pilots ran bilinear.
+    assert ds["interpolation"] == "bicubic"
     loss = _cfg()["loss"]
     assert loss["mixup_alpha"] == 0.8
     assert loss["cutmix_alpha"] == 1.0
@@ -355,7 +355,7 @@ def _resamplers(train_tf, val_tf):
 
 
 def test_interpolation_bilinear_is_the_unchanged_pipeline():
-    """The default must build exactly what every sv1 run trained with:
+    """"bilinear" must build exactly what every sv1 run trained with:
     torchvision's default (bilinear) crop and resize, and timm drawing
     bilinear-or-bicubic at random per RandAugment op. Only "bicubic" pins a
     filter anywhere."""
@@ -364,12 +364,12 @@ def test_interpolation_bilinear_is_the_unchanged_pipeline():
 
     from pvt_moe.data.imagenet import build_transforms
 
-    rrc, resize, ops = _resamplers(*build_transforms(_cfg()))
+    rrc, resize, ops = _resamplers(*build_transforms(_cfg(dataset={"interpolation": "bilinear"})))
     assert rrc is transforms.InterpolationMode.BILINEAR
     assert resize is transforms.InterpolationMode.BILINEAR
     assert ops == {_RANDOM_INTERPOLATION}, ops
     # A config from before the key existed (an sv1 checkpoint's saved config)
-    # gets the same transforms, not a KeyError.
+    # gets the sv1 transforms -- not the new default, and not a KeyError.
     legacy = _cfg()
     del legacy["dataset"]["interpolation"]
     assert _resamplers(*build_transforms(legacy)) == (rrc, resize, ops)
@@ -385,6 +385,7 @@ def test_interpolation_bicubic_reaches_crop_randaugment_and_val_resize():
     from pvt_moe.data.imagenet import build_transforms
 
     rrc, resize, ops = _resamplers(*build_transforms(_cfg(dataset={"interpolation": "bicubic"})))
+    assert _resamplers(*build_transforms(_cfg())) == (rrc, resize, ops), "the default is bicubic"
     assert rrc is transforms.InterpolationMode.BICUBIC
     assert resize is transforms.InterpolationMode.BICUBIC
     assert ops == {Image.BICUBIC}, ops

@@ -99,12 +99,12 @@ ROPE_THETA_DEFAULT = {"mixed": 10.0,   # rope-vit RoPE-Mixed models
                       "axial": 50.0}   # this repo's axial choice (7x7 stage-4 grid)
 
 #: Resampling filter for the train crop, the RandAugment ops and the val
-#: resize (``dataset.interpolation``). "bilinear" is this repo's pipeline as
-#: it has always been (torchvision's default; timm RandAugment left to pick
-#: bilinear or bicubic at random per op). "bicubic" is what DeiT and PVT v2
-#: train AND evaluate with (``--train-interpolation bicubic``; DeiT
+#: resize (``dataset.interpolation``). "bicubic" (the default) is what DeiT
+#: and PVT v2 train AND evaluate with (``--train-interpolation bicubic``; DeiT
 #: ``datasets.py`` eval ``Resize(..., interpolation=3)``) and is applied to
-#: all three places. Not the default until a dense pilot has run with it.
+#: all three places. "bilinear" is this repo's pipeline before sv2
+#: (torchvision's default; timm RandAugment left to pick bilinear or bicubic
+#: at random per op), built exactly as it was.
 VALID_INTERPOLATIONS = ("bilinear", "bicubic")
 
 #: Router load-balancing loss (``model.moe.balance_loss``), Tutel's two:

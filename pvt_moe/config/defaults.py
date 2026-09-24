@@ -23,7 +23,9 @@ _DEFAULT: dict = {
     #           depth-independent placement); Tutel's default router
     #   "sv2" - Swin-MoE's router (capacity 1.25, gate_noise 1.0,
     #           batch-prioritized routing, load+importance loss) and DeiT's
-    #           mixup_prob 1.0. The architecture is unchanged.
+    #           mixup_prob 1.0 and bicubic interpolation. The architecture is
+    #           unchanged. (The sv2 PILOTS ran bilinear; results.json records
+    #           it, so the resume guard refuses a silent switch.)
     "version": "sv2",
     # Which recipe fills the fields left as None below (see RECIPES).
     #   "scratch"    - full from-scratch training, PVT v2 recipe
@@ -132,11 +134,11 @@ _DEFAULT: dict = {
         "random_erasing": 0.25,
         "crop_pct": 0.875,                # val resize = img_size / crop_pct
         # Resampling filter for the train crop, the RandAugment ops and the
-        # val resize (VALID_INTERPOLATIONS). "bilinear" = the pipeline every
-        # run so far used. DeiT / PVT v2 use "bicubic" for both training and
-        # evaluation; it is available as --set dataset.interpolation=bicubic
-        # and becomes the default only once a dense pilot has run with it.
-        "interpolation": "bilinear",
+        # val resize (VALID_INTERPOLATIONS). "bicubic" is DeiT's and PVT v2's,
+        # for training (--train-interpolation bicubic) and evaluation alike.
+        # "bilinear" = the pipeline every sv1 run and the sv2 pilots used
+        # (torchvision's default; timm RandAugment random per op).
+        "interpolation": "bicubic",
         # Low-shot fine-tuning: a JSON index list written by
         # `python -m pvt_moe.eval.lowshot` (seeded, class-balanced 1% / 10% of
         # the train split). None = the whole train split. Never applied to

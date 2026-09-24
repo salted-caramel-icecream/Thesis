@@ -127,7 +127,7 @@ B2-Linear is not a variant: linear (pooling) attention is `model.linear_attentio
 | Mixup | 0.8 | `loss.mixup_alpha` |
 | CutMix | 1.0 | `loss.cutmix_alpha` |
 | Mixup / CutMix probability | 1.0 — DeiT and PVT v2 `main.py`, `--mixup-prob` default 1.0. Every sv1 run trained at 0.8 (the v9 lineage's value, unsourced) | `loss.mixup_prob` |
-| Interpolation | `bilinear` — the pipeline as it has always been here (torchvision's default for the crop and the val resize; timm RandAugment picks bilinear or bicubic at random per op). DeiT and PVT v2 use **bicubic** for training (`--train-interpolation`) and evaluation (DeiT `datasets.py`, `Resize(..., interpolation=3)`); `--set dataset.interpolation=bicubic` applies it to all three places, and it becomes the default only after a dense pilot has run with it | `dataset.interpolation` |
+| Interpolation | `bicubic` — DeiT and PVT v2 for training (`--train-interpolation`) and evaluation (DeiT `datasets.py`, `Resize(..., interpolation=3)`), applied to the train crop, every RandAugment op and the val resize. sv1 and the sv2 pilots ran `bilinear` (torchvision's default for the crop and the val resize; timm RandAugment picks bilinear or bicubic at random per op), which `--set dataset.interpolation=bilinear` rebuilds exactly | `dataset.interpolation` |
 | Random erasing | 0.25 | `dataset.random_erasing` |
 | Label smoothing | 0.1 | `loss.label_smoothing` |
 

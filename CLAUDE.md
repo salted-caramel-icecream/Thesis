@@ -53,7 +53,7 @@ can be rerun without sharing a checkpoint directory or a W&B name; an
 explicit `run_name` replaces the derived name entirely instead.
 The version prefix (`config/defaults.py` `"version"`) is bumped on every architecture
 or training-default change (`sv2` = Swin-MoE's router — capacity 1.25, gate_noise 1.0,
-batch-prioritized routing, load+importance loss, Tutel only — and mixup_prob 1.0; an
+batch-prioritized routing, load+importance loss, Tutel only — mixup_prob 1.0 and bicubic interpolation; an
 `sv1` run resumes with `--run-name <its sv1 name>` plus the sv1 values passed explicitly,
 since results.json from sv1 does not record them for the resume guard), so old
 and new runs never share a W&B name or a checkpoint directory.

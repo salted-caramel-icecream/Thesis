@@ -222,7 +222,7 @@ re-downloading 160 GB.
 Three labelled sets for the last stage of the chain, all far below 224 px
 natively. `dataset.img_size` (224 by default) **upsamples them in the
 transforms** (`RandomResizedCrop` / `Resize` on the PIL image, with the
-filter `dataset.interpolation` names — bilinear by default), so accuracy
+filter `dataset.interpolation` names — bicubic by default), so accuracy
 on these partly measures interpolation of the upsampled input — say so when
 reporting them. The loader converts grayscale to RGB; the fine-tune budget is
 **fixed per dataset** in `config.DATASETS` so an open-ended run cannot overrun
