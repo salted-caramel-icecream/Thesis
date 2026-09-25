@@ -149,6 +149,10 @@ class PyramidVisionTransformerV2(nn.Module):
     ``moe_placement`` / ``rope_placement`` are lists (one entry per stage) of
     block indices, e.g. ``[[], [], [], [0, 1]]`` enables both blocks of
     stage 4. Use ``pvt_moe.config.resolve_placement`` to build them.
+    ``dwconv_off_placement`` (same form) names the DENSE blocks whose FFN
+    drops its depthwise conv while ``dense_dwconv`` keeps it everywhere else;
+    negative indices are normalised here too, so an unresolved ``-1`` cannot
+    silently miss.
     """
 
     def __init__(
@@ -173,6 +177,7 @@ class PyramidVisionTransformerV2(nn.Module):
         rope_mode: str = "mixed",
         act_layer=nn.GELU,
         dense_dwconv: bool = True,
+        dwconv_off_placement=None,
         grad_checkpointing=(),
     ):
         super().__init__()
@@ -186,6 +191,9 @@ class PyramidVisionTransformerV2(nn.Module):
         rope_placement = rope_placement or [[] for _ in depths]
         self.moe_placement = [list(b) for b in moe_placement]
         self.rope_placement = [list(b) for b in rope_placement]
+        dwconv_off_placement = dwconv_off_placement or [[] for _ in depths]
+        self.dwconv_off_placement = [sorted({int(b) % d for b in blocks})
+                                     for blocks, d in zip(dwconv_off_placement, depths)]
 
         # Stochastic depth: linear ramp over the full block sequence.
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
@@ -218,7 +226,8 @@ class PyramidVisionTransformerV2(nn.Module):
                         use_rope=(j in self.rope_placement[i]),
                         rope_theta=rope_theta,
                         rope_mode=rope_mode,
-                        dense_dwconv=dense_dwconv,
+                        # the global switch, minus the blocks named off
+                        dense_dwconv=dense_dwconv and (j not in self.dwconv_off_placement[i]),
                     )
                     for j in range(depths[i])
                 ]
@@ -393,5 +402,7 @@ def build_model(cfg: dict) -> PyramidVisionTransformerV2:
         rope_theta=abl["rope_theta"],
         rope_mode=abl["rope_mode"],
         dense_dwconv=m.get("dense_dwconv", True),
+        # no use_* gate: the empty list IS the off state
+        dwconv_off_placement=abl.get("dwconv_off_placement"),
         grad_checkpointing=m.get("grad_checkpointing", ()),
     )

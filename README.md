@@ -312,6 +312,33 @@ early, add `--epochs 300 --stop-at N --milestones "[...]"` to the same
 command. Repeat an arm without sharing
 its checkpoint directory or W&B name: `--run-suffix v2`.
 
+### 10. Wave 2: placement, the shared expert, dense scale, and the RoPE control
+
+Same schedule and `$COMMON` as Wave 1; every arm pairs with a Wave 1 arm.
+
+| GPU | arm | command | compares with | question |
+|---|---|---|---|---|
+| 0 | MoE E=4, stages 3+4 | `--recipe scratch --ladder 8 --no-shared-expert` | E=4 stage 4; E=8 stages 3+4 | placement at E=4; expert count at stages 3+4 |
+| 1 | E=4 stage 4 + shared expert, plain | `--recipe scratch --ladder 4 --no-moe-dwconv` | E=4 stage 4 | does a shared expert help? (plain = no conv in the shared branch, so the shared MLP is the only difference) |
+| 2 | dense B3 | `--recipe scratch --ladder 1 --variant b3` | E=8 stages 3+4 (45.2M vs ~44M params) | is MoE better than scaling the dense model? |
+| 3 | dense + RoPE at s4b2, no conv there | `--recipe scratch --ladder 1 --rope --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]"` | dense B2; E=4 stage 4 | is the stage-4 gain from the routed experts or from the conv→RoPE swap? |
+
+Run names: `sv2_b2_in1k_r224_moe-s3b5+s4b2-e4k1_rope-s3b5+s4b2_scratch90`,
+`sv2_b2_in1k_r224_moe-s4b2-e4k1+sh-plain_rope-s4b2_scratch90`,
+`sv2_b3_in1k_r224_dense_norope_scratch90`,
+`sv2_b2_in1k_r224_dense_rope-s4b2_nodw-s4b2_scratch90`.
+
+GPU 3 is the block-for-block dense mirror of the E=4 stage-4 arm: a
+no-shared-expert MoE block has no depthwise conv, so the control drops the
+conv at s4b2 too (`--dwconv-off-placement`) and carries RoPE there. Against
+the dense baseline it prices the conv→RoPE swap alone; against the MoE arm
+the two differ only in the s4b2 FFN — one dense fc1→GELU→fc2 vs four top-1
+routed experts of the same hidden size plus router and balance loss: matched
+per-token FFN compute, 4× FFN parameters at that block on the MoE side. The
+stages-3+4 mirror of GPU 0 is the same line with both placements
+`"[[],[],[-1],[-1]]"`. B3 (GPU 2) resolves `drop_path 0.3`, PVT v2's rate
+for that size; it is the one Wave 2 arm never piloted at 5e-4.
+
 ## Or use a notebook
 
 | | |
@@ -435,7 +462,7 @@ directly, and prints the equivalent command line.
 | 3 | RoPE placement and flavour | `model.ablation.rope_placement`, `rope_mode`, `rope_theta` | 2D RoPE (rope-vit), real `(cos, sin)` form, adjacent-channel pairing; needs `head_dim % 4 == 0`. **Default `rope_mode: "mixed"` = RoPE-Mixed**: learnable per-head 2D frequencies, one `attn.rope.freqs` parameter of shape `(2, heads, head_dim//2)` per RoPE'd block, weight-decay excluded, MHA only. `--rope-mode axial` = fixed axial frequencies, no parameters, run tag `-ax`. `rope_theta` defaults per mode (10 mixed — init spread only; 50 axial) |
 | 4 | Dataset | `dataset.name: "imagenet-1k" \| "imagenet-22k"` | `num_classes` derived (1000 / 21841); Arrow snapshot path per dataset |
 | 5 | Shared expert | `model.moe.shared_expert` | always-on dense FFN added to the routed output (DeepSeekMoE-style); see below |
-| 6 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks) and `model.dense_dwconv` (every dense block) | two separate knobs: the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6) |
+| 6 | Conv positional encoding | `model.moe.moe_block_dwconv` (scoped to the MoE'd blocks), `model.dense_dwconv` (every dense block) and `model.ablation.dwconv_off_placement` (named dense blocks) | the first gives the four DWConv × RoPE arms, the second the fully-dense "no DWConv" arms (ladder rows 2 and 6), the third the dense control of a MoE arm (Wave 2, §10) |
 
 Orthogonal to all six: **model size**, `model.variant` / `--variant b2`
 (b0…b5, default b1). A variant sets depths, dims, heads, mlp/sr ratios and the
@@ -461,8 +488,9 @@ sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90
 ```
 
 Further markers appear only when they apply: `-nat` (the native backend),
-`+sh-plain` (MoE'd block without its DWConv), `_nodw` (dense blocks without
-theirs), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
+`+sh-plain` (MoE'd block without its DWConv), `_nodw` (every dense block
+without its DWConv) or `_nodw-s4b2` (only the named dense blocks; the dense
+control of a MoE arm), `-ax` (fixed axial RoPE instead of the default RoPE-Mixed),
 `-randexp` (random expert init), `-szi` (`shared_zero` upcycling init; an explicit
 `none` with seeded experts is refused at validate time, so `-nozi` never appears).
 

@@ -177,9 +177,10 @@ _DEFAULT: dict = {
         "grad_checkpointing": [],
 
         # PVT v2 carries positional information as a depthwise 3x3 conv inside
-        # the dense FFN. False removes it from DENSE blocks too — the
+        # the dense FFN. False removes it from EVERY dense block — the
         # "no DWConv + RoPE" architecture edit as an ablation in its own right
-        # (MoE blocks never have it in their routed branch regardless).
+        # (MoE blocks never have it in their routed branch regardless). To
+        # strip named blocks only, see ablation.dwconv_off_placement.
         "dense_dwconv": True,
 
         # LayerNorm is the only norm; RMSNorm was an ablation axis that no
@@ -207,6 +208,16 @@ _DEFAULT: dict = {
             # the routed branch drops.
             "rope_placement": [[], [], [], [-1]],
             "rope_last_n_stages": None,
+            # DENSE blocks whose FFN drops its depthwise conv while every other
+            # dense block keeps it — the same per-stage list convention as the
+            # two placements above (-1 = the stage's last block). None / all
+            # empty = today's model. Built for the dense control of a MoE arm:
+            # a no-shared-expert MoE block has no conv, so the block-for-block
+            # dense mirror is RoPE at that block plus this list at that block.
+            # A block listed here must be dense (not in moe_placement while
+            # use_moe), and model.dense_dwconv false already strips all of
+            # them, so the two are never combined (validate_config refuses).
+            "dwconv_off_placement": None,
             # "mixed" (default): learnable per-head (ω_x, ω_y) frequencies,
             # parameter `attn.rope.freqs` of shape (2, heads, head_dim//2) in
             # every RoPE'd block, weight-decay excluded, snapshotted at step 0

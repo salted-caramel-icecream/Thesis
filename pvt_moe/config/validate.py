@@ -224,6 +224,37 @@ def _check_router(moe: dict, builds_router: bool) -> None:
             f"native backend, or use backend 'tutel'.")
 
 
+def _resolve_dwconv_off(model: dict, abl: dict, depths: list) -> None:
+    """Resolve ``ablation.dwconv_off_placement`` in place and refuse nonsense.
+
+    ``.get()``: a config saved before the key existed (an sv1/sv2 checkpoint's,
+    which evaluate.py re-validates with no defaults merge) resolves to the
+    all-empty list, i.e. the model it trained.
+    """
+    off = resolve_placement(abl.get("dwconv_off_placement") or [[] for _ in depths], None, depths)
+    if any(off) and not model.get("dense_dwconv", True):
+        raise ValueError(
+            f"model.dense_dwconv is false (ladder rows 2 and 6 set it), which already "
+            f"strips the conv from EVERY dense block, so ablation.dwconv_off_placement "
+            f"{off} would be a no-op with a misleading run name. For the per-block "
+            f"control start from a conv-intact arm: --recipe scratch --ladder 1 --rope "
+            f"--rope-placement <blocks> --dwconv-off-placement <blocks>.")
+    if abl["use_moe"] and any(set(a) & set(b) for a, b in zip(abl["moe_placement"], off)):
+        raise ValueError(
+            f"ablation.dwconv_off_placement {off} names a block that is also in "
+            f"moe_placement {abl['moe_placement']}: a routed block has no dense FFN to "
+            f"strip (its conv, if any, is model.moe.moe_block_dwconv's). Name dense "
+            f"blocks only.")
+    if any(off) and all(sorted(b) == list(range(d)) for b, d in zip(off, depths)):
+        # Every dense block stripped == the global arm; give it the global
+        # arm's name so one model cannot live in two checkpoint directories.
+        print("[config] ablation.dwconv_off_placement names every block -> "
+              "model.dense_dwconv false (the global no-DWConv arm, run tag _nodw)")
+        model["dense_dwconv"] = False
+        off = [[] for _ in depths]
+    abl["dwconv_off_placement"] = off
+
+
 def validate_config(cfg: dict) -> dict:
     """Validate and normalize a config in place (returns it for chaining).
 
@@ -330,6 +361,7 @@ def validate_config(cfg: dict) -> dict:
     # After resolution the convenience fields have been consumed.
     abl["moe_last_n_stages"] = None
     abl["rope_last_n_stages"] = None
+    _resolve_dwconv_off(model, abl, depths)
 
     _check_router(moe, builds_router=bool(abl["use_moe"] and any(abl["moe_placement"])))
 

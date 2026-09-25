@@ -191,8 +191,16 @@ def run_name_parts(cfg: dict) -> dict:
         rope = "norope"
 
     # Without this, "conv-FFN intact" and "no DWConv" dense arms produce the
-    # same run name and overwrite each other's checkpoints.
-    dwconv = "" if cfg["model"].get("dense_dwconv", True) else "_nodw"
+    # same run name and overwrite each other's checkpoints. The per-block form
+    # carries its placement (`_nodw-s4b2`) so it collides with neither the
+    # global `_nodw` arm nor the untouched one; re-resolved here like the two
+    # placements above, so an unresolved config never yields `_nodw-s4b-1`.
+    if not cfg["model"].get("dense_dwconv", True):
+        dwconv = "_nodw"
+    else:
+        off = resolve_placement(abl.get("dwconv_off_placement") or [[] for _ in depths],
+                                None, depths)
+        dwconv = f"_nodw-{_placement_tag(off, depths)}" if any(off) else ""
     # Budget tag: the epoch count is an ablation axis of its own (90/150/300
     # from scratch vs 100 fine-tuned), so it belongs in the run name.
     budget = {"scratch": "scratch", "pretrained": "ft",

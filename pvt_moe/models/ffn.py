@@ -70,9 +70,11 @@ class Mlp(nn.Module):
     """Dense PVT v2 FFN: fc1 -> DWConv -> act -> fc2.
 
     ``use_dwconv=False`` drops the depthwise conv (and with it PVT v2's conv
-    positional encoding), leaving a plain fc1 -> act -> fc2 FFN. Only the
-    shared-expert branch of ``MoEMlp`` uses that form; the backbone's dense
-    blocks always keep the DWConv.
+    positional encoding), leaving a plain fc1 -> act -> fc2 FFN. The
+    shared-expert branch of ``MoEMlp`` uses that form under
+    ``moe_block_dwconv: false``; a dense block uses it when
+    ``model.dense_dwconv`` is false (every block) or the block is named in
+    ``ablation.dwconv_off_placement`` (that block only).
     """
 
     def __init__(
