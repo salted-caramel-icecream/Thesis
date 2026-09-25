@@ -315,29 +315,49 @@ its checkpoint directory or W&B name: `--run-suffix v2`.
 ### 10. Wave 2: placement, the shared expert, dense scale, and the RoPE control
 
 Same schedule and `$COMMON` as Wave 1; every arm pairs with a Wave 1 arm.
+Five arms on four GPUs: the two RoPE controls run first, and B3 (the
+longest, ~46 h) takes whichever GPU frees next.
 
-| GPU | arm | command | compares with | question |
+| GPU | arm | arm flags (after `$COMMON`) | compares with | question |
 |---|---|---|---|---|
 | 0 | MoE E=4, stages 3+4 | `--recipe scratch --ladder 8 --no-shared-expert` | E=4 stage 4; E=8 stages 3+4 | placement at E=4; expert count at stages 3+4 |
 | 1 | E=4 stage 4 + shared expert, plain | `--recipe scratch --ladder 4 --no-moe-dwconv` | E=4 stage 4 | does a shared expert help? (plain = no conv in the shared branch, so the shared MLP is the only difference) |
-| 2 | dense B3 | `--recipe scratch --ladder 1 --variant b3` | E=8 stages 3+4 (45.2M vs ~44M params) | is MoE better than scaling the dense model? |
-| 3 | dense + RoPE at s4b2, no conv there | `--recipe scratch --ladder 1 --rope --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]"` | dense B2; E=4 stage 4 | is the stage-4 gain from the routed experts or from the conv→RoPE swap? |
+| 2 | dense + RoPE at s4b2, no conv there | `--recipe scratch --ladder 1 --rope --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]"` | dense B2; E=4 stage 4 | is the stage-4 gain from the routed experts or from the conv→RoPE swap? |
+| 3 | dense + RoPE at s3b5+s4b2, no conv there | `--recipe scratch --ladder 1 --rope --rope-placement "[[],[],[-1],[-1]]" --dwconv-off-placement "[[],[],[-1],[-1]]"` | dense B2; E=8 stages 3+4; E=4 stages 3+4 (GPU 0) | the same question at stages 3+4 |
+| next free | dense B3 | `--recipe scratch --ladder 1 --variant b3` | E=8 stages 3+4 (45.2M vs ~44M params) | is MoE better than scaling the dense model? |
+
+```bash
+# $SCHED and $COMMON as in Wave 1. $COMMON goes FIRST: it carries
+# --variant b2, and a later --variant wins, so B3 must come after it.
+CUDA_VISIBLE_DEVICES=0 python train.py $COMMON --recipe scratch --ladder 8 --no-shared-expert
+CUDA_VISIBLE_DEVICES=1 python train.py $COMMON --recipe scratch --ladder 4 --no-moe-dwconv
+CUDA_VISIBLE_DEVICES=2 python train.py $COMMON --recipe scratch --ladder 1 --rope \
+    --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]"
+CUDA_VISIBLE_DEVICES=3 python train.py $COMMON --recipe scratch --ladder 1 --rope \
+    --rope-placement "[[],[],[-1],[-1]]" --dwconv-off-placement "[[],[],[-1],[-1]]"
+CUDA_VISIBLE_DEVICES=N python train.py $COMMON --recipe scratch --ladder 1 --variant b3
+```
 
 Run names: `sv2_b2_in1k_r224_moe-s3b5+s4b2-e4k1_rope-s3b5+s4b2_scratch90`,
 `sv2_b2_in1k_r224_moe-s4b2-e4k1+sh-plain_rope-s4b2_scratch90`,
-`sv2_b3_in1k_r224_dense_norope_scratch90`,
-`sv2_b2_in1k_r224_dense_rope-s4b2_nodw-s4b2_scratch90`.
+`sv2_b2_in1k_r224_dense_rope-s4b2_nodw-s4b2_scratch90`,
+`sv2_b2_in1k_r224_dense_rope-s3b5+s4b2_nodw-s3b5+s4b2_scratch90`,
+`sv2_b3_in1k_r224_dense_norope_scratch90`. Check the printed `run:` line
+before walking away: `--variant b3` placed before `$COMMON` resolves to
+`sv2_b2_in1k_r224_dense_norope_scratch90`, Wave 1's dense baseline, and
+nothing refuses an existing run directory.
 
-GPU 3 is the block-for-block dense mirror of the E=4 stage-4 arm: a
+GPU 2 is the block-for-block dense mirror of the E=4 stage-4 arm: a
 no-shared-expert MoE block has no depthwise conv, so the control drops the
 conv at s4b2 too (`--dwconv-off-placement`) and carries RoPE there. Against
 the dense baseline it prices the conv→RoPE swap alone; against the MoE arm
 the two differ only in the s4b2 FFN — one dense fc1→GELU→fc2 vs four top-1
 routed experts of the same hidden size plus router and balance loss: matched
-per-token FFN compute, 4× FFN parameters at that block on the MoE side. The
-stages-3+4 mirror of GPU 0 is the same line with both placements
-`"[[],[],[-1],[-1]]"`. B3 (GPU 2) resolves `drop_path 0.3`, PVT v2's rate
-for that size; it is the one Wave 2 arm never piloted at 5e-4.
+per-token FFN compute, 4× FFN parameters at that block on the MoE side.
+GPU 3 is the same mirror of the stages-3+4 arms (Wave 1 GPU 3 at E=8, GPU 0
+here at E=4), with both placements `"[[],[],[-1],[-1]]"`. B3 resolves
+`drop_path 0.3`, PVT v2's rate for that size; it is the one Wave 2 arm never
+piloted at 5e-4.
 
 ## Or use a notebook
 
