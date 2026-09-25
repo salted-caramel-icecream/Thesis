@@ -88,3 +88,6 @@ jobs:
             python train.py --recipe scratch --ladder "$row" --dry-run > /dev/null
           done
           python train.py --recipe pretrained --dry-run > /dev/null
+          # the per-block dense control (Wave 2): both placements resolve under B2
+          python train.py --recipe scratch --ladder 1 --variant b2 --rope \
+            --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]" --dry-run > /dev/null

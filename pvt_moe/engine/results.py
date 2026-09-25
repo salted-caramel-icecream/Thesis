@@ -109,6 +109,8 @@ def run_identity(cfg: dict) -> dict:
         "effective_batch_size": cfg.get("effective_batch_size"),
         "precision": cfg.get("precision"),
         "dense_dwconv": m.get("dense_dwconv", True),
+        # the per-block form; None on a record from before the key existed
+        "dwconv_off_placement": abl.get("dwconv_off_placement"),
         # Stochastic depth leaves NO trace in the checkpoint (DropPath holds no
         # parameters and no buffers) and none in the run name, so this record
         # is the only place a resume can check it against — see

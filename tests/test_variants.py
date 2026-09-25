@@ -208,7 +208,7 @@ def test_negative_indices_resolve_python_style():
 def _assert_last_block_placements(c, where):
     depths = c["model"]["depths"]
     abl = c["model"]["ablation"]
-    for key in ("moe_placement", "rope_placement"):
+    for key in ("moe_placement", "rope_placement", "dwconv_off_placement"):
         if key == "moe_placement" and not abl["use_moe"]:
             continue
         if key == "rope_placement" and not abl["use_rope"]:

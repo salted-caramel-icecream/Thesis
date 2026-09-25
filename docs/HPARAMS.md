@@ -25,7 +25,7 @@ your LR.
 | Backbone | PVT v2 **B1** by default; `--variant b0..b5` picks another official size (table below) | `model.variant` — fills `depths`, `embed_dims`, `num_heads`, `mlp_ratios`, `sr_ratios` and `pretrained_hf_id` as one set | official PVT v2 sizes. B2 (82.0%) sits in the range of Swin-T (81.3) and DaViT-T (82.8); B1 (78.7) invites the "weak baseline" objection |
 | mlp_ratios | [8,8,4,4] | `model.mlp_ratios` | PVT v2 |
 | Attention | SRA + plain multi-head attention via `F.scaled_dot_product_attention` (flash kernel on CUDA under bf16) | — (no knob: one kv head per query head) | PVT v2 |
-| FFN | DWConv removed, RoPE added | `model.dense_dwconv`, `ablation.rope_placement` | your architecture edit |
+| FFN | DWConv removed, RoPE added | `model.dense_dwconv` (every dense block) or `ablation.dwconv_off_placement` (named dense blocks; the dense control of a MoE arm), `ablation.rope_placement` | your architecture edit |
 | RoPE | mode **mixed** (RoPE-Mixed: learnable per-head 2D frequencies, one `attn.rope.freqs` per RoPE'd block, no weight decay, MHA only); `--rope-mode axial` = fixed frequencies (run tag `-ax`). theta: **10** for mixed — sets only the init spread of the frequencies — / **50** for axial — the frequencies themselves | `ablation.rope_mode`, `ablation.rope_theta` (None = per-mode default) | rope-vit (Heo et al. ECCV'24): RoPE-Mixed models use theta 10, axial 100; 50 is this repo's axial choice for the 7×7 stage-4 grid |
 | Resolution | 224² | `dataset.img_size` | PVT v2 |
 | Epochs | **90** (ablations) / 150 / 300 (final) | `epochs` | ScMoE runs vision comparisons at 90 ep on IN-1K; PVT v2's own recipe is 300 |
@@ -299,7 +299,9 @@ the next thing to check is that `force_tutel_gates_train`
 
 `model.moe.moe_block_dwconv` controls whether the converted block keeps PVT
 v2's depthwise conv. It is **scoped to the blocks in `moe_placement`** — dense
-blocks elsewhere keep their official CFFN (`model.dense_dwconv` strips those).
+blocks elsewhere keep their official CFFN (`model.dense_dwconv` strips all of
+those; `ablation.dwconv_off_placement` strips the named ones, run tag
+`_nodw-s4b2`, for the dense control that mirrors a MoE arm block for block).
 
 The conv rides the **shared expert**, because that is the only branch of a MoE
 block with an intact token grid: token-choice routing gathers each expert's
@@ -528,8 +530,10 @@ directory and a W&B run.
 Three choices the spec does not pin, made explicit:
 
 - **(choice)** scratch row 2 removes the DWConv from *every* block, so RoPE is
-  placed in every block too — the architecture edit as a whole. Pass
-  `--rope-placement` for a narrower arm.
+  placed in every block too — the architecture edit as a whole. Its
+  `rope_last_n_stages: 4` overrides a `--rope-placement`, so a narrower arm
+  starts from row 1: `--ladder 1 --rope --rope-placement <blocks>
+  --dwconv-off-placement <blocks>`.
 - **(choice)** rows 8/9 move MoE to stages 3+4, and RoPE moves with it (this
   repo's convention: RoPE goes where MoE is). Pass `--rope-placement` to
   decouple the axes.

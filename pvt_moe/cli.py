@@ -157,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(rope-vit RoPE-Mixed); axial = fixed frequencies")
     g.add_argument("--rope-theta", type=float,
                    help="RoPE base (default: 10 for mixed, 50 for axial)")
+    g.add_argument("--dwconv-off-placement", metavar="JSON", dest="dwconv_off_placement",
+                   help='DENSE blocks whose FFN drops its depthwise conv while every other '
+                        'dense block keeps it; same per-stage JSON as --moe-placement, so '
+                        '"[[],[],[],[-1]]" with --rope --rope-placement "[[],[],[],[-1]]" is '
+                        'the default MoE block minus the MoE (run tag _nodw-s4b2)')
     g.add_argument("--grad-checkpointing", metavar="JSON",
                    help='stages (1-based) to recompute in backward, e.g. "[1,2]". '
                         'Saves memory proportional to token count, so stage 1 '
@@ -389,7 +394,7 @@ _CLI_ONLY_DESTS = frozenset({
     "check_env", "dry_run", "print_config", "save_config", "overfit_check",
     "config", "overrides", "ladder", "recipe", "resume_from",
     # applied separately: these parse JSON
-    "moe_placement", "rope_placement", "grad_checkpointing", "milestones",
+    "moe_placement", "rope_placement", "dwconv_off_placement", "grad_checkpointing", "milestones",
     # applied separately: sets dataset.arrow_dirs for the chosen dataset
     "data_dir",
 })
@@ -443,6 +448,7 @@ def build_config(args, verbose: bool = True) -> dict:
 
     for dest, path in (("moe_placement", "model.ablation.moe_placement"),
                        ("rope_placement", "model.ablation.rope_placement"),
+                       ("dwconv_off_placement", "model.ablation.dwconv_off_placement"),
                        ("grad_checkpointing", "model.grad_checkpointing"),
                        ("milestones", "milestones")):
         raw = getattr(args, dest, None)
@@ -480,9 +486,12 @@ def describe(cfg: dict) -> str:
         f"{o['lr'] * o['warmup_start_factor']:.1e}) | wd {o['weight_decay']} "
         f"| clip {o['grad_clip']} | stage4 LR x{o['stage4_lr_multiplier']} "
         f"| layer_decay {o['layer_decay']}")
+    off = abl.get("dwconv_off_placement") or []
     lines.append(
         f"  drop_path {m['drop_path_rate']} "
-        f"| dense_dwconv {m['dense_dwconv']} | {cfg['dataset']['name']} "
+        f"| dense_dwconv {m['dense_dwconv']}"
+        + (f" (off at {off})" if any(off) else "")
+        + f" | {cfg['dataset']['name']} "
         f"@ {cfg['dataset']['img_size']}px"
         + (f" | subset {cfg['dataset']['subset_file']}" if cfg["dataset"].get("subset_file") else ""))
     lines.append(f"  {lr_banner(cfg)}")

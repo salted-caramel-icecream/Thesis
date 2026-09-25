@@ -36,12 +36,12 @@ documentation. Read `docs/ARCHITECTURE.md` before touching `pvt_moe/models/`.
 - Datasets: `config.DATASETS` — every one labelled. The small downstream sets are exactly `fashionmnist`, `eurosat`, `pathmnist` (`SMALL_DATASETS`), each with a fixed `finetune_epochs` budget, a verbatim `licence` line and `hf_id: None` (download takes `--hf-id` / `--npz`); `dataset.img_size` upsamples them. `dataset.subset_file` restricts the train split to a seeded low-shot subset.
 - Self-supervised pretraining (SimMIM / JEPA, the `task` axis, the PASS corpus) lives on the **`ssl` git branch** — see `docs/SSL_BRANCH.md`. `main` is single-task supervised.
 - Recipes: `scratch` | `pretrained` | `downstream` (small set, epochs from the registry). `optim.layer_decay` compounds per block from the head down; 1.0 (scratch / pretrained) keeps the 4-group optimizer byte for byte.
-- Placement lists are per stage, block indices within the stage; `-1` = the last block of the stage for any variant. `*_last_n_stages: N` expands to all blocks of the last N stages.
+- Placement lists are per stage, block indices within the stage; `-1` = the last block of the stage for any variant. `*_last_n_stages: N` expands to all blocks of the last N stages. `ablation.dwconv_off_placement` (same form) strips the DWConv from the named DENSE blocks only — the dense control of a MoE arm; `model.dense_dwconv: false` strips all of them, and the two never combine.
 - RoPE: `ablation.rope_mode` `mixed` (default: learnable per-head 2D frequencies, MHA only, no weight decay) | `axial` (fixed); `rope_theta: None` resolves per mode (10 mixed — init spread only — / 50 axial).
 
 ## Run names and checkpoints
 
-`sv2_{variant}_{in1k|in22k|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw]_{scratch90|ft100|dstr50|eval}[_from-{dense|moe}-{parent budget}]`,
+`sv2_{variant}_{in1k|in22k|fmnist|eurosat|path}_r{img}_{moe-...|dense}_{rope-...[-ax]|norope}[_nodw|_nodw-<placement>]_{scratch90|ft100|dstr50|eval}[_from-{dense|moe}-{parent budget}]`,
 e.g. `sv2_b1_in1k_r224_moe-s4b1-e4k1+sh_rope-s4b1_scratch90`,
 `sv2_b1_eurosat_r224_moe-s4b1-e4k1+sh_rope-s4b1_dstr50_from-dense-ft100`.
 `r{img}` is the input resolution (`dataset.img_size`, 224 unless set); it arrived

@@ -311,7 +311,8 @@ and the result. Self-supervised pretraining is not here: it lives on the
 | MoE placement | `--moe-placement "[[],[],[],[-1]]"` (−1 = last block of the stage, for any variant) | `ablation.moe_placement` |
 | RoPE | `--rope` / `--no-rope` | `ablation.use_rope` |
 | RoPE flavour | `--rope-mode mixed\|axial` (mixed = learnable RoPE-Mixed, default; axial = fixed, run tag `-ax`) | `ablation.rope_mode` |
-| DWConv in dense blocks | `--dwconv` / `--no-dwconv` | `model.dense_dwconv` |
+| DWConv in dense blocks | `--dwconv` / `--no-dwconv` (every dense block) | `model.dense_dwconv` |
+| DWConv off in named dense blocks | `--dwconv-off-placement "[[],[],[],[-1]]"` (the dense control of a MoE arm; run tag `_nodw-s4b2`) | `ablation.dwconv_off_placement` |
 | DWConv in the MoE'd block | `--moe-dwconv` / `--no-moe-dwconv` | `moe.moe_block_dwconv` |
 | upcycling init | `--upcycle-init routed_zero\|shared_zero\|none` | `moe.upcycle_init` |
 | grad checkpointing | `--grad-checkpointing "[1,2]"` | `GRAD_CHECKPOINT` |

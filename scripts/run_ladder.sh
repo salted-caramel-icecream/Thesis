@@ -14,6 +14,11 @@
 #   python train.py --recipe scratch --ladder 4 --no-moe-dwconv
 #   python train.py --recipe scratch --ladder 4 --no-moe-dwconv --no-rope
 #
+# The dense control of a MoE arm (Wave 2, README §10) is row 1 with the MoE
+# block's RoPE and no conv at that block:
+#
+#   python train.py --recipe scratch --ladder 1 --rope --rope-placement "[[],[],[],[-1]]" --dwconv-off-placement "[[],[],[],[-1]]"
+#
 # Everything else — --variant, --data-dir, --checkpoint-root, --batch-size —
 # passes straight through the environment or your own edit of TRAIN_ARGS.
 set -euo pipefail

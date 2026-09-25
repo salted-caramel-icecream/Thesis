@@ -532,6 +532,22 @@ def check_backbone_architecture(ckpt_cfg: dict | None, cfg: dict, state_keys,
         if hp is not None and hp != wp:
             out.append(f"rope_placement: checkpoint {hp} vs run {wp} — blocks with RoPE in "
                        "only one of the two get dropped or random RoPE-Mixed frequencies")
+
+    # Which DENSE blocks have no depthwise conv: the global switch strips all
+    # of them, the placement strips the named ones. Compared as one set, so a
+    # conv-everywhere parent into a stripped child (or the reverse) is caught:
+    # the conv exists in only one of the two, and is dropped or left random.
+    def _stripped(mdl, abl):
+        if mdl.get("dense_dwconv") is False:
+            return [list(range(d)) for d in depths]
+        pl_ = abl.get("dwconv_off_placement")
+        return resolve_placement(pl_, None, depths) if pl_ is not None else [[] for _ in depths]
+
+    if "dense_dwconv" in have or "dwconv_off_placement" in ha:
+        hs, ws = _stripped(have, ha), _stripped(want, wa)
+        if hs != ws:
+            out.append(f"dense blocks without DWConv: checkpoint {hs} vs run {ws} — the FFN "
+                       "conv exists in only one of the two: dropped, or left at random init")
     ckpt_has_moe = any(".mlp.moe_layer." in k or ".mlp.shared_expert." in k for k in state_keys)
     if ckpt_has_moe:
         hp = _resolved(ha, "moe") if ha.get("use_moe") else [[] for _ in depths]

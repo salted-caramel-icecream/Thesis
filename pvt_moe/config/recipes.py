@@ -106,7 +106,10 @@ _SCRATCH_LADDER = {
     2: {"_desc": "Dense, no DWConv + RoPE", "epochs": 90,
         "_note": "the DWConv is removed from EVERY block, so RoPE is "
                  "placed in every block too — the architecture edit as a "
-                 "whole. Pass --rope-placement for a narrower arm.",
+                 "whole. For a narrower arm start from row 1 instead: "
+                 "--ladder 1 --rope --rope-placement <blocks> "
+                 "--dwconv-off-placement <blocks> (this row's "
+                 "rope_last_n_stages: 4 overrides a --rope-placement).",
         "model": {"dense_dwconv": False,
                   "ablation": {"use_moe": False, "use_rope": True,
                                "rope_last_n_stages": 4}}},
